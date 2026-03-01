@@ -1,0 +1,8 @@
+# Require maintainer review on all changes.
+* @vinayak3022
+
+# Optional path ownership (keep global owner too)
+/codespine/ @vinayak3022
+/.github/ @vinayak3022
+/README.md @vinayak3022
+/SECURITY.md @vinayak3022
