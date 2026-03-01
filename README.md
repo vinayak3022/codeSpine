@@ -71,6 +71,8 @@ CodeSpine includes:
 
 ## Install
 
+### Local editable install
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -78,6 +80,30 @@ pip install -e .
 ```
 
 If your environment is externally managed (PEP 668), use a virtualenv as above.
+
+You can also use `pip3`:
+
+```bash
+pip3 install -e .
+```
+
+### Install from GitHub
+
+```bash
+pip install "git+https://github.com/vinayak3022/codeSpine.git"
+```
+
+or
+
+```bash
+pip3 install "git+https://github.com/vinayak3022/codeSpine.git"
+```
+
+### Optional extras
+
+- `pip install -e .[ml]` for local embedding model dependencies
+- `pip install -e .[community]` for Leiden community detection stack
+- `pip install -e .[full]` for all optional features
 
 ## Quick Start
 
@@ -93,6 +119,23 @@ codespine context "processPayment" --max-depth 3 --json
 
 # 4) estimate blast radius before refactor
 codespine impact com.example.Service#processPayment(java.lang.String) --max-depth 4 --json
+```
+
+Example output:
+
+```text
+$ codespine analyse .
+Walking files...               142 files found
+Parsing code...                142/142
+Tracing calls...               847 calls resolved
+Analyzing types...             234 type relationships
+Detecting communities...       8 clusters found
+Detecting execution flows...   34 processes found
+Finding dead code...           12 unreachable symbols
+Analyzing git history...       18 coupled file pairs
+Generating embeddings...       623 vectors stored
+
+Done in 4.2s - 623 symbols, 1847 edges, 8 clusters, 34 flows
 ```
 
 ## CLI Commands

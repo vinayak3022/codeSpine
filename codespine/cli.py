@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 import click
 import psutil
@@ -65,6 +66,10 @@ def _db_size_bytes(path: str) -> int:
     return total
 
 
+def _phase(label: str, value: str) -> None:
+    click.echo(f"{label:<30} {value}")
+
+
 @click.group()
 def main() -> None:
     """CodeSpine CLI."""
@@ -79,11 +84,55 @@ def analyse(path: str, full: bool) -> None:
         click.secho("Stop MCP first ('codespine stop') to index.", fg="yellow")
         return
 
+    started = time.perf_counter()
+    abs_path = os.path.abspath(path)
     store = GraphStore(read_only=False)
     indexer = JavaIndexer(store)
-    result = indexer.index_project(path, full=full)
+
+    result = indexer.index_project(abs_path, full=full)
+    _phase("Walking files...", f"{result.files_found} files found")
+    _phase("Parsing code...", f"{result.files_indexed}/{result.files_found}")
+    _phase("Tracing calls...", f"{result.calls_resolved} calls resolved")
+    _phase("Analyzing types...", f"{result.type_relationships} type relationships")
+
+    communities = detect_communities(store)
+    _phase("Detecting communities...", f"{len(communities)} clusters found")
+
+    flows = trace_execution_flows(store)
+    _phase("Detecting execution flows...", f"{len(flows)} processes found")
+
+    dead = detect_dead_code(store, limit=500)
+    _phase("Finding dead code...", f"{len(dead)} unreachable symbols")
+
+    coupling_pairs = compute_coupling(
+        store,
+        abs_path,
+        result.project_id,
+        months=SETTINGS.default_coupling_months,
+        min_strength=SETTINGS.default_min_coupling_strength,
+        min_cochanges=SETTINGS.default_min_cochanges,
+    )
+    _phase("Analyzing git history...", f"{len(coupling_pairs)} coupled file pairs")
+
+    vector_count = store.query_records(
+        """
+        MATCH (s:Symbol)
+        WHERE s.embedding IS NOT NULL
+        RETURN count(s) as count
+        """
+    )
+    vectors_stored = int(vector_count[0]["count"]) if vector_count else result.embeddings_generated
+    _phase("Generating embeddings...", f"{vectors_stored} vectors stored")
+
+    symbol_count = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
+    edge_count = store.query_records("MATCH ()-[r]->() RETURN count(r) as count")
+    symbols = int(symbol_count[0]["count"]) if symbol_count else 0
+    edges = int(edge_count[0]["count"]) if edge_count else 0
+    elapsed = time.perf_counter() - started
+
+    click.echo()
     click.secho(
-        f"Indexed project={result.project_id} files={result.files_indexed} classes={result.classes_indexed} methods={result.methods_indexed}",
+        f"Done in {elapsed:.1f}s - {symbols} symbols, {edges} edges, {len(communities)} clusters, {len(flows)} flows",
         fg="green",
     )
 

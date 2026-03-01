@@ -27,6 +27,10 @@ Semantic Versioning where practical.
   - hash-based incremental index invalidation
   - persistent SQLite embedding cache
   - transactional batched write path for indexing
+- Packaging/installability improvements:
+  - relaxed build backend version pin
+  - optional dependency extras (`ml`, `community`, `full`)
+  - README install instructions for both `pip` and `pip3`
 
 ## [0.1.0] - 2026-03-02
 

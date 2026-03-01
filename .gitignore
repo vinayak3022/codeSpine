@@ -24,6 +24,7 @@ htmlcov/
 # Tooling
 .mypy_cache/
 .ruff_cache/
+.benchmarks/
 
 # OS
 .DS_Store

@@ -12,9 +12,13 @@ from codespine.search.vector import embed_text
 @dataclass
 class IndexResult:
     project_id: str
+    files_found: int
     files_indexed: int
     classes_indexed: int
     methods_indexed: int
+    calls_resolved: int
+    type_relationships: int
+    embeddings_generated: int
 
 
 class JavaIndexer:
@@ -45,6 +49,8 @@ class JavaIndexer:
         files_indexed = 0
         classes_indexed = 0
         methods_indexed = 0
+        calls_resolved = 0
+        type_relationships = 0
 
         method_catalog: dict[str, dict] = self._existing_method_catalog(project_id) if not full else {}
         method_calls: dict[str, list] = {}
@@ -148,14 +154,19 @@ class JavaIndexer:
 
             for src, dst, confidence, reason in resolve_calls(method_catalog, method_calls, method_context, class_catalog):
                 self.store.add_call(src, dst, confidence, reason)
+                calls_resolved += 1
 
-            self._build_inheritance_edges(class_meta, class_catalog, class_methods)
+            type_relationships += self._build_inheritance_edges(class_meta, class_catalog, class_methods)
 
         return IndexResult(
             project_id=project_id,
+            files_found=len(current_files),
             files_indexed=files_indexed,
             classes_indexed=classes_indexed,
             methods_indexed=methods_indexed,
+            calls_resolved=calls_resolved,
+            type_relationships=type_relationships,
+            embeddings_generated=classes_indexed + methods_indexed,
         )
 
     @staticmethod
@@ -263,7 +274,8 @@ class JavaIndexer:
         class_meta: dict[str, dict],
         class_catalog: dict[str, list[str]],
         class_methods: dict[str, dict[str, str]],
-    ) -> None:
+    ) -> int:
+        rel_count = 0
         for fqcn, meta in class_meta.items():
             src_id = class_id(fqcn)
             ctx = {"package": meta.get("package", ""), "imports": meta.get("imports", [])}
@@ -272,17 +284,22 @@ class JavaIndexer:
             for parent_fqcn in parent_candidates:
                 dst_id = class_id(parent_fqcn)
                 self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 0.8)
+                rel_count += 1
                 for sig, method_id in class_methods.get(fqcn, {}).items():
                     parent_method = class_methods.get(parent_fqcn, {}).get(sig)
                     if parent_method:
                         self.store.add_reference("OVERRIDES", "Method", method_id, "Method", parent_method, 1.0)
+                        rel_count += 1
 
             for iface in meta.get("interfaces", []):
                 iface_candidates = self._resolve_type_candidates(iface, ctx, class_catalog)
                 for iface_fqcn in iface_candidates:
                     dst_id = class_id(iface_fqcn)
                     self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 1.0)
+                    rel_count += 1
                     for sig, method_id in class_methods.get(fqcn, {}).items():
                         iface_method = class_methods.get(iface_fqcn, {}).get(sig)
                         if iface_method:
                             self.store.add_reference("OVERRIDES", "Method", method_id, "Method", iface_method, 1.0)
+                            rel_count += 1
+        return rel_count

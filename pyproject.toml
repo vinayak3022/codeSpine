@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -31,9 +31,20 @@ dependencies = [
   "tree-sitter",
   "tree-sitter-java",
   "fastmcp",
-  "watchdog",
   "psutil",
-  "watchfiles",
+  "watchfiles"
+]
+
+[project.optional-dependencies]
+ml = [
+  "sentence-transformers",
+  "numpy"
+]
+community = [
+  "igraph",
+  "leidenalg"
+]
+full = [
   "sentence-transformers",
   "numpy",
   "igraph",
