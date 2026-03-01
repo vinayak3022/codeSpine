@@ -31,6 +31,7 @@ Semantic Versioning where practical.
   - relaxed build backend version pin
   - optional dependency extras (`ml`, `community`, `full`)
   - README install instructions for both `pip` and `pip3`
+- Added automated PyPI publish workflow via GitHub Releases (`publish-pypi.yml`).
 
 ## [0.1.0] - 2026-03-02
 

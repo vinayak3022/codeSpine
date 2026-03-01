@@ -99,6 +99,18 @@ or
 pip3 install "git+https://github.com/vinayak3022/codeSpine.git"
 ```
 
+### Install from PyPI (after first release is published)
+
+```bash
+pip install codespine
+```
+
+or
+
+```bash
+pip3 install codespine
+```
+
 ### Optional extras
 
 - `pip install -e .[ml]` for local embedding model dependencies
@@ -238,6 +250,22 @@ Optional working directory (recommended for repo-scoped usage):
 - Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
 - Branch protection runbook: [`docs/GITHUB_HARDENING.md`](docs/GITHUB_HARDENING.md)
+
+## Publish to PyPI
+
+This repo includes a release workflow:
+- [`.github/workflows/publish-pypi.yml`](.github/workflows/publish-pypi.yml)
+
+Recommended setup (one-time):
+1. Create project on PyPI with the same name (`codespine`) or update `project.name` if unavailable.
+2. In PyPI, configure Trusted Publisher for this GitHub repo/workflow.
+3. In GitHub, keep the `pypi` environment enabled for publishing.
+
+Release flow:
+1. Bump version in [`pyproject.toml`](pyproject.toml).
+2. Push commit + tag (for example `v0.1.1`).
+3. Create a GitHub Release for that tag.
+4. Workflow builds and publishes to PyPI.
 
 ## Compatibility
 
