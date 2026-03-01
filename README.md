@@ -20,7 +20,7 @@ CodeSpine answers:
 ## Core Capabilities
 
 ### 1) Hybrid Search (BM25 + Vector + Fuzzy + RRF)
-- Lexical ranking (BM25-style)
+- Lexical ranking (BM25-based)
 - Semantic matching (local embeddings)
 - Typo-tolerant fuzzy matching
 - Reciprocal Rank Fusion with ranking multipliers
@@ -35,7 +35,7 @@ CodeSpine answers:
 - constructors, tests, `main(String[] args)`
 - override/interface contracts
 - common lifecycle/framework annotations
-- reflection/bean-style method patterns
+- reflection/bean-friendly method patterns
 
 ### 4) Execution Flow Tracing
 - Detects framework-agnostic entry points (`main`, tests, public roots)
@@ -124,6 +124,39 @@ codespine impact com.example.Service#processPayment(java.lang.String) --max-dept
 - `codespine stop`
 - `codespine serve` (alias of `start`)
 - `codespine mcp` (foreground stdio MCP)
+
+## MCP JSON (Paste Into `mcp.json`)
+
+Use this if your MCP client supports stdio servers:
+
+```json
+{
+  "mcpServers": {
+    "codespine": {
+      "command": "codespine",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+If `codespine` is not on your PATH, use an absolute path for `command`, for example:
+- macOS/Linux: `"/Users/<you>/path/to/venv/bin/codespine"`
+- Windows: `"C:\\\\Users\\\\<you>\\\\path\\\\to\\\\venv\\\\Scripts\\\\codespine.exe"`
+
+Optional working directory (recommended for repo-scoped usage):
+
+```json
+{
+  "mcpServers": {
+    "codespine": {
+      "command": "codespine",
+      "args": ["mcp"],
+      "cwd": "/absolute/path/to/your/repo"
+    }
+  }
+}
+```
 
 ## MCP Tool Surface
 
