@@ -1,9 +1,7 @@
 # CodeSpine
 
-CodeSpine turns Java codebases into a graph for coding agents.
-
-Use it to search symbols semantically, trace impact before edits, detect dead code,
-understand execution flows, and inspect architecture clusters from one CLI/MCP tool.
+CodeSpine is an intelligence layer for Java teams and AI coding agents.
+It maps your codebase into a live graph so you can find anything fast, predict change impact, and ship safer refactors.
 
 ## Installation
 
