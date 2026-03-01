@@ -1,12 +1,94 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 
+import tree_sitter_java as tsjava
+from tree_sitter import Language, Parser, Query
+
 from codespine.indexer.java_parser import parse_java_source
+
+JAVA_LANGUAGE = Language(tsjava.language())
+PARSER = Parser(JAVA_LANGUAGE)
+
+
+def _text(node) -> str:
+    return node.text.decode("utf-8")
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha1(_normalize_java_snippet(text).encode("utf-8")).hexdigest()
+
+
+def _normalize_java_snippet(text: str) -> str:
+    """Normalize formatting/comments so branch diff emphasizes semantic edits."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _method_hashes(source: bytes) -> dict[str, dict]:
+    tree = PARSER.parse(source)
+    root = tree.root_node
+    method_query = Query(
+        JAVA_LANGUAGE,
+        """
+        [
+          (method_declaration
+            name: (identifier) @name
+            parameters: (formal_parameters) @params) @decl
+          (constructor_declaration
+            name: (identifier) @name
+            parameters: (formal_parameters) @params) @decl
+        ]
+        """,
+    )
+    methods: dict[str, dict] = {}
+    grouped: dict[object, dict[str, str]] = {}
+    for node, tag in method_query.captures(root):
+        key_node = node if tag == "decl" else node.parent
+        grouped.setdefault(key_node, {})[tag] = _text(node)
+
+    for node, capture in grouped.items():
+        name = capture.get("name")
+        params = capture.get("params", "()")
+        if not name:
+            continue
+        signature = f"{name}{params}"
+        methods[signature] = {
+            "hash": _hash_text(_text(node)),
+            "line_start": node.start_point[0] + 1,
+            "line_end": node.end_point[0] + 1,
+        }
+    return methods
+
+
+def _class_hashes(source: bytes) -> dict[str, str]:
+    tree = PARSER.parse(source)
+    root = tree.root_node
+    class_query = Query(
+        JAVA_LANGUAGE,
+        """
+        (class_declaration
+          name: (identifier) @name) @decl
+        """,
+    )
+    grouped: dict[object, dict[str, str]] = {}
+    for node, tag in class_query.captures(root):
+        key_node = node if tag == "decl" else node.parent
+        grouped.setdefault(key_node, {})[tag] = _text(node)
+    out: dict[str, str] = {}
+    for node, capture in grouped.items():
+        name = capture.get("name")
+        if name:
+            out[name] = _hash_text(_text(node))
+    return out
 
 
 def _symbol_manifest(repo_path: str) -> dict[str, dict]:
@@ -20,17 +102,30 @@ def _symbol_manifest(repo_path: str) -> dict[str, dict]:
             path = os.path.join(root, f)
             rel = os.path.relpath(path, repo_path)
             with open(path, "rb") as fp:
-                parsed = parse_java_source(fp.read())
+                source = fp.read()
+            parsed = parse_java_source(source)
+            method_hashes = _method_hashes(source)
+            class_hashes = _class_hashes(source)
             for cls in parsed.classes:
                 cls_key = f"class:{cls.fqcn}"
-                manifest[cls_key] = {"kind": "Class", "file": rel, "name": cls.fqcn}
+                manifest[cls_key] = {
+                    "kind": "Class",
+                    "file": rel,
+                    "name": cls.fqcn,
+                    "hash": class_hashes.get(cls.name, cls.body_hash),
+                    "line_start": cls.line,
+                }
                 for m in cls.methods:
                     m_key = f"method:{cls.fqcn}#{m.signature}"
+                    mh = method_hashes.get(f"{m.name}({','.join(m.parameter_types)})") or method_hashes.get(m.signature) or {}
                     manifest[m_key] = {
                         "kind": "Method",
                         "file": rel,
                         "name": m.signature,
                         "class": cls.fqcn,
+                        "hash": m.body_hash or mh.get("hash"),
+                        "line_start": mh.get("line_start", m.line),
+                        "line_end": mh.get("line_end", m.line),
                     }
     return manifest
 

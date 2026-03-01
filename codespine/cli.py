@@ -11,6 +11,7 @@ import click
 import psutil
 
 from codespine.analysis.community import detect_communities, symbol_community
+from codespine.analysis.context import build_symbol_context
 from codespine.analysis.coupling import compute_coupling, get_coupling
 from codespine.analysis.deadcode import detect_dead_code
 from codespine.analysis.flow import trace_execution_flows
@@ -49,6 +50,21 @@ def _current_repo_path() -> str:
     return os.getcwd()
 
 
+def _db_size_bytes(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
 @click.group()
 def main() -> None:
     """CodeSpine CLI."""
@@ -81,6 +97,17 @@ def search(query: str, k: int, as_json: bool) -> None:
     store = GraphStore(read_only=True)
     results = hybrid_search(store, query, k=k)
     _echo_json(results, as_json)
+
+
+@main.command()
+@click.argument("query")
+@click.option("--max-depth", default=3, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def context(query: str, max_depth: int, as_json: bool) -> None:
+    """Get one-shot symbol context: search + impact + community + flows."""
+    store = GraphStore(read_only=True)
+    result = build_symbol_context(store, query, max_depth=max_depth)
+    _echo_json(result, as_json)
 
 
 @main.command()
@@ -194,6 +221,98 @@ def stats() -> None:
     )
 
 
+@main.command("list")
+@click.option("--json", "as_json", is_flag=True)
+def list_projects(as_json: bool) -> None:
+    """List indexed projects."""
+    store = GraphStore(read_only=True)
+    projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path, p.language as language ORDER BY p.id")
+    _echo_json(projects, as_json)
+
+
+@main.command()
+@click.option("--json", "as_json", is_flag=True)
+def status(as_json: bool) -> None:
+    """Show service and database status."""
+    running = _is_running()
+    pid = None
+    if os.path.exists(SETTINGS.pid_file):
+        try:
+            with open(SETTINGS.pid_file, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+        except Exception:
+            pid = None
+    payload = {
+        "running": running,
+        "pid": pid,
+        "pid_file": SETTINGS.pid_file,
+        "db_path": SETTINGS.db_path,
+        "db_size_bytes": _db_size_bytes(SETTINGS.db_path),
+        "log_file": SETTINGS.log_file,
+    }
+    _echo_json(payload, as_json)
+
+
+@main.command()
+@click.argument("query")
+@click.option("--json", "as_json", is_flag=True)
+def cypher(query: str, as_json: bool) -> None:
+    """Run a raw Cypher query against the graph DB."""
+    store = GraphStore(read_only=True)
+    try:
+        result = store.query_records(query)
+    except Exception as exc:
+        raise click.ClickException(f"Cypher query failed: {exc}") from exc
+    _echo_json(result, as_json)
+
+
+@main.command()
+@click.option("--force", is_flag=True, help="Skip confirmation prompt.")
+def clean(force: bool) -> None:
+    """Remove CodeSpine local state (DB/PID/log)."""
+    if not force and not click.confirm("Remove local CodeSpine DB, PID, and logs?"):
+        click.echo("Aborted.")
+        return
+    for path in [SETTINGS.pid_file, SETTINGS.log_file, SETTINGS.db_path]:
+        if not os.path.exists(path):
+            continue
+        if os.path.isdir(path):
+            import shutil
+
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    click.echo("Cleaned CodeSpine local state.")
+
+
+@main.command()
+def setup() -> None:
+    """Print local setup checks and next steps."""
+    checks = {
+        "click": False,
+        "kuzu": False,
+        "tree_sitter_java": False,
+        "fastmcp": False,
+        "watchfiles": False,
+    }
+    for mod in list(checks):
+        try:
+            __import__(mod)
+            checks[mod] = True
+        except Exception:
+            checks[mod] = False
+    click.echo("Dependency check:")
+    for mod, ok in checks.items():
+        click.echo(f"  - {mod}: {'OK' if ok else 'MISSING'}")
+    click.echo("\\nRecommended:")
+    click.echo("  pip install -e .")
+    click.echo("  codespine analyse /path/to/java-project --full")
+    click.echo("  codespine search payment --json")
+
+
 @main.command()
 def start() -> None:
     """Launch MCP background server."""
@@ -212,6 +331,18 @@ def start() -> None:
     with open(SETTINGS.pid_file, "w", encoding="utf-8") as f:
         f.write(str(proc.pid))
     click.secho("CodeSpine MCP active", fg="cyan")
+
+
+@main.command()
+def serve() -> None:
+    """Alias for start."""
+    start()
+
+
+@main.command()
+def mcp() -> None:
+    """Run MCP server in foreground (stdio)."""
+    run_mcp()
 
 
 @main.command()

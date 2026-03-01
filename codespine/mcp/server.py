@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastmcp import FastMCP
 
 from codespine.analysis.community import detect_communities, symbol_community
+from codespine.analysis.context import build_symbol_context
 from codespine.analysis.coupling import get_coupling
 from codespine.analysis.deadcode import detect_dead_code as detect_dead_code_analysis
 from codespine.analysis.flow import trace_execution_flows as trace_flows_analysis
@@ -54,5 +55,13 @@ def build_mcp_server(store, repo_path_provider):
             "symbols": symbols[0]["count"] if symbols else 0,
             "calls": calls[0]["count"] if calls else 0,
         }
+
+    @mcp.tool()
+    def get_symbol_context(query: str, max_depth: int = 3):
+        return build_symbol_context(store, query, max_depth=max_depth)
+
+    @mcp.tool()
+    def run_cypher(query: str):
+        return store.query_records(query)
 
     return mcp

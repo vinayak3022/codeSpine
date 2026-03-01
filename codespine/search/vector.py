@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import sqlite3
 from functools import lru_cache
 
 from codespine.config import SETTINGS
@@ -32,13 +33,63 @@ def _load_model():
         return None
 
 
+@lru_cache(maxsize=1)
+def _embedding_cache_conn():
+    conn = sqlite3.connect(SETTINGS.embedding_cache_db)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embedding_cache (
+            cache_key TEXT PRIMARY KEY,
+            dim INTEGER NOT NULL,
+            vector_json TEXT NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def _cache_key(text: str, dim: int) -> str:
+    return hashlib.sha1(f"{SETTINGS.embedding_model}|{dim}|{text}".encode("utf-8")).hexdigest()
+
+
+def _get_cached_embedding(text: str, dim: int) -> list[float] | None:
+    key = _cache_key(text, dim)
+    conn = _embedding_cache_conn()
+    row = conn.execute("SELECT vector_json FROM embedding_cache WHERE cache_key = ? AND dim = ?", (key, dim)).fetchone()
+    if not row:
+        return None
+    import json
+
+    return [float(x) for x in json.loads(row[0])]
+
+
+def _set_cached_embedding(text: str, dim: int, vec: list[float]) -> None:
+    key = _cache_key(text, dim)
+    conn = _embedding_cache_conn()
+    import json
+
+    conn.execute(
+        "INSERT OR REPLACE INTO embedding_cache(cache_key, dim, vector_json) VALUES (?, ?, ?)",
+        (key, dim, json.dumps(vec)),
+    )
+    conn.commit()
+
+
 def embed_text(text: str, dim: int | None = None) -> list[float]:
     dim = dim or SETTINGS.vector_dim
+    cached = _get_cached_embedding(text or "", dim)
+    if cached is not None:
+        return cached
+
     model = _load_model()
     if model is None:
-        return _hash_vector(text, dim)
-    vec = model.encode([text or ""], normalize_embeddings=True)[0]
-    return [float(x) for x in vec]
+        vec = _hash_vector(text, dim)
+        _set_cached_embedding(text or "", dim, vec)
+        return vec
+
+    vec = [float(x) for x in model.encode([text or ""], normalize_embeddings=True)[0]]
+    _set_cached_embedding(text or "", dim, vec)
+    return vec
 
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:

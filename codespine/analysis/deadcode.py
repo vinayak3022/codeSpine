@@ -1,15 +1,45 @@
 from __future__ import annotations
 
+EXEMPT_ANNOTATIONS = {
+    "Override",
+    "Test",
+    "ParameterizedTest",
+    "Bean",
+    "PostConstruct",
+    "PreDestroy",
+    "Scheduled",
+    "KafkaListener",
+    "EventListener",
+    "JsonCreator",
+    "Inject",
+}
+
+EXEMPT_CONTRACT_METHODS = {
+    "toString",
+    "hashCode",
+    "equals",
+    "compareTo",
+}
+
+
+def _modifier_tokens(modifiers) -> set[str]:
+    if not modifiers:
+        return set()
+    return {str(m).strip() for m in modifiers}
+
 
 def detect_dead_code(store, limit: int = 200) -> list[dict]:
     """Java-aware dead code detection with exemption passes."""
     candidates = store.query_records(
         """
-        MATCH (m:Method)
-        WHERE NOT EXISTS { MATCH (:Method)-[:CALLS]->(m) }
+        MATCH (m:Method), (c:Class)
+        WHERE m.class_id = c.id
+          AND NOT EXISTS { MATCH (:Method)-[:CALLS]->(m) }
         RETURN m.id as method_id,
                m.name as name,
                m.signature as signature,
+               m.modifiers as modifiers,
+               c.fqcn as class_fqcn,
                m.is_constructor as is_constructor,
                m.is_test as is_test
         LIMIT $limit
@@ -25,11 +55,23 @@ def detect_dead_code(store, limit: int = 200) -> list[dict]:
     # Exempt constructors, test methods, and Java main entrypoints.
     for c in candidates:
         sig = (c.get("signature") or "").lower()
+        name = c.get("name") or ""
+        mods = _modifier_tokens(c.get("modifiers"))
         if c.get("is_constructor"):
             exempt.add(c["method_id"])
         if c.get("is_test"):
             exempt.add(c["method_id"])
-        if c.get("name") == "main" and "string[]" in sig:
+        if name == "main" and "string[]" in sig:
+            exempt.add(c["method_id"])
+        if name in EXEMPT_CONTRACT_METHODS:
+            exempt.add(c["method_id"])
+        if any(m.lstrip("@") in EXEMPT_ANNOTATIONS for m in mods):
+            exempt.add(c["method_id"])
+        # Java bean-ish APIs often rely on reflection/serialization.
+        if "public" in mods and (name.startswith("get") or name.startswith("set") or name.startswith("is")):
+            exempt.add(c["method_id"])
+        # Reflection-style hooks
+        if name in {"valueOf", "fromString", "builder"}:
             exempt.add(c["method_id"])
 
     # Exempt override/interface contract methods if relation exists.
@@ -41,12 +83,9 @@ def detect_dead_code(store, limit: int = 200) -> list[dict]:
     )
     interface_methods = store.query_records(
         """
-        MATCH (:Class)-[:IMPLEMENTS]->(:Class)
-        WITH 1 as x
-        MATCH (m:Method)
-        WHERE m.name IS NOT NULL
+        MATCH (c:Class)-[:IMPLEMENTS]->(:Class), (m:Method)
+        WHERE m.class_id = c.id
         RETURN DISTINCT m.id as method_id
-        LIMIT 100000
         """
     )
     exempt.update(r["method_id"] for r in override_methods)

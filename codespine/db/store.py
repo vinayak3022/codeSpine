@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,22 @@ class GraphStore:
 
     def execute(self, query: str, params: dict[str, Any] | None = None):
         return self.conn.execute(query, params or {})
+
+    @contextmanager
+    def transaction(self):
+        tx_started = True
+        try:
+            self.execute("BEGIN TRANSACTION")
+        except Exception:
+            tx_started = False
+        try:
+            yield
+            if tx_started:
+                self.execute("COMMIT")
+        except Exception:
+            if tx_started:
+                self.execute("ROLLBACK")
+            raise
 
     def clear_project(self, project_id: str) -> None:
         # Keep project node and rebuild attached graph artifacts.
@@ -70,6 +87,57 @@ class GraphStore:
         self.execute(
             "MERGE (p:Project {id: $id}) SET p.path = $path, p.language = 'java'",
             {"id": project_id, "path": path},
+        )
+
+    def project_file_hashes(self, project_id: str) -> dict[str, dict[str, str]]:
+        recs = self.query_records(
+            """
+            MATCH (f:File)
+            WHERE f.project_id = $pid
+            RETURN f.id as id, f.path as path, f.hash as hash
+            """,
+            {"pid": project_id},
+        )
+        return {r["id"]: {"path": r.get("path", ""), "hash": r.get("hash", "")} for r in recs}
+
+    def clear_file(self, file_id: str) -> None:
+        self.execute(
+            """
+            MATCH (s:Symbol) WHERE s.file_id = $fid
+            DETACH DELETE s
+            """,
+            {"fid": file_id},
+        )
+        self.execute(
+            """
+            MATCH (m:Method), (c:Class)
+            WHERE m.class_id = c.id AND c.file_id = $fid
+            DETACH DELETE m
+            """,
+            {"fid": file_id},
+        )
+        self.execute(
+            """
+            MATCH (c:Class) WHERE c.file_id = $fid
+            DETACH DELETE c
+            """,
+            {"fid": file_id},
+        )
+        self.execute(
+            """
+            MATCH (f:File {id: $fid})
+            DETACH DELETE f
+            """,
+            {"fid": file_id},
+        )
+
+    def list_methods(self) -> list[dict[str, Any]]:
+        return self.query_records(
+            """
+            MATCH (m:Method), (c:Class)
+            WHERE m.class_id = c.id
+            RETURN m.id as method_id, m.name as name, m.signature as signature, c.fqcn as class_fqcn
+            """
         )
 
     def upsert_file(self, file_id: str, path: str, project_id: str, is_test: bool, digest: str) -> None:

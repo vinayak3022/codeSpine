@@ -20,8 +20,13 @@ Semantic Versioning where practical.
 - Branch comparison command/tool with symbol-level add/modify/remove output.
 - Noise filtering blocklist for call graph cleanup.
 - New CLI surfaces (`impact`, `deadcode`, `flow`, `community`, `coupling`, `watch`, `diff`).
+- Additional Axon-style CLI surfaces (`context`, `cypher`, `list`, `status`, `clean`, `setup`, `serve`, `mcp`).
 - MCP server expanded with advanced tools.
 - Compatibility shim retained in `gindex.py`.
+- Fourth-pass performance tuning:
+  - hash-based incremental index invalidation
+  - persistent SQLite embedding cache
+  - transactional batched write path for indexing
 
 ## [0.1.0] - 2026-03-02
 
