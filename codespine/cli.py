@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+
+import click
+import psutil
+
+from codespine.analysis.community import detect_communities, symbol_community
+from codespine.analysis.coupling import compute_coupling, get_coupling
+from codespine.analysis.deadcode import detect_dead_code
+from codespine.analysis.flow import trace_execution_flows
+from codespine.analysis.impact import analyze_impact
+from codespine.config import SETTINGS
+from codespine.db.store import GraphStore
+from codespine.diff.branch_diff import compare_branches
+from codespine.indexer.engine import JavaIndexer
+from codespine.mcp.server import build_mcp_server
+from codespine.search.hybrid import hybrid_search
+from codespine.watch.watcher import run_watch_mode
+
+logging.basicConfig(filename=SETTINGS.log_file, level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
+
+
+def _echo_json(data, as_json: bool) -> None:
+    if as_json:
+        click.echo(json.dumps(data, indent=2))
+    else:
+        click.echo(data)
+
+
+def _is_running() -> bool:
+    if not os.path.exists(SETTINGS.pid_file):
+        return False
+    try:
+        with open(SETTINGS.pid_file, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        return psutil.pid_exists(pid)
+    except Exception:
+        return False
+
+
+def _current_repo_path() -> str:
+    return os.getcwd()
+
+
+@click.group()
+def main() -> None:
+    """CodeSpine CLI."""
+
+
+@main.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--full/--incremental", default=True, show_default=True)
+def analyse(path: str, full: bool) -> None:
+    """Index a local Java project."""
+    if _is_running():
+        click.secho("Stop MCP first ('codespine stop') to index.", fg="yellow")
+        return
+
+    store = GraphStore(read_only=False)
+    indexer = JavaIndexer(store)
+    result = indexer.index_project(path, full=full)
+    click.secho(
+        f"Indexed project={result.project_id} files={result.files_indexed} classes={result.classes_indexed} methods={result.methods_indexed}",
+        fg="green",
+    )
+
+
+@main.command()
+@click.argument("query")
+@click.option("--k", default=20, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def search(query: str, k: int, as_json: bool) -> None:
+    """Hybrid search (BM25 + vector + fuzzy + RRF)."""
+    store = GraphStore(read_only=True)
+    results = hybrid_search(store, query, k=k)
+    _echo_json(results, as_json)
+
+
+@main.command()
+@click.argument("symbol")
+@click.option("--max-depth", default=4, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def impact(symbol: str, max_depth: int, as_json: bool) -> None:
+    """Impact analysis grouped by depth with confidence scores."""
+    store = GraphStore(read_only=True)
+    result = analyze_impact(store, symbol, max_depth=max_depth)
+    _echo_json(result, as_json)
+
+
+@main.command()
+@click.option("--limit", default=200, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def deadcode(limit: int, as_json: bool) -> None:
+    """Detect dead code candidates with Java-aware exemptions."""
+    store = GraphStore(read_only=True)
+    result = detect_dead_code(store, limit=limit)
+    _echo_json(result, as_json)
+
+
+@main.command()
+@click.option("--entry", "entry_symbol", default=None)
+@click.option("--max-depth", default=6, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def flow(entry_symbol: str | None, max_depth: int, as_json: bool) -> None:
+    """Trace execution flows from detected entry points."""
+    store = GraphStore(read_only=True)
+    result = trace_execution_flows(store, entry_symbol=entry_symbol, max_depth=max_depth)
+    _echo_json(result, as_json)
+
+
+@main.command()
+@click.option("--symbol", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def community(symbol: str | None, as_json: bool) -> None:
+    """Detect communities or lookup community for a symbol."""
+    store = GraphStore(read_only=False)
+    detect_communities(store)
+    if symbol:
+        _echo_json(symbol_community(store, symbol), as_json)
+        return
+    communities = store.query_records(
+        "MATCH (c:Community) RETURN c.id as id, c.label as label, c.cohesion as cohesion ORDER BY c.cohesion DESC LIMIT 200"
+    )
+    _echo_json(communities, as_json)
+
+
+@main.command()
+@click.option("--months", default=6, show_default=True, type=int)
+@click.option("--min-strength", default=0.3, show_default=True, type=float)
+@click.option("--min-cochanges", default=3, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def coupling(months: int, min_strength: float, min_cochanges: int, as_json: bool) -> None:
+    """Compute and query git change coupling."""
+    store = GraphStore(read_only=False)
+    project = store.query_records("MATCH (p:Project) RETURN p.id as id LIMIT 1")
+    project_id = project[0]["id"] if project else os.path.basename(os.getcwd())
+    compute_coupling(store, os.getcwd(), project_id, months=months, min_strength=min_strength, min_cochanges=min_cochanges)
+    result = get_coupling(
+        store,
+        symbol=None,
+        months=months,
+        min_strength=min_strength,
+        min_cochanges=min_cochanges,
+    )
+    _echo_json(result, as_json)
+
+
+@main.command()
+@click.option("--path", default=".", show_default=True, type=click.Path(exists=True))
+@click.option("--global-interval", default=30, show_default=True, type=int)
+def watch(path: str, global_interval: int) -> None:
+    """Live re-indexing and periodic global analysis refresh."""
+    store = GraphStore(read_only=False)
+    run_watch_mode(store, os.path.abspath(path), global_interval=global_interval)
+
+
+@main.command()
+@click.argument("range_spec")
+@click.option("--json", "as_json", is_flag=True)
+def diff(range_spec: str, as_json: bool) -> None:
+    """Compare branches at symbol level: <base>..<head>."""
+    if ".." not in range_spec:
+        raise click.ClickException("Range must be in format <base>..<head>")
+    base_ref, head_ref = range_spec.split("..", 1)
+    result = compare_branches(os.getcwd(), base_ref, head_ref)
+    _echo_json(result, as_json)
+
+
+@main.command()
+def stats() -> None:
+    """Show project and graph statistics."""
+    store = GraphStore(read_only=True)
+    projects = store.query_records("MATCH (p:Project) RETURN p.id as project, p.path as path")
+    classes = store.query_records("MATCH (c:Class) RETURN count(c) as count")
+    methods = store.query_records("MATCH (m:Method) RETURN count(m) as count")
+    calls = store.query_records("MATCH (:Method)-[r:CALLS]->(:Method) RETURN count(r) as count")
+
+    click.echo("--- Projects ---")
+    click.echo(projects)
+    click.echo("--- Counts ---")
+    click.echo(
+        {
+            "classes": classes[0]["count"] if classes else 0,
+            "methods": methods[0]["count"] if methods else 0,
+            "calls": calls[0]["count"] if calls else 0,
+        }
+    )
+
+
+@main.command()
+def start() -> None:
+    """Launch MCP background server."""
+    if _is_running():
+        click.secho("CodeSpine already active.", fg="yellow")
+        return
+
+    if os.path.exists(SETTINGS.pid_file):
+        os.remove(SETTINGS.pid_file)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "codespine.cli", "run-mcp"],
+        stdout=open(SETTINGS.log_file, "a", encoding="utf-8"),
+        stderr=subprocess.STDOUT,
+    )
+    with open(SETTINGS.pid_file, "w", encoding="utf-8") as f:
+        f.write(str(proc.pid))
+    click.secho("CodeSpine MCP active", fg="cyan")
+
+
+@main.command()
+def stop() -> None:
+    """Stop MCP background server."""
+    if not os.path.exists(SETTINGS.pid_file):
+        click.echo("Nothing to stop.")
+        return
+    try:
+        with open(SETTINGS.pid_file, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        click.echo(f"Stopped {pid}")
+    except Exception:
+        click.echo("Stale PID removed")
+    finally:
+        if os.path.exists(SETTINGS.pid_file):
+            os.remove(SETTINGS.pid_file)
+
+
+@main.command("run-mcp", hidden=True)
+def run_mcp() -> None:
+    """Run MCP server in stdio mode."""
+    store = GraphStore(read_only=True)
+    mcp = build_mcp_server(store, repo_path_provider=_current_repo_path)
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
