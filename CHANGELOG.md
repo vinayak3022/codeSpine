@@ -7,6 +7,13 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-03-02
+
+### Changed
+
+- Added visible progress updates for long post-parse phases in `codespine analyse` (`Tracing calls`, `Analyzing types`).
+- Streamed call resolution edges instead of building a full in-memory list first, improving large-project latency and memory pressure.
+
 ## [0.1.5] - 2026-03-02
 
 ### Changed

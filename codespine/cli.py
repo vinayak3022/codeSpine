@@ -89,6 +89,7 @@ def analyse(path: str, full: bool) -> None:
     store = GraphStore(read_only=False)
     indexer = JavaIndexer(store)
     parse_state = {"shown": False, "indexed": 0, "total": 0, "last_ts": 0.0}
+    call_state = {"shown": False, "count": 0, "last_ts": 0.0}
 
     def _progress(event: str, payload: dict) -> None:
         now = time.perf_counter()
@@ -119,6 +120,29 @@ def analyse(path: str, full: bool) -> None:
         if event == "resolve_calls_start" and parse_state["shown"]:
             click.echo()
             parse_state["shown"] = False
+            _phase("Tracing calls...", "running")
+            return
+        if event == "resolve_calls_start":
+            _phase("Tracing calls...", "running")
+            return
+        if event == "resolve_calls_progress":
+            call_state["count"] = int(payload.get("calls_resolved", 0))
+            if (now - call_state["last_ts"]) >= 0.25:
+                click.echo(f"\rTracing calls...               {call_state['count']} resolved", nl=False)
+                call_state["shown"] = True
+                call_state["last_ts"] = now
+            return
+        if event == "resolve_calls_done":
+            if call_state["shown"]:
+                click.echo()
+            call_state["shown"] = False
+            _phase("Tracing calls...", f"{int(payload.get('calls_resolved', 0))} calls resolved")
+            return
+        if event == "resolve_types_start":
+            _phase("Analyzing types...", "running")
+            return
+        if event == "resolve_types_done":
+            _phase("Analyzing types...", f"{int(payload.get('type_relationships', 0))} type relationships")
             return
 
     result = indexer.index_project(abs_path, full=full, progress=_progress)
@@ -128,8 +152,6 @@ def analyse(path: str, full: bool) -> None:
         _phase("Parsing code...", "0/0")
     elif parse_state["indexed"] < parse_state["total"]:
         _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
-    _phase("Tracing calls...", f"{result.calls_resolved} calls resolved")
-    _phase("Analyzing types...", f"{result.type_relationships} type relationships")
 
     communities = detect_communities(store)
     _phase("Detecting communities...", f"{len(communities)} clusters found")

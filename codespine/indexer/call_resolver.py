@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Iterator
 
 from codespine.noise.blocklist import NOISE_METHOD_NAMES
 
@@ -53,10 +54,10 @@ def resolve_calls(
     calls: dict[str, list],
     method_context: dict[str, dict],
     class_catalog: dict[str, list[str]],
-) -> list[tuple[str, str, float, str]]:
+) -> Iterator[tuple[str, str, float, str]]:
     """Resolve call names to known method ids.
 
-    Returns tuples: (source_method_id, target_method_id, confidence, reason)
+    Yields tuples: (source_method_id, target_method_id, confidence, reason)
     """
     name_arity_to_method_ids: dict[tuple[str, int], list[str]] = defaultdict(list)
     class_method_index: dict[str, dict[tuple[str, int], list[str]]] = defaultdict(lambda: defaultdict(list))
@@ -65,7 +66,6 @@ def resolve_calls(
         name_arity_to_method_ids[key].append(method_id)
         class_method_index[meta["class_fqcn"]][key].append(method_id)
 
-    edges: list[tuple[str, str, float, str]] = []
     for source_id, call_sites in calls.items():
         src_meta = method_catalog.get(source_id, {})
         src_ctx = method_context.get(source_id, {})
@@ -131,7 +131,5 @@ def resolve_calls(
 
             if not targets:
                 continue
-            for target_id in targets:
-                edges.append((source_id, target_id, confidence, reason))
-
-    return edges
+            for target_id in set(targets):
+                yield source_id, target_id, confidence, reason

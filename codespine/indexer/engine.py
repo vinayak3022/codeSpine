@@ -177,6 +177,8 @@ class JavaIndexer:
             for src, dst, confidence, reason in resolve_calls(method_catalog, method_calls, method_context, class_catalog):
                 self.store.add_call(src, dst, confidence, reason)
                 calls_resolved += 1
+                if calls_resolved % 2000 == 0:
+                    self._emit(progress, "resolve_calls_progress", calls_resolved=calls_resolved)
             self._emit(progress, "resolve_calls_done", calls_resolved=calls_resolved)
 
             self._emit(progress, "resolve_types_start")
