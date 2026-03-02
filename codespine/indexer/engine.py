@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Callable
 
 from codespine.indexer.call_resolver import resolve_calls
 from codespine.indexer.java_parser import parse_java_source
@@ -25,12 +26,18 @@ class JavaIndexer:
     def __init__(self, store):
         self.store = store
 
-    def index_project(self, root_path: str, full: bool = True) -> IndexResult:
+    def index_project(
+        self,
+        root_path: str,
+        full: bool = True,
+        progress: Callable[[str, dict], None] | None = None,
+    ) -> IndexResult:
         root_path = os.path.abspath(root_path)
         project_id = os.path.basename(root_path)
         current_files = self._collect_java_files(root_path)
-        current_hashes = self._hash_files(project_id, root_path, current_files)
+        self._emit(progress, "scan_done", files_found=len(current_files))
         db_files = self.store.project_file_hashes(project_id) if not full else {}
+        current_hashes = self._hash_files(project_id, root_path, current_files) if not full else {}
 
         if full:
             to_reindex = current_files
@@ -45,6 +52,13 @@ class JavaIndexer:
                 old = db_files.get(fid, {}).get("hash")
                 if old != digest:
                     to_reindex.append(file_path)
+        self._emit(
+            progress,
+            "plan_done",
+            files_to_index=len(to_reindex),
+            deleted_files=len(deleted_file_ids),
+            mode="full" if full else "incremental",
+        )
 
         files_indexed = 0
         classes_indexed = 0
@@ -151,12 +165,23 @@ class JavaIndexer:
                         }
                         class_methods[cls.fqcn][method.signature] = m_id
                 files_indexed += 1
+                self._emit(
+                    progress,
+                    "parse_progress",
+                    indexed=files_indexed,
+                    total=len(to_reindex),
+                    file_path=file_path,
+                )
 
+            self._emit(progress, "resolve_calls_start")
             for src, dst, confidence, reason in resolve_calls(method_catalog, method_calls, method_context, class_catalog):
                 self.store.add_call(src, dst, confidence, reason)
                 calls_resolved += 1
+            self._emit(progress, "resolve_calls_done", calls_resolved=calls_resolved)
 
+            self._emit(progress, "resolve_types_start")
             type_relationships += self._build_inheritance_edges(class_meta, class_catalog, class_methods)
+            self._emit(progress, "resolve_types_done", type_relationships=type_relationships)
 
         return IndexResult(
             project_id=project_id,
@@ -172,10 +197,11 @@ class JavaIndexer:
     @staticmethod
     def _collect_java_files(root_path: str) -> list[str]:
         out: list[str] = []
-        for root, _, files in os.walk(root_path):
-            if "src" not in root:
-                continue
-            if any(skip in root for skip in ["target", "build", "out", ".git"]):
+        skip_dirs = {".git", "target", "build", "out", ".idea", ".gradle", ".mvn", "node_modules"}
+        for root, dirs, files in os.walk(root_path, topdown=True):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            normalized = root.replace("\\", "/")
+            if "/src/" not in normalized and not normalized.endswith("/src"):
                 continue
             for filename in files:
                 if filename.endswith(".java"):
@@ -303,3 +329,9 @@ class JavaIndexer:
                             self.store.add_reference("OVERRIDES", "Method", method_id, "Method", iface_method, 1.0)
                             rel_count += 1
         return rel_count
+
+    @staticmethod
+    def _emit(progress: Callable[[str, dict], None] | None, event: str, **payload: object) -> None:
+        if progress is None:
+            return
+        progress(event, payload)

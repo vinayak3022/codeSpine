@@ -7,6 +7,17 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-03-02
+
+### Changed
+
+- Improved `codespine analyse` UX with live parse progress updates during indexing.
+- Reduced full-analysis overhead by removing redundant file hash pre-pass.
+- Faster file discovery by pruning common heavy build/IDE directories.
+- Synced package version metadata across `pyproject.toml` and `codespine/__init__.py`.
+
+## [0.1.4] - 2026-03-02
+
 ### Added
 
 - Full `codespine/` package refactor with modular architecture.

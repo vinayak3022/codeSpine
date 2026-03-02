@@ -88,10 +88,46 @@ def analyse(path: str, full: bool) -> None:
     abs_path = os.path.abspath(path)
     store = GraphStore(read_only=False)
     indexer = JavaIndexer(store)
+    parse_state = {"shown": False, "indexed": 0, "total": 0, "last_ts": 0.0}
 
-    result = indexer.index_project(abs_path, full=full)
-    _phase("Walking files...", f"{result.files_found} files found")
-    _phase("Parsing code...", f"{result.files_indexed}/{result.files_found}")
+    def _progress(event: str, payload: dict) -> None:
+        now = time.perf_counter()
+        if event == "scan_done":
+            _phase("Walking files...", f"{int(payload.get('files_found', 0))} files found")
+            return
+        if event == "plan_done":
+            to_index = int(payload.get("files_to_index", 0))
+            deleted = int(payload.get("deleted_files", 0))
+            mode = str(payload.get("mode", "incremental"))
+            parse_state["total"] = to_index
+            _phase("Index mode...", f"{mode} ({to_index} files to index, {deleted} deleted)")
+            if to_index == 0:
+                _phase("Parsing code...", "0/0")
+            return
+        if event == "parse_progress":
+            indexed = int(payload.get("indexed", 0))
+            total = int(payload.get("total", 0))
+            parse_state["indexed"] = indexed
+            parse_state["total"] = total
+            if total == 0:
+                return
+            if indexed == total or (now - parse_state["last_ts"]) >= 0.2:
+                click.echo(f"\rParsing code...                {indexed}/{total}", nl=False)
+                parse_state["shown"] = True
+                parse_state["last_ts"] = now
+            return
+        if event == "resolve_calls_start" and parse_state["shown"]:
+            click.echo()
+            parse_state["shown"] = False
+            return
+
+    result = indexer.index_project(abs_path, full=full, progress=_progress)
+    if parse_state["shown"]:
+        click.echo()
+    if parse_state["total"] == 0:
+        _phase("Parsing code...", "0/0")
+    elif parse_state["indexed"] < parse_state["total"]:
+        _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
     _phase("Tracing calls...", f"{result.calls_resolved} calls resolved")
     _phase("Analyzing types...", f"{result.type_relationships} type relationships")
 
