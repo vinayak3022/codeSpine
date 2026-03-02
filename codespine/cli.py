@@ -78,7 +78,8 @@ def main() -> None:
 @main.command()
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--full/--incremental", default=True, show_default=True)
-def analyse(path: str, full: bool) -> None:
+@click.option("--deep/--no-deep", default=False, show_default=True, help="Run expensive global analyses.")
+def analyse(path: str, full: bool, deep: bool) -> None:
     """Index a local Java project."""
     if _is_running():
         click.secho("Stop MCP first ('codespine stop') to index.", fg="yellow")
@@ -153,24 +154,36 @@ def analyse(path: str, full: bool) -> None:
     elif parse_state["indexed"] < parse_state["total"]:
         _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
 
-    communities = detect_communities(store)
-    _phase("Detecting communities...", f"{len(communities)} clusters found")
+    communities: list[dict] = []
+    flows: list[dict] = []
+    dead: list[dict] = []
+    coupling_pairs: list[dict] = []
 
-    flows = trace_execution_flows(store)
-    _phase("Detecting execution flows...", f"{len(flows)} processes found")
+    should_run_deep = deep or result.files_found <= 1200
+    if should_run_deep:
+        communities = detect_communities(store)
+        _phase("Detecting communities...", f"{len(communities)} clusters found")
 
-    dead = detect_dead_code(store, limit=500)
-    _phase("Finding dead code...", f"{len(dead)} unreachable symbols")
+        flows = trace_execution_flows(store)
+        _phase("Detecting execution flows...", f"{len(flows)} processes found")
 
-    coupling_pairs = compute_coupling(
-        store,
-        abs_path,
-        result.project_id,
-        months=SETTINGS.default_coupling_months,
-        min_strength=SETTINGS.default_min_coupling_strength,
-        min_cochanges=SETTINGS.default_min_cochanges,
-    )
-    _phase("Analyzing git history...", f"{len(coupling_pairs)} coupled file pairs")
+        dead = detect_dead_code(store, limit=500)
+        _phase("Finding dead code...", f"{len(dead)} unreachable symbols")
+
+        coupling_pairs = compute_coupling(
+            store,
+            abs_path,
+            result.project_id,
+            months=SETTINGS.default_coupling_months,
+            min_strength=SETTINGS.default_min_coupling_strength,
+            min_cochanges=SETTINGS.default_min_cochanges,
+        )
+        _phase("Analyzing git history...", f"{len(coupling_pairs)} coupled file pairs")
+    else:
+        _phase("Detecting communities...", "skipped (large repo; rerun with --deep)")
+        _phase("Detecting execution flows...", "skipped (large repo; rerun with --deep)")
+        _phase("Finding dead code...", "skipped (large repo; rerun with --deep)")
+        _phase("Analyzing git history...", "skipped (large repo; rerun with --deep)")
 
     vector_count = store.query_records(
         """

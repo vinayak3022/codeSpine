@@ -7,6 +7,15 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-03-02
+
+### Changed
+
+- Added automatic fast-path for large repositories in `codespine analyse`:
+  - global heavy analyses are skipped by default on very large repos
+  - rerun with `--deep` to force full post-index analysis
+- Capped low-confidence fuzzy call expansion to avoid edge explosion and improve large-project indexing latency.
+
 ## [0.1.6] - 2026-03-02
 
 ### Changed

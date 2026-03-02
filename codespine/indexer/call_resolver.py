@@ -5,6 +5,8 @@ from typing import Iterator
 
 from codespine.noise.blocklist import NOISE_METHOD_NAMES
 
+MAX_FUZZY_TARGETS = 12
+
 
 def _simple_type_name(type_name: str | None) -> str:
     if not type_name:
@@ -126,6 +128,9 @@ def resolve_calls(
                     confidence = 1.0
                     reason = "exact_name_arity_unique"
                 elif len(targets) > 1:
+                    if len(targets) > MAX_FUZZY_TARGETS:
+                        # Avoid exploding low-confidence edges in large repos.
+                        continue
                     confidence = 0.5
                     reason = "fuzzy_name_arity_ambiguous"
 
