@@ -25,4 +25,4 @@ def test_parse_java_methods_and_calls():
     methods = {m.name: m for m in parsed.classes[0].methods}
     assert "processPayment" in methods
     assert "helper" in methods
-    assert "helper" in methods["processPayment"].calls
+    assert any(call.name == "helper" for call in methods["processPayment"].calls)

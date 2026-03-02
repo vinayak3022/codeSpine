@@ -35,7 +35,16 @@ def _load_model():
 
 @lru_cache(maxsize=1)
 def _embedding_cache_conn():
-    conn = sqlite3.connect(SETTINGS.embedding_cache_db)
+    path = SETTINGS.embedding_cache_db
+    try:
+        os_dir = path.rsplit("/", 1)[0] if "/" in path else ""
+        if os_dir:
+            import os
+
+            os.makedirs(os_dir, exist_ok=True)
+        conn = sqlite3.connect(path)
+    except Exception:
+        conn = sqlite3.connect("/tmp/.codespine_embedding_cache.sqlite3")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS embedding_cache (

@@ -21,6 +21,59 @@ def _text(node) -> str:
     return node.text.decode("utf-8")
 
 
+def _captures(query: Query, node) -> list[tuple]:
+    if hasattr(query, "captures"):
+        return query.captures(node)
+
+    from tree_sitter import QueryCursor
+
+    raw = None
+    try:
+        cursor = QueryCursor(query)
+        if hasattr(cursor, "captures"):
+            raw = cursor.captures(node)
+    except TypeError:
+        raw = None
+
+    if raw is None:
+        cursor = QueryCursor()
+        for call in (
+            lambda: cursor.captures(query, node),
+            lambda: cursor.captures(node, query),
+        ):
+            try:
+                raw = call()
+                break
+            except TypeError:
+                continue
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        out: list[tuple] = []
+        for tag, nodes in raw.items():
+            for n in nodes:
+                out.append((n, tag))
+        return out
+    out: list[tuple] = []
+    for item in raw:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        n, t = item[0], item[1]
+        if isinstance(t, int):
+            tag = None
+            for attr in ("capture_name_for_id", "capture_name"):
+                if hasattr(query, attr):
+                    try:
+                        tag = getattr(query, attr)(t)
+                        break
+                    except Exception:
+                        pass
+            out.append((n, tag if tag else str(t)))
+        else:
+            out.append((n, t))
+    return out
+
+
 def _hash_text(text: str) -> str:
     return hashlib.sha1(_normalize_java_snippet(text).encode("utf-8")).hexdigest()
 
@@ -30,6 +83,7 @@ def _normalize_java_snippet(text: str) -> str:
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s*([{}();,])\s*", r"\1", text)
     return text
 
 
@@ -51,7 +105,7 @@ def _method_hashes(source: bytes) -> dict[str, dict]:
     )
     methods: dict[str, dict] = {}
     grouped: dict[object, dict[str, str]] = {}
-    for node, tag in method_query.captures(root):
+    for node, tag in _captures(method_query, root):
         key_node = node if tag == "decl" else node.parent
         grouped.setdefault(key_node, {})[tag] = _text(node)
 
@@ -80,7 +134,7 @@ def _class_hashes(source: bytes) -> dict[str, str]:
         """,
     )
     grouped: dict[object, dict[str, str]] = {}
-    for node, tag in class_query.captures(root):
+    for node, tag in _captures(class_query, root):
         key_node = node if tag == "decl" else node.parent
         grouped.setdefault(key_node, {})[tag] = _text(node)
     out: dict[str, str] = {}

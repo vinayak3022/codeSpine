@@ -62,6 +62,66 @@ def _text(node) -> str:
     return node.text.decode("utf-8")
 
 
+def _captures(query: Query, node) -> list[tuple]:
+    """Compatibility wrapper for tree-sitter Python bindings."""
+    if hasattr(query, "captures"):
+        return query.captures(node)
+
+    from tree_sitter import QueryCursor
+
+    raw = None
+    # API shape A: QueryCursor(query).captures(node)
+    try:
+        cursor = QueryCursor(query)
+        if hasattr(cursor, "captures"):
+            raw = cursor.captures(node)
+    except TypeError:
+        raw = None
+
+    # API shape B/C: QueryCursor().captures(...)
+    if raw is None:
+        cursor = QueryCursor()
+        for call in (
+            lambda: cursor.captures(query, node),
+            lambda: cursor.captures(node, query),
+        ):
+            try:
+                raw = call()
+                break
+            except TypeError:
+                continue
+
+    if raw is None:
+        return []
+
+    # Newer bindings may return {capture_name: [nodes...]}
+    if isinstance(raw, dict):
+        out: list[tuple] = []
+        for tag, nodes in raw.items():
+            for n in nodes:
+                out.append((n, tag))
+        return out
+
+    out: list[tuple] = []
+    for item in raw:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        n, t = item[0], item[1]
+        if isinstance(t, int):
+            tag = None
+            for attr in ("capture_name_for_id", "capture_name"):
+                if hasattr(query, attr):
+                    try:
+                        tag = getattr(query, attr)(t)
+                        break
+                    except Exception:
+                        pass
+            out.append((n, tag if tag else str(t)))
+        else:
+            out.append((n, t))
+    return out
+
+
 def _hash_node(node) -> str:
     return hashlib.sha1(_normalize_java_bytes(node.text).encode("utf-8")).hexdigest()
 
@@ -122,7 +182,7 @@ def _extract_local_types(method_node) -> dict[str, str]:
           declarator: (variable_declarator name: (identifier) @name))
         """,
     )
-    captures = q.captures(method_node)
+    captures = _captures(q, method_node)
     locals_map: dict[str, str] = {}
     current_type = None
     for node, tag in captures:
@@ -142,7 +202,7 @@ def _extract_field_types(class_node) -> dict[str, str]:
           declarator: (variable_declarator name: (identifier) @name))
         """,
     )
-    captures = q.captures(class_node)
+    captures = _captures(q, class_node)
     field_map: dict[str, str] = {}
     current_type = None
     for node, tag in captures:
@@ -156,16 +216,16 @@ def _extract_field_types(class_node) -> dict[str, str]:
 def _extract_parameter_types(params_node) -> list[str]:
     if params_node is None:
         return []
-    q = Query(
-        JAVA_LANGUAGE,
-        """
-        [
-          (formal_parameter type: (_) @ptype)
-          (spread_parameter type: (_) @ptype)
-        ]
-        """,
-    )
-    return [_node_type_name(node) for node, tag in q.captures(params_node) if tag == "ptype"]
+    types: list[str] = []
+    for child in params_node.named_children:
+        if child.type in {"formal_parameter", "spread_parameter"}:
+            tnode = child.child_by_field_name("type")
+            types.append(_node_type_name(tnode))
+        elif child.type == "receiver_parameter":
+            # Keep receiver as pseudo-type to stabilize signature arity
+            tnode = child.child_by_field_name("type")
+            types.append(_node_type_name(tnode))
+    return [t for t in types if t]
 
 
 def _extract_inheritance(class_node) -> tuple[str | None, list[str]]:
@@ -189,7 +249,7 @@ def _extract_inheritance(class_node) -> tuple[str | None, list[str]]:
             ]
             """,
         )
-        interfaces = [_node_type_name(n) for n, tag in type_query.captures(iface_node) if tag == "t"]
+        interfaces = [_node_type_name(n) for n, tag in _captures(type_query, iface_node) if tag == "t"]
 
     # Fallback for grammar variants where interfaces are not exposed as a field.
     if not interfaces:
@@ -206,7 +266,7 @@ def _extract_inheritance(class_node) -> tuple[str | None, list[str]]:
                     ]
                     """,
                 )
-                interfaces.extend([_node_type_name(n) for n, tag in type_query.captures(child) if tag == "t"])
+                interfaces.extend([_node_type_name(n) for n, tag in _captures(type_query, child) if tag == "t"])
 
     return extends_name, interfaces
 
@@ -229,12 +289,12 @@ def parse_java_source(source: bytes) -> ParsedFile:
     package_name = ""
     imports: list[str] = []
 
-    for node, tag in pkg_query.captures(root):
+    for node, tag in _captures(pkg_query, root):
         if tag == "pkg":
             package_name = _text(node)
             break
 
-    for node, tag in import_query.captures(root):
+    for node, tag in _captures(import_query, root):
         if tag == "imp":
             imports.append(_text(node))
 
@@ -267,7 +327,7 @@ def parse_java_source(source: bytes) -> ParsedFile:
         """,
     )
 
-    for node, tag in cls_query.captures(root):
+    for node, tag in _captures(cls_query, root):
         if tag != "class_decl":
             continue
 
@@ -292,8 +352,8 @@ def parse_java_source(source: bytes) -> ParsedFile:
             body_hash=_hash_node(node),
         )
 
-        method_nodes = [n for n, t in method_query.captures(node) if t == "method_decl"]
-        method_nodes.extend([n for n, t in ctor_query.captures(node) if t == "method_decl"])
+        method_nodes = [n for n, t in _captures(method_query, node) if t == "method_decl"]
+        method_nodes.extend([n for n, t in _captures(ctor_query, node) if t == "method_decl"])
 
         for m_node in method_nodes:
             m_name_node = m_node.child_by_field_name("name")
@@ -323,7 +383,7 @@ def parse_java_source(source: bytes) -> ParsedFile:
             body_node = m_node.child_by_field_name("body")
             if body_node is not None:
                 grouped: dict[object, dict[str, str]] = {}
-                for c_node, c_tag in call_query.captures(body_node):
+                for c_node, c_tag in _captures(call_query, body_node):
                     inv_node = c_node if c_tag == "call_inv" else c_node.parent
                     grouped.setdefault(inv_node, {})[c_tag] = _text(c_node)
                 for inv_node, capture_map in grouped.items():

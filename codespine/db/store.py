@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -20,7 +21,13 @@ class GraphStore:
     read_only: bool = False
 
     def __post_init__(self) -> None:
-        self.db = kuzu.Database(SETTINGS.db_path, buffer_pool_size=1024**3)
+        db_path = SETTINGS.db_path
+        try:
+            self.db = kuzu.Database(db_path, buffer_pool_size=1024**3)
+        except Exception as exc:
+            fallback = os.path.join("/tmp", ".codespine_db")
+            LOGGER.warning("Primary DB path failed (%s). Falling back to %s", exc, fallback)
+            self.db = kuzu.Database(fallback, buffer_pool_size=1024**3)
         self.conn = kuzu.Connection(self.db)
         if not self.read_only:
             ensure_schema(self.conn)
