@@ -70,6 +70,7 @@ class JavaIndexer:
         method_calls: dict[str, list] = {}
         method_context: dict[str, dict] = {}
         class_catalog: dict[str, list[str]] = self._existing_class_catalog(project_id) if not full else {}
+        fqcn_to_class_ids: dict[str, list[str]] = self._existing_class_ids_by_fqcn(project_id) if not full else {}
         class_meta: dict[str, dict] = {}
         class_methods: dict[str, dict[str, str]] = self._existing_class_methods(project_id) if not full else {}
 
@@ -84,6 +85,7 @@ class JavaIndexer:
             for file_path in to_reindex:
                 rel_path = os.path.relpath(file_path, root_path)
                 is_test = "src/test/java" in file_path.replace("\\", "/")
+                scope = self._scope_from_rel_path(rel_path)
 
                 with open(file_path, "rb") as f:
                     source = f.read()
@@ -96,20 +98,25 @@ class JavaIndexer:
                 self.store.upsert_file(f_id, file_path, project_id, is_test, digest_bytes(source))
 
                 for cls in parsed.classes:
-                    c_id = class_id(cls.fqcn)
+                    c_id = class_id(cls.fqcn, scope)
                     self.store.upsert_class(c_id, cls.fqcn, cls.name, cls.package, f_id)
                     class_catalog.setdefault(cls.name, [])
                     if cls.fqcn not in class_catalog[cls.name]:
                         class_catalog[cls.name].append(cls.fqcn)
-                    class_meta[cls.fqcn] = {
+                    fqcn_to_class_ids.setdefault(cls.fqcn, [])
+                    if c_id not in fqcn_to_class_ids[cls.fqcn]:
+                        fqcn_to_class_ids[cls.fqcn].append(c_id)
+                    class_meta[c_id] = {
+                        "fqcn": cls.fqcn,
                         "package": parsed.package,
                         "imports": parsed.imports,
                         "extends": cls.extends,
                         "interfaces": cls.interfaces,
+                        "scope": scope,
                     }
-                    class_methods.setdefault(cls.fqcn, {})
+                    class_methods.setdefault(c_id, {})
 
-                    cls_symbol_id = symbol_id("class", cls.fqcn)
+                    cls_symbol_id = symbol_id("class", cls.fqcn, scope)
                     self.store.upsert_symbol(
                         symbol_id=cls_symbol_id,
                         kind="class",
@@ -123,7 +130,7 @@ class JavaIndexer:
                     classes_indexed += 1
 
                     for method in cls.methods:
-                        m_id = method_id(cls.fqcn, method.signature)
+                        m_id = method_id(cls.fqcn, method.signature, scope)
                         self.store.upsert_method(
                             method_id=m_id,
                             class_id=c_id,
@@ -136,7 +143,7 @@ class JavaIndexer:
                         )
 
                         fqname = f"{cls.fqcn}#{method.signature}"
-                        m_symbol_id = symbol_id("method", fqname)
+                        m_symbol_id = symbol_id("method", fqname, scope)
                         self.store.upsert_symbol(
                             symbol_id=m_symbol_id,
                             kind="method",
@@ -154,16 +161,18 @@ class JavaIndexer:
                             "name": method.name,
                             "param_count": len(method.parameter_types),
                             "class_fqcn": cls.fqcn,
+                            "class_id": c_id,
                         }
                         method_calls[m_id] = method.calls
                         method_context[m_id] = {
+                            "class_id": c_id,
                             "class_fqcn": cls.fqcn,
                             "local_types": method.local_types,
                             "field_types": cls.field_types,
                             "imports": parsed.imports,
                             "package": parsed.package,
                         }
-                        class_methods[cls.fqcn][method.signature] = m_id
+                        class_methods[c_id][method.signature] = m_id
                 files_indexed += 1
                 self._emit(
                     progress,
@@ -182,7 +191,12 @@ class JavaIndexer:
             self._emit(progress, "resolve_calls_done", calls_resolved=calls_resolved)
 
             self._emit(progress, "resolve_types_start")
-            type_relationships += self._build_inheritance_edges(class_meta, class_catalog, class_methods)
+            type_relationships += self._build_inheritance_edges(
+                class_meta,
+                class_catalog,
+                class_methods,
+                fqcn_to_class_ids,
+            )
             self._emit(progress, "resolve_types_done", type_relationships=type_relationships)
 
         return IndexResult(
@@ -225,7 +239,7 @@ class JavaIndexer:
             """
             MATCH (m:Method), (c:Class), (f:File)
             WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid
-            RETURN m.id as method_id, m.name as name, m.signature as signature, c.fqcn as class_fqcn
+            RETURN m.id as method_id, m.name as name, m.signature as signature, c.fqcn as class_fqcn, c.id as class_id
             """,
             {"pid": project_id},
         )
@@ -239,7 +253,28 @@ class JavaIndexer:
                 "name": r.get("name", ""),
                 "param_count": param_count,
                 "class_fqcn": r.get("class_fqcn", ""),
+                "class_id": r.get("class_id", ""),
             }
+        return out
+
+    def _existing_class_ids_by_fqcn(self, project_id: str) -> dict[str, list[str]]:
+        recs = self.store.query_records(
+            """
+            MATCH (c:Class), (f:File)
+            WHERE c.file_id = f.id AND f.project_id = $pid
+            RETURN c.fqcn as fqcn, c.id as class_id
+            """,
+            {"pid": project_id},
+        )
+        out: dict[str, list[str]] = {}
+        for r in recs:
+            fqcn = r.get("fqcn", "")
+            cid = r.get("class_id", "")
+            if not fqcn or not cid:
+                continue
+            out.setdefault(fqcn, [])
+            if cid not in out[fqcn]:
+                out[fqcn].append(cid)
         return out
 
     def _existing_class_catalog(self, project_id: str) -> dict[str, list[str]]:
@@ -263,14 +298,17 @@ class JavaIndexer:
             """
             MATCH (m:Method), (c:Class), (f:File)
             WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid
-            RETURN c.fqcn as fqcn, m.signature as signature, m.id as method_id
+            RETURN c.id as class_id, m.signature as signature, m.id as method_id
             """,
             {"pid": project_id},
         )
         out: dict[str, dict[str, str]] = {}
         for r in recs:
-            out.setdefault(r["fqcn"], {})
-            out[r["fqcn"]][r["signature"]] = r["method_id"]
+            class_key = r.get("class_id")
+            if not class_key:
+                continue
+            out.setdefault(class_key, {})
+            out[class_key][r["signature"]] = r["method_id"]
         return out
 
     @staticmethod
@@ -302,34 +340,34 @@ class JavaIndexer:
         class_meta: dict[str, dict],
         class_catalog: dict[str, list[str]],
         class_methods: dict[str, dict[str, str]],
+        fqcn_to_class_ids: dict[str, list[str]],
     ) -> int:
         rel_count = 0
-        for fqcn, meta in class_meta.items():
-            src_id = class_id(fqcn)
+        for src_id, meta in class_meta.items():
             ctx = {"package": meta.get("package", ""), "imports": meta.get("imports", [])}
 
             parent_candidates = self._resolve_type_candidates(meta.get("extends"), ctx, class_catalog)
             for parent_fqcn in parent_candidates:
-                dst_id = class_id(parent_fqcn)
-                self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 0.8)
-                rel_count += 1
-                for sig, method_id in class_methods.get(fqcn, {}).items():
-                    parent_method = class_methods.get(parent_fqcn, {}).get(sig)
-                    if parent_method:
-                        self.store.add_reference("OVERRIDES", "Method", method_id, "Method", parent_method, 1.0)
-                        rel_count += 1
+                for dst_id in fqcn_to_class_ids.get(parent_fqcn, []):
+                    self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 0.8)
+                    rel_count += 1
+                    for sig, method_id in class_methods.get(src_id, {}).items():
+                        parent_method = class_methods.get(dst_id, {}).get(sig)
+                        if parent_method:
+                            self.store.add_reference("OVERRIDES", "Method", method_id, "Method", parent_method, 1.0)
+                            rel_count += 1
 
             for iface in meta.get("interfaces", []):
                 iface_candidates = self._resolve_type_candidates(iface, ctx, class_catalog)
                 for iface_fqcn in iface_candidates:
-                    dst_id = class_id(iface_fqcn)
-                    self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 1.0)
-                    rel_count += 1
-                    for sig, method_id in class_methods.get(fqcn, {}).items():
-                        iface_method = class_methods.get(iface_fqcn, {}).get(sig)
-                        if iface_method:
-                            self.store.add_reference("OVERRIDES", "Method", method_id, "Method", iface_method, 1.0)
-                            rel_count += 1
+                    for dst_id in fqcn_to_class_ids.get(iface_fqcn, []):
+                        self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 1.0)
+                        rel_count += 1
+                        for sig, method_id in class_methods.get(src_id, {}).items():
+                            iface_method = class_methods.get(dst_id, {}).get(sig)
+                            if iface_method:
+                                self.store.add_reference("OVERRIDES", "Method", method_id, "Method", iface_method, 1.0)
+                                rel_count += 1
         return rel_count
 
     @staticmethod
@@ -337,3 +375,13 @@ class JavaIndexer:
         if progress is None:
             return
         progress(event, payload)
+
+    @staticmethod
+    def _scope_from_rel_path(rel_path: str) -> str:
+        normalized = rel_path.replace("\\", "/")
+        if "/java/" in normalized:
+            return normalized.split("/java/", 1)[0]
+        if "/src/" in normalized:
+            return normalized.split("/src/", 1)[0]
+        scope = os.path.dirname(normalized).strip()
+        return scope or "."

@@ -62,16 +62,23 @@ def resolve_calls(
     Yields tuples: (source_method_id, target_method_id, confidence, reason)
     """
     name_arity_to_method_ids: dict[tuple[str, int], list[str]] = defaultdict(list)
-    class_method_index: dict[str, dict[tuple[str, int], list[str]]] = defaultdict(lambda: defaultdict(list))
+    class_method_index_by_id: dict[str, dict[tuple[str, int], list[str]]] = defaultdict(lambda: defaultdict(list))
+    class_method_index_by_fqcn: dict[str, dict[tuple[str, int], list[str]]] = defaultdict(lambda: defaultdict(list))
     for method_id, meta in method_catalog.items():
         key = (meta["name"], int(meta["param_count"]))
         name_arity_to_method_ids[key].append(method_id)
-        class_method_index[meta["class_fqcn"]][key].append(method_id)
+        class_id = meta.get("class_id", "")
+        class_fqcn = meta.get("class_fqcn", "")
+        if class_id:
+            class_method_index_by_id[class_id][key].append(method_id)
+        if class_fqcn:
+            class_method_index_by_fqcn[class_fqcn][key].append(method_id)
 
     for source_id, call_sites in calls.items():
         src_meta = method_catalog.get(source_id, {})
         src_ctx = method_context.get(source_id, {})
-        src_class = src_meta.get("class_fqcn", "")
+        src_class_id = src_meta.get("class_id", "") or src_ctx.get("class_id", "")
+        src_class_fqcn = src_meta.get("class_fqcn", "")
         local_types = src_ctx.get("local_types", {}) or {}
         field_types = src_ctx.get("field_types", {}) or {}
 
@@ -90,7 +97,7 @@ def resolve_calls(
                 receiver_type = None
                 receiver_is_this = False
                 if receiver == "this":
-                    receiver_type = src_class
+                    receiver_type = src_class_fqcn
                     receiver_is_this = True
                 elif receiver in local_types:
                     receiver_type = local_types[receiver]
@@ -102,14 +109,14 @@ def resolve_calls(
                 receiver_fqcn_candidates = _resolve_type_candidates(receiver_type, src_ctx, class_catalog)
 
                 for fqcn in receiver_fqcn_candidates:
-                    targets.extend(class_method_index.get(fqcn, {}).get(key, []))
+                    targets.extend(class_method_index_by_fqcn.get(fqcn, {}).get(key, []))
 
                 if targets:
                     confidence = 1.0 if receiver_is_this else 0.8
                     reason = "receiver_this_exact" if receiver_is_this else "receiver_method_match"
 
             if not targets:
-                in_class = class_method_index.get(src_class, {}).get(key, [])
+                in_class = class_method_index_by_id.get(src_class_id, {}).get(key, [])
                 if in_class:
                     targets = in_class
                     confidence = 1.0

@@ -7,6 +7,14 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-03-03
+
+### Changed
+
+- Fixed multi-module indexing collisions by introducing module-scoped class/method/symbol IDs.
+- Improved resolver fidelity for multi-module projects by preferring exact class-ID matches for intra-class calls.
+- Added regression coverage for duplicate FQCNs across modules.
+
 ## [0.1.7] - 2026-03-02
 
 ### Changed
