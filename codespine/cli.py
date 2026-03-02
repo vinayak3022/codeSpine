@@ -77,7 +77,7 @@ def main() -> None:
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True))
-@click.option("--full/--incremental", default=True, show_default=True)
+@click.option("--full/--incremental", default=False, show_default=True)
 @click.option("--deep/--no-deep", default=False, show_default=True, help="Run expensive global analyses.")
 def analyse(path: str, full: bool, deep: bool) -> None:
     """Index a local Java project."""
@@ -89,7 +89,7 @@ def analyse(path: str, full: bool, deep: bool) -> None:
     abs_path = os.path.abspath(path)
     store = GraphStore(read_only=False)
     indexer = JavaIndexer(store)
-    parse_state = {"shown": False, "indexed": 0, "total": 0, "last_ts": 0.0}
+    parse_state = {"shown": False, "indexed": 0, "total": 0, "last_ts": 0.0, "printed_zero": False}
     call_state = {"shown": False, "count": 0, "last_ts": 0.0}
 
     def _progress(event: str, payload: dict) -> None:
@@ -105,6 +105,7 @@ def analyse(path: str, full: bool, deep: bool) -> None:
             _phase("Index mode...", f"{mode} ({to_index} files to index, {deleted} deleted)")
             if to_index == 0:
                 _phase("Parsing code...", "0/0")
+                parse_state["printed_zero"] = True
             return
         if event == "parse_progress":
             indexed = int(payload.get("indexed", 0))
@@ -149,7 +150,7 @@ def analyse(path: str, full: bool, deep: bool) -> None:
     result = indexer.index_project(abs_path, full=full, progress=_progress)
     if parse_state["shown"]:
         click.echo()
-    if parse_state["total"] == 0:
+    if parse_state["total"] == 0 and not parse_state["printed_zero"]:
         _phase("Parsing code...", "0/0")
     elif parse_state["indexed"] < parse_state["total"]:
         _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Callable
 
+from codespine.config import SETTINGS
 from codespine.indexer.call_resolver import resolve_calls
 from codespine.indexer.java_parser import parse_java_source
 from codespine.indexer.symbol_builder import class_id, digest_bytes, file_id, method_id, symbol_id
@@ -37,21 +39,24 @@ class JavaIndexer:
         current_files = self._collect_java_files(root_path)
         self._emit(progress, "scan_done", files_found=len(current_files))
         db_files = self.store.project_file_hashes(project_id) if not full else {}
-        current_hashes = self._hash_files(project_id, root_path, current_files) if not full else {}
+        meta_cache = self._load_file_meta_cache(project_id)
+        current_file_ids = {
+            file_id(project_id, os.path.relpath(fp, root_path))
+            for fp in current_files
+        }
 
         if full:
             to_reindex = current_files
             deleted_file_ids = []
+            meta_cache = {}
         else:
-            to_reindex = []
-            deleted_file_ids = [fid for fid in db_files if fid not in current_hashes]
-            for file_path in current_files:
-                rel_path = os.path.relpath(file_path, root_path)
-                fid = file_id(project_id, rel_path)
-                digest = current_hashes[fid]
-                old = db_files.get(fid, {}).get("hash")
-                if old != digest:
-                    to_reindex.append(file_path)
+            to_reindex, deleted_file_ids, meta_cache = self._plan_incremental(
+                project_id,
+                root_path,
+                current_files,
+                db_files,
+                meta_cache,
+            )
         self._emit(
             progress,
             "plan_done",
@@ -59,6 +64,21 @@ class JavaIndexer:
             deleted_files=len(deleted_file_ids),
             mode="full" if full else "incremental",
         )
+        if not full and not to_reindex and not deleted_file_ids:
+            self._prune_meta_cache(meta_cache, current_file_ids)
+            self._save_file_meta_cache(project_id, meta_cache)
+            self._emit(progress, "resolve_calls_done", calls_resolved=0)
+            self._emit(progress, "resolve_types_done", type_relationships=0)
+            return IndexResult(
+                project_id=project_id,
+                files_found=len(current_files),
+                files_indexed=0,
+                classes_indexed=0,
+                methods_indexed=0,
+                calls_resolved=0,
+                type_relationships=0,
+                embeddings_generated=0,
+            )
 
         files_indexed = 0
         classes_indexed = 0
@@ -92,10 +112,12 @@ class JavaIndexer:
 
                 parsed = parse_java_source(source)
                 f_id = file_id(project_id, rel_path)
+                file_digest = digest_bytes(source)
                 if not full:
                     # Drop old symbols/methods/classes for changed files before reinserting.
                     self.store.clear_file(f_id)
-                self.store.upsert_file(f_id, file_path, project_id, is_test, digest_bytes(source))
+                self.store.upsert_file(f_id, file_path, project_id, is_test, file_digest)
+                self._update_meta_cache_entry(meta_cache, f_id, file_path, file_digest, len(source))
 
                 for cls in parsed.classes:
                     c_id = class_id(cls.fqcn, scope)
@@ -199,6 +221,9 @@ class JavaIndexer:
             )
             self._emit(progress, "resolve_types_done", type_relationships=type_relationships)
 
+        self._prune_meta_cache(meta_cache, current_file_ids)
+        self._save_file_meta_cache(project_id, meta_cache)
+
         return IndexResult(
             project_id=project_id,
             files_found=len(current_files),
@@ -224,15 +249,52 @@ class JavaIndexer:
                     out.append(os.path.join(root, filename))
         return out
 
-    @staticmethod
-    def _hash_files(project_id: str, root_path: str, files: list[str]) -> dict[str, str]:
-        hashes: dict[str, str] = {}
-        for fp in files:
-            rel = os.path.relpath(fp, root_path)
-            fid = file_id(project_id, rel)
-            with open(fp, "rb") as f:
-                hashes[fid] = digest_bytes(f.read())
-        return hashes
+    def _plan_incremental(
+        self,
+        project_id: str,
+        root_path: str,
+        files: list[str],
+        db_files: dict[str, dict[str, str]],
+        meta_cache: dict[str, dict],
+    ) -> tuple[list[str], list[str], dict[str, dict]]:
+        current_ids = {
+            file_id(project_id, os.path.relpath(fp, root_path))
+            for fp in files
+        }
+        deleted_file_ids = [fid for fid in db_files if fid not in current_ids]
+        to_reindex: list[str] = []
+
+        for file_path in files:
+            rel_path = os.path.relpath(file_path, root_path)
+            fid = file_id(project_id, rel_path)
+            old_hash = db_files.get(fid, {}).get("hash")
+            try:
+                st = os.stat(file_path)
+            except OSError:
+                continue
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+            size = int(st.st_size)
+            cached = meta_cache.get(fid, {})
+
+            if (
+                cached
+                and int(cached.get("mtime_ns", -1)) == mtime_ns
+                and int(cached.get("size", -1)) == size
+                and cached.get("hash")
+                and cached.get("hash") == old_hash
+            ):
+                continue
+
+            with open(file_path, "rb") as f:
+                digest = digest_bytes(f.read())
+            meta_cache[fid] = {"mtime_ns": mtime_ns, "size": size, "hash": digest}
+            if old_hash != digest:
+                to_reindex.append(file_path)
+
+        for fid in deleted_file_ids:
+            meta_cache.pop(fid, None)
+
+        return to_reindex, deleted_file_ids, meta_cache
 
     def _existing_method_catalog(self, project_id: str) -> dict[str, dict]:
         recs = self.store.query_records(
@@ -369,6 +431,56 @@ class JavaIndexer:
                                 self.store.add_reference("OVERRIDES", "Method", method_id, "Method", iface_method, 1.0)
                                 rel_count += 1
         return rel_count
+
+    @staticmethod
+    def _meta_cache_path(project_id: str) -> str:
+        base = SETTINGS.index_meta_dir
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError:
+            base = "/tmp/.codespine_index_meta"
+            os.makedirs(base, exist_ok=True)
+        return os.path.join(base, f"{project_id}.json")
+
+    def _load_file_meta_cache(self, project_id: str) -> dict[str, dict]:
+        path = self._meta_cache_path(project_id)
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError, TypeError):
+            return {}
+        return {}
+
+    def _save_file_meta_cache(self, project_id: str, data: dict[str, dict]) -> None:
+        path = self._meta_cache_path(project_id)
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, separators=(",", ":"))
+            os.replace(tmp_path, path)
+        except OSError:
+            return
+
+    @staticmethod
+    def _update_meta_cache_entry(meta_cache: dict[str, dict], fid: str, file_path: str, digest: str, size_hint: int) -> None:
+        try:
+            st = os.stat(file_path)
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+            size = int(st.st_size)
+        except OSError:
+            mtime_ns = -1
+            size = size_hint
+        meta_cache[fid] = {"mtime_ns": mtime_ns, "size": size, "hash": digest}
+
+    @staticmethod
+    def _prune_meta_cache(meta_cache: dict[str, dict], current_file_ids: set[str]) -> None:
+        for fid in list(meta_cache.keys()):
+            if fid not in current_file_ids:
+                del meta_cache[fid]
 
     @staticmethod
     def _emit(progress: Callable[[str, dict], None] | None, event: str, **payload: object) -> None:

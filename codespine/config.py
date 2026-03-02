@@ -8,6 +8,7 @@ class Settings:
     pid_file: str = os.path.expanduser("~/.codespine.pid")
     log_file: str = os.path.expanduser("~/.codespine.log")
     embedding_cache_db: str = os.path.expanduser("~/.codespine_embedding_cache.sqlite3")
+    index_meta_dir: str = os.path.expanduser("~/.codespine_index_meta")
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     vector_dim: int = 384
     rrf_k: int = 60

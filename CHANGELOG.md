@@ -7,6 +7,15 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-03-03
+
+### Changed
+
+- Switched `codespine analyse` default mode to incremental (`--incremental`).
+- Added persistent file metadata cache (`mtime`, `size`, `hash`) to avoid re-hashing unchanged files on incremental runs.
+- Added early no-op short-circuit when no Java files changed, reducing repeat analyze latency.
+- Added regression coverage for zero-reindex incremental runs.
+
 ## [0.1.8] - 2026-03-03
 
 ### Changed
