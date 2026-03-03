@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -10,6 +12,30 @@ from codespine.indexer.call_resolver import resolve_calls
 from codespine.indexer.java_parser import parse_java_source
 from codespine.indexer.symbol_builder import class_id, digest_bytes, file_id, method_id, symbol_id
 from codespine.search.vector import embed_text
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _parse_file_worker(file_path: str, root_path: str, project_id: str) -> dict:
+    """Pure CPU/IO work – no DB access. Safe to run in a thread pool."""
+    rel_path = os.path.relpath(file_path, root_path)
+    is_test = "src/test/java" in file_path.replace("\\", "/")
+    scope = JavaIndexer._scope_from_rel_path(rel_path)
+    with open(file_path, "rb") as fh:
+        source = fh.read()
+    parsed = parse_java_source(source)
+    f_id = file_id(project_id, rel_path)
+    digest = digest_bytes(source)
+    return {
+        "file_path": file_path,
+        "rel_path": rel_path,
+        "source": source,
+        "parsed": parsed,
+        "f_id": f_id,
+        "digest": digest,
+        "is_test": is_test,
+        "scope": scope,
+    }
 
 
 @dataclass
@@ -28,14 +54,106 @@ class JavaIndexer:
     def __init__(self, store):
         self.store = store
 
+    @staticmethod
+    def detect_projects_in_workspace(root_path: str) -> list[str]:
+        """Detect independent projects under a workspace folder (e.g. ~/IdeaProjects/).
+
+        A *workspace* is a directory that is not itself a project but contains
+        multiple independent project directories (each with a .git dir or a build
+        file at their root).  If root_path itself is a project, returns [root_path].
+
+        Returns a list of project root directories (absolute paths).
+        """
+        root_path = os.path.abspath(root_path)
+        build_markers = {
+            "pom.xml", "build.gradle", "build.gradle.kts",
+            "settings.gradle", "settings.gradle.kts",
+        }
+        skip = {".git", "target", "build", "out", ".idea", ".gradle", ".mvn", "node_modules"}
+
+        # If the root itself looks like a project, it is the only project.
+        has_git = os.path.isdir(os.path.join(root_path, ".git"))
+        has_build = any(os.path.isfile(os.path.join(root_path, m)) for m in build_markers)
+        if has_git or has_build:
+            return [root_path]
+
+        # Scan one level deep for project subdirectories.
+        project_dirs: list[str] = []
+        try:
+            for entry in os.scandir(root_path):
+                if not entry.is_dir() or entry.name.startswith(".") or entry.name in skip:
+                    continue
+                sub_has_git = os.path.isdir(os.path.join(entry.path, ".git"))
+                sub_has_build = any(
+                    os.path.isfile(os.path.join(entry.path, m)) for m in build_markers
+                )
+                if sub_has_git or sub_has_build:
+                    project_dirs.append(os.path.abspath(entry.path))
+        except OSError:
+            pass
+
+        return sorted(project_dirs) if project_dirs else [root_path]
+
+    @staticmethod
+    def detect_modules(root_path: str) -> list[str]:
+        """Detect Maven/Gradle module boundaries under root_path.
+
+        Returns a list of module root directories (absolute paths).
+        Returns [root_path] for single-module projects.
+        """
+        import re
+
+        root_path = os.path.abspath(root_path)
+        build_markers = {"pom.xml", "build.gradle", "build.gradle.kts"}
+
+        # Maven multi-module: parent pom.xml with <modules> element
+        parent_pom = os.path.join(root_path, "pom.xml")
+        if os.path.isfile(parent_pom):
+            try:
+                with open(parent_pom, "rb") as f:
+                    content = f.read().decode("utf-8", errors="replace")
+                if "<modules>" in content:
+                    raw_modules = re.findall(r"<module>(.*?)</module>", content)
+                    found = []
+                    for m in raw_modules:
+                        m_path = os.path.join(root_path, m.strip())
+                        if os.path.isdir(m_path):
+                            found.append(os.path.abspath(m_path))
+                    if found:
+                        return found
+            except OSError:
+                pass
+
+        # Gradle multi-project: subdirs with their own build file
+        module_dirs: list[str] = []
+        skip = {".git", "target", "build", "out", ".idea", ".gradle", ".mvn", "node_modules"}
+        try:
+            for entry in os.scandir(root_path):
+                if not entry.is_dir() or entry.name.startswith(".") or entry.name in skip:
+                    continue
+                for marker in build_markers:
+                    if os.path.isfile(os.path.join(entry.path, marker)):
+                        module_dirs.append(os.path.abspath(entry.path))
+                        break
+        except OSError:
+            pass
+
+        if module_dirs:
+            return sorted(module_dirs)
+
+        return [root_path]
+
     def index_project(
         self,
         root_path: str,
         full: bool = True,
         progress: Callable[[str, dict], None] | None = None,
+        project_id: str | None = None,
+        embed: bool = True,
     ) -> IndexResult:
         root_path = os.path.abspath(root_path)
-        project_id = os.path.basename(root_path)
+        if project_id is None:
+            project_id = os.path.basename(root_path)
         current_files = self._collect_java_files(root_path)
         self._emit(progress, "scan_done", files_found=len(current_files))
         db_files = self.store.project_file_hashes(project_id) if not full else {}
@@ -94,6 +212,33 @@ class JavaIndexer:
         class_meta: dict[str, dict] = {}
         class_methods: dict[str, dict[str, str]] = self._existing_class_methods(project_id) if not full else {}
 
+        # ── Parallel parse (CPU/IO) ──────────────────────────────────────────
+        # tree-sitter releases the GIL so ThreadPoolExecutor gives real speedup.
+        _workers = max(1, min(8, len(to_reindex), os.cpu_count() or 4))
+        parse_results: list[dict] = []
+        if to_reindex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_workers) as ex:
+                futs = {
+                    ex.submit(_parse_file_worker, fp, root_path, project_id): fp
+                    for fp in to_reindex
+                }
+                done = 0
+                for fut in concurrent.futures.as_completed(futs):
+                    done += 1
+                    fp = futs[fut]
+                    try:
+                        parse_results.append(fut.result())
+                    except Exception as exc:
+                        LOGGER.warning("Skipping %s: %s", fp, exc)
+                    self._emit(
+                        progress,
+                        "parse_progress",
+                        indexed=done,
+                        total=len(to_reindex),
+                        file_path=fp,
+                    )
+
+        # ── Sequential DB writes ─────────────────────────────────────────────
         with self.store.transaction():
             self.store.upsert_project(project_id, root_path)
             if full:
@@ -102,19 +247,16 @@ class JavaIndexer:
                 for fid in deleted_file_ids:
                     self.store.clear_file(fid)
 
-            for file_path in to_reindex:
-                rel_path = os.path.relpath(file_path, root_path)
-                is_test = "src/test/java" in file_path.replace("\\", "/")
-                scope = self._scope_from_rel_path(rel_path)
+            for pr in parse_results:
+                file_path = pr["file_path"]
+                parsed = pr["parsed"]
+                f_id = pr["f_id"]
+                file_digest = pr["digest"]
+                is_test = pr["is_test"]
+                scope = pr["scope"]
+                source = pr["source"]
 
-                with open(file_path, "rb") as f:
-                    source = f.read()
-
-                parsed = parse_java_source(source)
-                f_id = file_id(project_id, rel_path)
-                file_digest = digest_bytes(source)
                 if not full:
-                    # Drop old symbols/methods/classes for changed files before reinserting.
                     self.store.clear_file(f_id)
                 self.store.upsert_file(f_id, file_path, project_id, is_test, file_digest)
                 self._update_meta_cache_entry(meta_cache, f_id, file_path, file_digest, len(source))
@@ -147,7 +289,7 @@ class JavaIndexer:
                         file_id=f_id,
                         line=cls.line,
                         col=cls.col,
-                        embedding=embed_text(f"class {cls.fqcn}"),
+                        embedding=embed_text(f"class {cls.fqcn}") if embed else None,
                     )
                     classes_indexed += 1
 
@@ -174,7 +316,7 @@ class JavaIndexer:
                             file_id=f_id,
                             line=method.line,
                             col=method.col,
-                            embedding=embed_text(f"method {fqname} returns {method.return_type}"),
+                            embedding=embed_text(f"method {fqname} returns {method.return_type}") if embed else None,
                         )
                         methods_indexed += 1
 
@@ -196,13 +338,6 @@ class JavaIndexer:
                         }
                         class_methods[c_id][method.signature] = m_id
                 files_indexed += 1
-                self._emit(
-                    progress,
-                    "parse_progress",
-                    indexed=files_indexed,
-                    total=len(to_reindex),
-                    file_path=file_path,
-                )
 
             self._emit(progress, "resolve_calls_start")
             for src, dst, confidence, reason in resolve_calls(method_catalog, method_calls, method_context, class_catalog):
@@ -232,7 +367,7 @@ class JavaIndexer:
             methods_indexed=methods_indexed,
             calls_resolved=calls_resolved,
             type_relationships=type_relationships,
-            embeddings_generated=classes_indexed + methods_indexed,
+            embeddings_generated=classes_indexed + methods_indexed if embed else 0,
         )
 
     @staticmethod

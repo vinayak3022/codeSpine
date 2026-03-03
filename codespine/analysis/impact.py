@@ -3,21 +3,26 @@ from __future__ import annotations
 from collections import defaultdict, deque
 
 
-def _resolve_symbol_ids(store, symbol_query: str) -> list[str]:
+def _resolve_symbol_ids(store, symbol_query: str, project: str | None = None) -> list[str]:
+    project_clause = "AND f.project_id = $proj" if project else ""
+    params: dict = {"q": symbol_query}
+    if project:
+        params["proj"] = project
     recs = store.query_records(
-        """
-        MATCH (s:Symbol)
-        WHERE s.id = $q OR lower(s.name) = lower($q) OR lower(s.fqname) = lower($q) OR lower(s.fqname) CONTAINS lower($q)
+        f"""
+        MATCH (s:Symbol), (f:File)
+        WHERE s.file_id = f.id {project_clause}
+        AND (s.id = $q OR lower(s.name) = lower($q) OR lower(s.fqname) = lower($q) OR lower(s.fqname) CONTAINS lower($q))
         RETURN s.id as id
         LIMIT 50
         """,
-        {"q": symbol_query},
+        params,
     )
     return [r["id"] for r in recs]
 
 
-def analyze_impact(store, symbol_query: str, max_depth: int = 4) -> dict:
-    target_symbol_ids = _resolve_symbol_ids(store, symbol_query)
+def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | None = None) -> dict:
+    target_symbol_ids = _resolve_symbol_ids(store, symbol_query, project=project)
     if not target_symbol_ids:
         return {"target": symbol_query, "depth_groups": {"1": [], "2": [], "3+": []}}
 
@@ -36,6 +41,8 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4) -> dict:
     if not target_method_ids:
         return {"target": symbol_query, "depth_groups": {"1": [], "2": [], "3+": []}}
 
+    # Load all call edges – cross-project callers are included intentionally so
+    # impact analysis surfaces inter-module dependencies.
     edges = store.query_records(
         """
         MATCH (a:Method)-[r:CALLS]->(b:Method)

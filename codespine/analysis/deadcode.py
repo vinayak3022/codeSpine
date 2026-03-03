@@ -28,24 +28,42 @@ def _modifier_tokens(modifiers) -> set[str]:
     return {str(m).strip() for m in modifiers}
 
 
-def detect_dead_code(store, limit: int = 200) -> list[dict]:
+def detect_dead_code(store, limit: int = 200, project: str | None = None) -> list[dict]:
     """Java-aware dead code detection with exemption passes."""
-    candidates = store.query_records(
-        """
-        MATCH (m:Method), (c:Class)
-        WHERE m.class_id = c.id
-          AND NOT EXISTS { MATCH (:Method)-[:CALLS]->(m) }
-        RETURN m.id as method_id,
-               m.name as name,
-               m.signature as signature,
-               m.modifiers as modifiers,
-               c.fqcn as class_fqcn,
-               m.is_constructor as is_constructor,
-               m.is_test as is_test
-        LIMIT $limit
-        """,
-        {"limit": int(limit * 3)},
-    )
+    if project:
+        candidates = store.query_records(
+            """
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $proj
+              AND NOT EXISTS { MATCH (:Method)-[:CALLS]->(m) }
+            RETURN m.id as method_id,
+                   m.name as name,
+                   m.signature as signature,
+                   m.modifiers as modifiers,
+                   c.fqcn as class_fqcn,
+                   m.is_constructor as is_constructor,
+                   m.is_test as is_test
+            LIMIT $limit
+            """,
+            {"limit": int(limit * 3), "proj": project},
+        )
+    else:
+        candidates = store.query_records(
+            """
+            MATCH (m:Method), (c:Class)
+            WHERE m.class_id = c.id
+              AND NOT EXISTS { MATCH (:Method)-[:CALLS]->(m) }
+            RETURN m.id as method_id,
+                   m.name as name,
+                   m.signature as signature,
+                   m.modifiers as modifiers,
+                   c.fqcn as class_fqcn,
+                   m.is_constructor as is_constructor,
+                   m.is_test as is_test
+            LIMIT $limit
+            """,
+            {"limit": int(limit * 3)},
+        )
 
     if not candidates:
         return []

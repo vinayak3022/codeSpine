@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,8 @@ from codespine.db.schema import ensure_schema
 
 LOGGER = logging.getLogger(__name__)
 
+_BUFFER_POOL_SIZE = 256 * 1024 * 1024  # 256 MB – small enough for page eviction to work
+
 
 @dataclass
 class GraphStore:
@@ -22,15 +25,28 @@ class GraphStore:
 
     def __post_init__(self) -> None:
         db_path = SETTINGS.db_path
+        self._tls: threading.local = threading.local()
         try:
-            self.db = kuzu.Database(db_path, buffer_pool_size=1024**3)
+            self.db = self._open_db(db_path)
         except Exception as exc:
             fallback = os.path.join("/tmp", ".codespine_db")
             LOGGER.warning("Primary DB path failed (%s). Falling back to %s", exc, fallback)
-            self.db = kuzu.Database(fallback, buffer_pool_size=1024**3)
-        self.conn = kuzu.Connection(self.db)
+            self.db = self._open_db(fallback)
         if not self.read_only:
-            ensure_schema(self.conn)
+            ensure_schema(self._conn())
+
+    def _open_db(self, path: str) -> kuzu.Database:
+        # Newer Kuzu versions accept read_only; fall back for older ones.
+        try:
+            return kuzu.Database(path, buffer_pool_size=_BUFFER_POOL_SIZE, read_only=self.read_only)
+        except TypeError:
+            return kuzu.Database(path, buffer_pool_size=_BUFFER_POOL_SIZE)
+
+    def _conn(self) -> kuzu.Connection:
+        """Return the per-thread Kuzu connection, creating it lazily."""
+        if not hasattr(self._tls, "conn") or self._tls.conn is None:
+            self._tls.conn = kuzu.Connection(self.db)
+        return self._tls.conn
 
     @staticmethod
     def stable_id(*parts: str) -> str:
@@ -38,7 +54,7 @@ class GraphStore:
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def execute(self, query: str, params: dict[str, Any] | None = None):
-        return self.conn.execute(query, params or {})
+        return self._conn().execute(query, params or {})
 
     @contextmanager
     def transaction(self):
@@ -281,11 +297,14 @@ class GraphStore:
             "MERGE (c:Community {id: $id}) SET c.label = $label, c.cohesion = $cohesion",
             {"id": community_id, "label": label, "cohesion": cohesion},
         )
-        for sid in symbol_ids:
-            self.execute(
-                "MATCH (s:Symbol {id: $sid}), (c:Community {id: $cid}) MERGE (s)-[:IN_COMMUNITY]->(c)",
-                {"sid": sid, "cid": community_id},
-            )
+        # Batch all symbol→community edges in one transaction to prevent buffer pool exhaustion
+        # on large projects (53 K+ symbols would OOM without a single commit boundary).
+        with self.transaction():
+            for sid in symbol_ids:
+                self.execute(
+                    "MATCH (s:Symbol {id: $sid}), (c:Community {id: $cid}) MERGE (s)-[:IN_COMMUNITY]->(c)",
+                    {"sid": sid, "cid": community_id},
+                )
 
     def set_flow(self, flow_id: str, entry_symbol_id: str, kind: str, symbols_at_depth: list[tuple[str, int]]) -> None:
         self.execute(

@@ -7,10 +7,16 @@ from codespine.search.rrf import reciprocal_rank_fusion
 from codespine.search.vector import rank_semantic
 
 
-def hybrid_search(store, query: str, k: int = 20) -> list[dict]:
+def hybrid_search(store, query: str, k: int = 20, project: str | None = None) -> list[dict]:
+    project_clause = "AND f.project_id = $proj" if project else ""
+    params: dict = {"lim": SETTINGS.semantic_candidate_pool}
+    if project:
+        params["proj"] = project
+
     recs = store.query_records(
-        """
-        MATCH (s:Symbol), (f:File {id: s.file_id})
+        f"""
+        MATCH (s:Symbol), (f:File)
+        WHERE s.file_id = f.id {project_clause}
         RETURN s.id as id,
                s.kind as kind,
                s.name as name,
@@ -20,7 +26,7 @@ def hybrid_search(store, query: str, k: int = 20) -> list[dict]:
                f.is_test as is_test
         LIMIT $lim
         """,
-        {"lim": SETTINGS.semantic_candidate_pool},
+        params,
     )
 
     if not recs:

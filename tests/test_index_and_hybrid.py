@@ -16,7 +16,9 @@ def test_index_and_hybrid_search():
     result = JavaIndexer(store).index_project(str(fixture), full=True)
     assert result.files_indexed >= 2
 
-    results = hybrid_search(store, "process payment", k=5)
+    # Scope to the fixture project to avoid interference from other indexed projects.
+    project_id = result.project_id
+    results = hybrid_search(store, "process payment", k=5, project=project_id)
     assert results
     assert any("processPayment" in (r.get("fqname") or "") for r in results)
 

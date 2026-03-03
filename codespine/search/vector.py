@@ -42,9 +42,9 @@ def _embedding_cache_conn():
             import os
 
             os.makedirs(os_dir, exist_ok=True)
-        conn = sqlite3.connect(path)
+        conn = sqlite3.connect(path, check_same_thread=False)
     except Exception:
-        conn = sqlite3.connect("/tmp/.codespine_embedding_cache.sqlite3")
+        conn = sqlite3.connect("/tmp/.codespine_embedding_cache.sqlite3", check_same_thread=False)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS embedding_cache (

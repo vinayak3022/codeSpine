@@ -79,9 +79,20 @@ def main() -> None:
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--full/--incremental", default=False, show_default=True)
 @click.option("--deep/--no-deep", default=False, show_default=True, help="Run expensive global analyses.")
-def analyse(path: str, full: bool, deep: bool) -> None:
-    """Index a local Java project."""
-    if _is_running():
+@click.option(
+    "--embed/--no-embed",
+    default=False,
+    show_default=True,
+    help="Generate vector embeddings (slow if sentence-transformers installed; enables semantic search).",
+)
+@click.option("--allow-running", is_flag=True, hidden=True, help="Skip MCP running check (used by MCP analyse_project tool).")
+def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool) -> None:
+    """Index a local Java project (auto-detects workspace / Maven / Gradle layout).
+
+    By default embeddings are skipped for speed. Pass --embed to generate
+    vector embeddings for semantic search (requires sentence-transformers).
+    """
+    if not allow_running and _is_running():
         click.secho("Stop MCP first ('codespine stop') to index.", fg="yellow")
         return
 
@@ -89,8 +100,46 @@ def analyse(path: str, full: bool, deep: bool) -> None:
     abs_path = os.path.abspath(path)
     store = GraphStore(read_only=False)
     indexer = JavaIndexer(store)
+
+    # --- Workspace → project → module detection ---
+    # Level 1: workspace (e.g. ~/IdeaProjects/) may contain independent projects.
+    project_roots = JavaIndexer.detect_projects_in_workspace(abs_path)
+    is_workspace = not (len(project_roots) == 1 and project_roots[0] == abs_path)
+    if is_workspace:
+        click.secho(
+            f"Detected workspace with {len(project_roots)} projects in {abs_path}: "
+            + ", ".join(os.path.basename(p) for p in project_roots),
+            fg="cyan",
+        )
+
+    # Level 2: each project may be multi-module (Maven/Gradle).
+    # Build a flat list of (module_path, project_id) tuples.
+    modules_with_ids: list[tuple[str, str]] = []
+    for proj_root in project_roots:
+        proj_name = os.path.basename(proj_root)
+        module_dirs = JavaIndexer.detect_modules(proj_root)
+        is_multi_module = not (len(module_dirs) == 1 and module_dirs[0] == proj_root)
+        if is_multi_module:
+            module_names = [os.path.basename(m) for m in module_dirs]
+            click.secho(
+                f"  {proj_name}: {len(module_dirs)} modules – {module_names}",
+                fg="cyan",
+            )
+            for m in module_dirs:
+                modules_with_ids.append((m, f"{proj_name}::{os.path.basename(m)}"))
+        else:
+            modules_with_ids.append((proj_root, proj_name))
+
+    root_basename = os.path.basename(abs_path)
+
+    # Shared progress state (reset per module)
     parse_state = {"shown": False, "indexed": 0, "total": 0, "last_ts": 0.0, "printed_zero": False}
     call_state = {"shown": False, "count": 0, "last_ts": 0.0}
+
+    def _reset_state() -> None:
+        for k in list(parse_state):
+            parse_state[k] = False if isinstance(parse_state[k], bool) else (0.0 if isinstance(parse_state[k], float) else 0)
+        parse_state["last_ts"] = 0.0
 
     def _progress(event: str, payload: dict) -> None:
         now = time.perf_counter()
@@ -147,20 +196,32 @@ def analyse(path: str, full: bool, deep: bool) -> None:
             _phase("Analyzing types...", f"{int(payload.get('type_relationships', 0))} type relationships")
             return
 
-    result = indexer.index_project(abs_path, full=full, progress=_progress)
-    if parse_state["shown"]:
-        click.echo()
-    if parse_state["total"] == 0 and not parse_state["printed_zero"]:
-        _phase("Parsing code...", "0/0")
-    elif parse_state["indexed"] < parse_state["total"]:
-        _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
+    # --- Index each module ---
+    is_multi = len(modules_with_ids) > 1
+    total_files_found = 0
+    last_result = None
+    for idx, (module_path, project_id) in enumerate(modules_with_ids):
+        if is_multi:
+            click.echo()
+            click.secho(f"[{idx + 1}/{len(modules_with_ids)}] Indexing: {project_id}", fg="cyan")
+        _reset_state()
+        last_result = indexer.index_project(
+            module_path, full=full, progress=_progress, project_id=project_id, embed=embed
+        )
+        total_files_found += last_result.files_found
+        if parse_state["shown"]:
+            click.echo()
+        if parse_state["total"] == 0 and not parse_state["printed_zero"]:
+            _phase("Parsing code...", "0/0")
+        elif parse_state["indexed"] < parse_state["total"]:
+            _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
 
     communities: list[dict] = []
     flows: list[dict] = []
     dead: list[dict] = []
     coupling_pairs: list[dict] = []
 
-    should_run_deep = deep or result.files_found <= 1200
+    should_run_deep = deep or total_files_found <= 1200
     if should_run_deep:
         communities = detect_communities(store)
         _phase("Detecting communities...", f"{len(communities)} clusters found")
@@ -171,10 +232,13 @@ def analyse(path: str, full: bool, deep: bool) -> None:
         dead = detect_dead_code(store, limit=500)
         _phase("Finding dead code...", f"{len(dead)} unreachable symbols")
 
+        # Use the root path for git coupling; fallback to the single module path
+        coupling_root = abs_path
+        coupling_project = root_basename if is_multi else (last_result.project_id if last_result else root_basename)
         coupling_pairs = compute_coupling(
             store,
-            abs_path,
-            result.project_id,
+            coupling_root,
+            coupling_project,
             months=SETTINGS.default_coupling_months,
             min_strength=SETTINGS.default_min_coupling_strength,
             min_cochanges=SETTINGS.default_min_cochanges,
@@ -193,7 +257,8 @@ def analyse(path: str, full: bool, deep: bool) -> None:
         RETURN count(s) as count
         """
     )
-    vectors_stored = int(vector_count[0]["count"]) if vector_count else result.embeddings_generated
+    embeddings_generated = last_result.embeddings_generated if last_result else 0
+    vectors_stored = int(vector_count[0]["count"]) if vector_count else embeddings_generated
     _phase("Generating embeddings...", f"{vectors_stored} vectors stored")
 
     symbol_count = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
@@ -202,9 +267,11 @@ def analyse(path: str, full: bool, deep: bool) -> None:
     edges = int(edge_count[0]["count"]) if edge_count else 0
     elapsed = time.perf_counter() - started
 
+    embed_note = "" if embed else " (no embeddings; rerun with --embed for semantic search)"
+    module_info = f"{len(modules_with_ids)} modules/projects, " if is_multi else ""
     click.echo()
     click.secho(
-        f"Done in {elapsed:.1f}s - {symbols} symbols, {edges} edges, {len(communities)} clusters, {len(flows)} flows",
+        f"Done in {elapsed:.1f}s - {module_info}{symbols} symbols, {edges} edges, {len(communities)} clusters, {len(flows)} flows{embed_note}",
         fg="green",
     )
 
@@ -322,24 +389,71 @@ def diff(range_spec: str, as_json: bool) -> None:
 
 
 @main.command()
-def stats() -> None:
-    """Show project and graph statistics."""
+@click.option("--json", "as_json", is_flag=True)
+def stats(as_json: bool) -> None:
+    """Show per-project and aggregate graph statistics."""
     store = GraphStore(read_only=True)
-    projects = store.query_records("MATCH (p:Project) RETURN p.id as project, p.path as path")
-    classes = store.query_records("MATCH (c:Class) RETURN count(c) as count")
-    methods = store.query_records("MATCH (m:Method) RETURN count(m) as count")
-    calls = store.query_records("MATCH (:Method)-[r:CALLS]->(:Method) RETURN count(r) as count")
+    projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path ORDER BY p.id")
+    if not projects:
+        click.secho("No projects indexed yet. Run 'codespine analyse <path>'.", fg="yellow")
+        return
 
-    click.echo("--- Projects ---")
-    click.echo(projects)
-    click.echo("--- Counts ---")
-    click.echo(
-        {
-            "classes": classes[0]["count"] if classes else 0,
-            "methods": methods[0]["count"] if methods else 0,
-            "calls": calls[0]["count"] if calls else 0,
-        }
-    )
+    rows = []
+    for p in projects:
+        pid = p["id"]
+        files = store.query_records(
+            "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n", {"pid": pid}
+        )
+        classes = store.query_records(
+            "MATCH (c:Class), (f:File) WHERE c.file_id = f.id AND f.project_id = $pid RETURN count(c) as n",
+            {"pid": pid},
+        )
+        methods = store.query_records(
+            "MATCH (m:Method), (c:Class), (f:File) WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid RETURN count(m) as n",
+            {"pid": pid},
+        )
+        calls = store.query_records(
+            "MATCH (ma:Method)-[:CALLS]->(mb:Method), (ca:Class), (fa:File) WHERE ma.class_id = ca.id AND ca.file_id = fa.id AND fa.project_id = $pid RETURN count(*) as n",
+            {"pid": pid},
+        )
+        emb = store.query_records(
+            "MATCH (s:Symbol), (f:File) WHERE s.file_id = f.id AND f.project_id = $pid AND s.embedding IS NOT NULL RETURN count(s) as n",
+            {"pid": pid},
+        )
+        rows.append({
+            "project": pid,
+            "path": p["path"],
+            "files": files[0]["n"] if files else 0,
+            "classes": classes[0]["n"] if classes else 0,
+            "methods": methods[0]["n"] if methods else 0,
+            "calls_out": calls[0]["n"] if calls else 0,
+            "embeddings": emb[0]["n"] if emb else 0,
+        })
+
+    if as_json:
+        _echo_json(rows, as_json=True)
+        return
+
+    col_w = max(len(r["project"]) for r in rows)
+    header = f"{'Project':<{col_w}}  {'Files':>6}  {'Classes':>8}  {'Methods':>8}  {'Calls':>7}  {'Emb':>6}  Path"
+    click.secho(header, fg="cyan")
+    click.echo("-" * len(header))
+    total_files = total_classes = total_methods = total_calls = total_emb = 0
+    for r in rows:
+        click.echo(
+            f"{r['project']:<{col_w}}  {r['files']:>6}  {r['classes']:>8}  {r['methods']:>8}  {r['calls_out']:>7}  {r['embeddings']:>6}  {r['path']}"
+        )
+        total_files += r["files"]
+        total_classes += r["classes"]
+        total_methods += r["methods"]
+        total_calls += r["calls_out"]
+        total_emb += r["embeddings"]
+    if len(rows) > 1:
+        click.echo("-" * len(header))
+        click.secho(
+            f"{'TOTAL':<{col_w}}  {total_files:>6}  {total_classes:>8}  {total_methods:>8}  {total_calls:>7}  {total_emb:>6}",
+            fg="green",
+        )
 
 
 @main.command("list")
@@ -407,6 +521,67 @@ def clean(force: bool) -> None:
             except OSError:
                 pass
     click.echo("Cleaned CodeSpine local state.")
+
+
+@main.command("clear-project")
+@click.argument("project_id")
+@click.option("--allow-running", is_flag=True, hidden=True)
+def clear_project_cmd(project_id: str, allow_running: bool) -> None:
+    """Remove all indexed data for a single project (clean slate for that project).
+
+    Clears all files, classes, methods, symbols, and the project node itself.
+    The meta cache for this project is also removed.
+    Run 'codespine analyse <path>' afterwards to re-index from scratch.
+    """
+    if not allow_running and _is_running():
+        click.secho("Stop MCP first ('codespine stop') to modify index.", fg="yellow")
+        return
+    store = GraphStore(read_only=False)
+    recs = store.query_records(
+        "MATCH (p:Project) WHERE p.id = $pid RETURN p.id as id, p.path as path",
+        {"pid": project_id},
+    )
+    if not recs:
+        click.secho(f"Project '{project_id}' not found in index.", fg="yellow")
+        return
+    project_path = recs[0].get("path", "")
+    store.clear_project(project_id)
+    store.execute("MATCH (p:Project) WHERE p.id = $pid DETACH DELETE p", {"pid": project_id})
+    meta_path = JavaIndexer._meta_cache_path(project_id)
+    if os.path.exists(meta_path):
+        try:
+            os.remove(meta_path)
+        except OSError:
+            pass
+    click.secho(f"Cleared project '{project_id}' (was at {project_path}).", fg="green")
+
+
+@main.command("clear-index")
+@click.option("--allow-running", is_flag=True, hidden=True)
+def clear_index_cmd(allow_running: bool) -> None:
+    """Remove ALL indexed data – complete clean slate.
+
+    Deletes every project, file, class, method, symbol, community, and flow
+    from the graph. The DB file is kept so the MCP server stays usable.
+    Run 'codespine analyse <path>' for each project to re-index from scratch.
+    """
+    if not allow_running and _is_running():
+        click.secho("Stop MCP first ('codespine stop') to modify index.", fg="yellow")
+        return
+    store = GraphStore(read_only=False)
+    projects = store.query_records("MATCH (p:Project) RETURN p.id as id")
+    for p in projects:
+        store.clear_project(p["id"])
+        meta_path = JavaIndexer._meta_cache_path(p["id"])
+        if os.path.exists(meta_path):
+            try:
+                os.remove(meta_path)
+            except OSError:
+                pass
+    store.execute("MATCH (p:Project) DETACH DELETE p")
+    store.execute("MATCH (c:Community) DETACH DELETE c")
+    store.execute("MATCH (f:Flow) DETACH DELETE f")
+    click.secho(f"Cleared {len(projects)} project(s). Index is now empty.", fg="green")
 
 
 @main.command()

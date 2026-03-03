@@ -3,28 +3,50 @@ from __future__ import annotations
 from collections import defaultdict, deque
 
 
-def _entry_methods(store) -> list[str]:
-    recs = store.query_records(
-        """
-        MATCH (m:Method)
-        WHERE m.name = 'main' OR m.is_test = true
-        RETURN m.id as id
-        """
-    )
+def _entry_methods(store, project: str | None = None) -> list[str]:
+    if project:
+        recs = store.query_records(
+            """
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $proj
+            AND (m.name = 'main' OR m.is_test = true)
+            RETURN m.id as id
+            """,
+            {"proj": project},
+        )
+    else:
+        recs = store.query_records(
+            """
+            MATCH (m:Method)
+            WHERE m.name = 'main' OR m.is_test = true
+            RETURN m.id as id
+            """
+        )
     ids = [r["id"] for r in recs]
     if ids:
         return ids
-    fallback = store.query_records(
-        """
-        MATCH (m:Method)
-        WITH m ORDER BY m.name LIMIT 10
-        RETURN m.id as id
-        """
-    )
+    if project:
+        fallback = store.query_records(
+            """
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $proj
+            WITH m ORDER BY m.name LIMIT 10
+            RETURN m.id as id
+            """,
+            {"proj": project},
+        )
+    else:
+        fallback = store.query_records(
+            """
+            MATCH (m:Method)
+            WITH m ORDER BY m.name LIMIT 10
+            RETURN m.id as id
+            """
+        )
     return [r["id"] for r in fallback]
 
 
-def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int = 6) -> list[dict]:
+def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None) -> list[dict]:
     edges = store.query_records(
         """
         MATCH (a:Method)-[:CALLS]->(b:Method)
@@ -36,18 +58,30 @@ def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int
         adj[edge["src"]].append(edge["dst"])
 
     if entry_symbol:
-        start = store.query_records(
-            """
-            MATCH (m:Method)
-            WHERE m.id = $q OR lower(m.name) = lower($q) OR lower(m.signature) CONTAINS lower($q)
-            RETURN m.id as id
-            LIMIT 10
-            """,
-            {"q": entry_symbol},
-        )
+        if project:
+            start = store.query_records(
+                """
+                MATCH (m:Method), (c:Class), (f:File)
+                WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $proj
+                AND (m.id = $q OR lower(m.name) = lower($q) OR lower(m.signature) CONTAINS lower($q))
+                RETURN m.id as id
+                LIMIT 10
+                """,
+                {"q": entry_symbol, "proj": project},
+            )
+        else:
+            start = store.query_records(
+                """
+                MATCH (m:Method)
+                WHERE m.id = $q OR lower(m.name) = lower($q) OR lower(m.signature) CONTAINS lower($q)
+                RETURN m.id as id
+                LIMIT 10
+                """,
+                {"q": entry_symbol},
+            )
         entries = [r["id"] for r in start]
     else:
-        entries = _entry_methods(store)
+        entries = _entry_methods(store, project=project)
 
     flows = []
     for e in entries:
