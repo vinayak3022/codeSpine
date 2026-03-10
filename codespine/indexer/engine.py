@@ -167,6 +167,10 @@ class JavaIndexer:
             to_reindex = current_files
             deleted_file_ids = []
             meta_cache = {}
+            # Wipe the embedding cache on a full re-index so stale embeddings
+            # (including those from the old SQLite format) are not carried over.
+            from codespine.search.vector import _CACHE as _embed_cache
+            _embed_cache.clear()
         else:
             to_reindex, deleted_file_ids, meta_cache = self._plan_incremental(
                 project_id,

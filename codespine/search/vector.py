@@ -51,6 +51,13 @@ class _EmbeddingCache:
         """Load cache from disk. Must be called with _lock held."""
         if self._data is not None:
             return
+        # Delete the old SQLite cache file left by versions < 0.4.0.
+        old_sqlite = self._path.replace(".json", ".sqlite3")
+        if os.path.isfile(old_sqlite):
+            try:
+                os.remove(old_sqlite)
+            except OSError:
+                pass
         if os.path.isfile(self._path):
             try:
                 with open(self._path, "r", encoding="utf-8") as f:
@@ -61,6 +68,15 @@ class _EmbeddingCache:
             except Exception:
                 pass
         self._data = {}
+
+    def clear(self) -> None:
+        """Wipe the in-memory cache and delete the backing file."""
+        with self._lock:
+            self._data = {}
+            try:
+                os.remove(self._path)
+            except OSError:
+                pass
 
     def _flush(self) -> None:
         """Persist cache to disk atomically. Must be called with _lock held."""

@@ -71,9 +71,16 @@ def build_mcp_server(store, repo_path_provider):
         Call this before other tools so you know what's ready without trial-and-error.
         Features marked false may need 'codespine analyse --deep' or optional dependencies.
         """
-        projects = store.query_records(
-            "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
-        )
+        try:
+            projects = store.query_records(
+                "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
+            )
+        except Exception:
+            # Old DB schema (pre-0.4.0) doesn't have indexed_at column yet.
+            # Falls back gracefully; column is added next time 'analyse' runs.
+            projects = store.query_records(
+                "MATCH (p:Project) RETURN p.id as id, p.path as path"
+            )
         sym_q = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
         comm_q = store.query_records("MATCH (c:Community) RETURN count(c) as count")
         flow_q = store.query_records("MATCH (f:Flow) RETURN count(f) as count")
@@ -171,9 +178,14 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def list_projects():
         """List all indexed projects with their symbol and file counts."""
-        projects = store.query_records(
-            "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
-        )
+        try:
+            projects = store.query_records(
+                "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
+            )
+        except Exception:
+            projects = store.query_records(
+                "MATCH (p:Project) RETURN p.id as id, p.path as path"
+            )
         if not projects:
             return {"available": False, "note": "No projects indexed yet. Run 'codespine analyse <path>'."}
         now = int(time.time())
