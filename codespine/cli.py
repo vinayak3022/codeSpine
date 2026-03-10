@@ -14,6 +14,7 @@ import psutil
 from codespine.analysis.community import detect_communities, symbol_community
 from codespine.analysis.context import build_symbol_context
 from codespine.analysis.coupling import compute_coupling, get_coupling
+from codespine.analysis.crossmodule import link_cross_module_calls
 from codespine.analysis.deadcode import detect_dead_code
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
@@ -215,6 +216,16 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
             _phase("Parsing code...", "0/0")
         elif parse_state["indexed"] < parse_state["total"]:
             _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
+
+    # ── Cross-module call linking ──────────────────────────────────────
+    # When multiple modules/projects are indexed, attempt to resolve call
+    # edges that span module boundaries using import + REFERENCES_TYPE info.
+    if is_multi and len(modules_with_ids) > 1:
+        xmod_pids = [pid for _, pid in modules_with_ids]
+        xmod_edges = link_cross_module_calls(store, project_ids=xmod_pids)
+        _phase("Cross-module linking...", f"{xmod_edges} cross-module call edges")
+    else:
+        _phase("Cross-module linking...", "skipped (single module)")
 
     communities: list[dict] = []
     flows: list[dict] = []

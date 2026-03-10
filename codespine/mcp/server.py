@@ -48,6 +48,36 @@ def _no_symbols_response(note: str = "No symbols indexed. Run 'codespine analyse
     return {"available": False, "note": note}
 
 
+def _staleness_meta(store, response: dict, project: str | None = None) -> dict:
+    """Inject index staleness metadata into every tool response.
+
+    Adds ``index_age_seconds`` and ``stale_warning`` when the index is old.
+    """
+    try:
+        if project:
+            recs = store.query_records(
+                "MATCH (p:Project) WHERE p.id = $pid RETURN p.indexed_at as ts",
+                {"pid": project},
+            )
+        else:
+            recs = store.query_records(
+                "MATCH (p:Project) RETURN p.indexed_at as ts ORDER BY p.indexed_at ASC LIMIT 1"
+            )
+        if recs:
+            ts = int(recs[0].get("ts") or 0)
+            if ts:
+                age = int(time.time()) - ts
+                response["index_age_seconds"] = age
+                if age > 3600:
+                    response["stale_warning"] = (
+                        f"Index is {age // 3600}h {(age % 3600) // 60}m old. "
+                        "Run analyse_project() or start_watch() to refresh."
+                    )
+    except Exception:
+        pass
+    return response
+
+
 def build_mcp_server(store, repo_path_provider):
     mcp = FastMCP("codespine")
 
@@ -159,6 +189,8 @@ def build_mcp_server(store, repo_path_provider):
                 "git_log": git_ok,
                 "git_diff": git_ok,
                 "compare_branches": git_ok,
+                "get_neighborhood": n_sym > 0,
+                "reindex_file": True,
                 "watch_mode": True,
                 "analyse_project": True,
             },
@@ -235,7 +267,7 @@ def build_mcp_server(store, repo_path_provider):
         results = hybrid_search(store, query, k=k, project=project)
         if not results:
             return _no_symbols_response()
-        return {"available": True, "results": results}
+        return _staleness_meta(store, {"available": True, "results": results}, project)
 
     @mcp.tool()
     def get_impact(symbol: str, max_depth: int = 4, project: str | None = None):
@@ -246,20 +278,30 @@ def build_mcp_server(store, repo_path_provider):
         result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
         if not result.get("targets_resolved"):
             return {"available": False, "note": f"Symbol '{symbol}' not found in the index."}
-        return {"available": True, **result}
+        return _staleness_meta(store, {"available": True, **result}, project)
 
     @mcp.tool()
-    def detect_dead_code(limit: int = 200, project: str | None = None):
+    def detect_dead_code(limit: int = 200, project: str | None = None, strict: bool = False):
         """
         Detect methods with no incoming calls (after Java-aware exemptions).
         Pass project to scope to a single module.
+
+        Parameters:
+          strict – When True, only main()/@Test and explicit entry-point
+                   annotations are exempted. Constructors, getters/setters,
+                   contract methods (toString, hashCode, equals), and method
+                   overrides are NOT exempt. Use this for a thorough audit.
+                   Each result includes a confidence level (high/medium/low):
+                     high   = private method, almost certainly dead
+                     medium = package-private or protected
+                     low    = public method, could be called via reflection
 
         Returns dead_code list, count, and an exemption_stats dict showing
         how many candidates were found and how many were filtered out by the
         exemption rules — useful for validating that the feature is working
         even when the dead list is empty.
         """
-        raw = detect_dead_code_analysis(store, limit=limit, project=project)
+        raw = detect_dead_code_analysis(store, limit=limit, project=project, strict=strict)
         if raw is None:
             return _no_symbols_response()
 
@@ -272,12 +314,12 @@ def build_mcp_server(store, repo_path_provider):
             else:
                 dead.append(entry)
 
-        return {
+        return _staleness_meta(store, {
             "available": True,
             "dead_code": dead,
             "count": len(dead),
             "exemption_stats": stats,
-        }
+        }, project)
 
     @mcp.tool()
     def trace_execution_flows(entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None):
@@ -288,7 +330,7 @@ def build_mcp_server(store, repo_path_provider):
         flows = trace_flows_analysis(store, entry_symbol=entry_symbol, max_depth=max_depth, project=project)
         if not flows:
             return _no_symbols_response("No entry points found. Run 'codespine analyse --deep' or provide entry_symbol.")
-        return {"available": True, "flows": flows}
+        return _staleness_meta(store, {"available": True, "flows": flows}, project)
 
     @mcp.tool()
     def get_symbol_community(symbol: str):
@@ -300,7 +342,7 @@ def build_mcp_server(store, repo_path_provider):
         result = symbol_community(store, symbol)
         if not result.get("matches"):
             return {"available": False, "note": "No community data yet. Run 'codespine analyse --deep'."}
-        return {"available": True, **result}
+        return _staleness_meta(store, {"available": True, **result})
 
     @mcp.tool()
     def get_change_coupling(
@@ -319,7 +361,7 @@ def build_mcp_server(store, repo_path_provider):
                 "available": False,
                 "note": "No coupling data. Run 'codespine analyse --deep' with a git repository.",
             }
-        return {"available": True, "coupling": result}
+        return _staleness_meta(store, {"available": True, "coupling": result})
 
     @mcp.tool()
     def get_symbol_context(query: str, max_depth: int = 3, project: str | None = None):
@@ -330,7 +372,7 @@ def build_mcp_server(store, repo_path_provider):
         result = build_symbol_context(store, query, max_depth=max_depth, project=project)
         if not result.get("search_candidates"):
             return _no_symbols_response()
-        return {"available": True, **result}
+        return _staleness_meta(store, {"available": True, **result}, project)
 
     @mcp.tool()
     def get_codebase_stats():
@@ -496,7 +538,7 @@ def build_mcp_server(store, repo_path_provider):
             by_project.setdefault(pid, {"classes": [], "methods": []})
             by_project[pid]["methods"].append(m)
 
-        return {
+        return _staleness_meta(store, {
             "available": True,
             "query": name,
             "total_matches": total,
@@ -505,7 +547,7 @@ def build_mcp_server(store, repo_path_provider):
                 f"Found {total} match(es). If multiple projects contain the same name, "
                 "pass project=<project_id> to subsequent tools to avoid cross-project ambiguity."
             ) if total > 1 else None,
-        }
+        }, project)
 
     @mcp.tool()
     def list_packages(project: str | None = None, limit: int = 200):
@@ -548,11 +590,11 @@ def build_mcp_server(store, repo_path_provider):
                 "class_count": r.get("class_count", 0),
             })
 
-        return {
+        return _staleness_meta(store, {
             "available": True,
             "total_packages": len(recs),
             "by_project": by_project,
-        }
+        }, project)
 
     # ------------------------------------------------------------------
     # Git tools
@@ -1005,6 +1047,225 @@ def build_mcp_server(store, repo_path_provider):
                 f"Re-index with: {re_index_hint}" if paths else
                 "Index cleared. No projects were indexed."
             ),
+        }
+
+    # ------------------------------------------------------------------
+    # Neighborhood exploration
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def get_neighborhood(symbol: str, project: str | None = None):
+        """
+        One-shot structural context for a symbol: callers (upstream), callees
+        (downstream), sibling methods in the same class, and override /
+        implements relationships.
+
+        This is the tool to call when you want to understand a method's
+        immediate surroundings in the call graph without traversing the
+        full impact tree.
+
+        Parameters:
+          symbol  – Method name, signature fragment, or fully-qualified name.
+          project – Optional project_id to scope the symbol lookup.
+        """
+        from codespine.analysis.impact import _resolve_method_metadata
+
+        project_clause = "AND f.project_id = $proj" if project else ""
+        params: dict = {"q": symbol}
+        if project:
+            params["proj"] = project
+
+        # 1. Resolve the symbol to method IDs
+        method_recs = store.query_records(
+            f"""
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id {project_clause}
+              AND (m.id = $q OR lower(m.name) = lower($q)
+                   OR lower(m.signature) CONTAINS lower($q))
+            RETURN m.id as id, m.name as name, m.signature as signature,
+                   c.id as class_id, c.fqcn as class_fqcn,
+                   f.path as file_path, f.project_id as project_id
+            LIMIT 5
+            """,
+            params,
+        )
+        if not method_recs:
+            return {"available": False, "note": f"Symbol '{symbol}' not found. Try find_symbol or search_hybrid."}
+
+        target = method_recs[0]
+        mid = target["id"]
+        cid = target["class_id"]
+
+        # 2. Callers (upstream)
+        callers = store.query_records(
+            """
+            MATCH (caller:Method)-[r:CALLS]->(m:Method {id: $mid})
+            RETURN caller.id as id, coalesce(r.confidence, 0.5) as confidence,
+                   coalesce(r.reason, 'unknown') as reason
+            """,
+            {"mid": mid},
+        )
+
+        # 3. Callees (downstream)
+        callees = store.query_records(
+            """
+            MATCH (m:Method {id: $mid})-[r:CALLS]->(callee:Method)
+            RETURN callee.id as id, coalesce(r.confidence, 0.5) as confidence,
+                   coalesce(r.reason, 'unknown') as reason
+            """,
+            {"mid": mid},
+        )
+
+        # 4. Siblings (same class, excluding self)
+        siblings = store.query_records(
+            """
+            MATCH (m:Method)
+            WHERE m.class_id = $cid AND m.id <> $mid
+            RETURN m.id as id, m.name as name, m.signature as signature
+            """,
+            {"cid": cid, "mid": mid},
+        )
+
+        # 5. Override / implements relationships
+        overrides_up = store.query_records(
+            "MATCH (m:Method {id: $mid})-[:OVERRIDES]->(parent:Method) RETURN parent.id as id",
+            {"mid": mid},
+        )
+        overrides_down = store.query_records(
+            "MATCH (child:Method)-[:OVERRIDES]->(m:Method {id: $mid}) RETURN child.id as id",
+            {"mid": mid},
+        )
+
+        # Bulk-resolve all referenced method IDs for human-readable output
+        all_ids = (
+            [c["id"] for c in callers]
+            + [c["id"] for c in callees]
+            + [o["id"] for o in overrides_up]
+            + [o["id"] for o in overrides_down]
+        )
+        meta = _resolve_method_metadata(store, all_ids) if all_ids else {}
+
+        def _enrich(items, extra_keys=None):
+            enriched = []
+            for item in items:
+                m = meta.get(item["id"], {})
+                entry = {
+                    "id": item["id"],
+                    "name": m.get("name") or item.get("name"),
+                    "fqname": m.get("fqname") or item.get("signature"),
+                    "class_fqcn": m.get("class_fqcn"),
+                    "file_path": m.get("file_path"),
+                    "project_id": m.get("project_id"),
+                }
+                if extra_keys:
+                    for k in extra_keys:
+                        if k in item:
+                            entry[k] = item[k]
+                enriched.append(entry)
+            return enriched
+
+        result = {
+            "available": True,
+            "target": {
+                "id": mid,
+                "name": target["name"],
+                "signature": target["signature"],
+                "class_fqcn": target["class_fqcn"],
+                "file_path": target["file_path"],
+                "project_id": target["project_id"],
+            },
+            "callers": _enrich(callers, extra_keys=["confidence", "reason"]),
+            "callees": _enrich(callees, extra_keys=["confidence", "reason"]),
+            "siblings": [
+                {"name": s["name"], "signature": s["signature"]}
+                for s in siblings
+            ],
+            "overrides": _enrich(overrides_up),
+            "overridden_by": _enrich(overrides_down),
+            "summary": {
+                "callers": len(callers),
+                "callees": len(callees),
+                "siblings": len(siblings),
+                "overrides": len(overrides_up),
+                "overridden_by": len(overrides_down),
+            },
+        }
+        return _staleness_meta(store, result)
+
+    # ------------------------------------------------------------------
+    # Single-file re-index
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def reindex_file(file_path: str, project: str | None = None):
+        """
+        Incrementally re-index a single Java file (<1 s for typical files).
+
+        Use this after editing a file to immediately refresh the graph without
+        waiting for watch mode or running a full analysis.
+
+        Parameters:
+          file_path – Absolute path to the .java file.
+          project   – Optional project_id. If omitted, the tool infers the
+                      project by matching the file path against indexed projects.
+        """
+        import os as _os
+
+        abs_fp = _os.path.abspath(file_path)
+        if not _os.path.isfile(abs_fp) or not abs_fp.endswith(".java"):
+            return {"available": False, "note": f"Not a valid .java file: {abs_fp}"}
+
+        # Resolve project from indexed projects if not given
+        if not project:
+            projects = store.query_records(
+                "MATCH (p:Project) RETURN p.id as id, p.path as path"
+            )
+            for p in projects:
+                if abs_fp.startswith(p["path"] + _os.sep):
+                    project = p["id"]
+                    break
+            if not project:
+                return {
+                    "available": False,
+                    "note": (
+                        "Cannot determine project for this file. "
+                        "Pass project=<project_id> explicitly."
+                    ),
+                }
+
+        # Find the project path to use as root for indexing
+        proj_recs = store.query_records(
+            "MATCH (p:Project) WHERE p.id = $pid RETURN p.path as path LIMIT 1",
+            {"pid": project},
+        )
+        if not proj_recs:
+            return {"available": False, "note": f"Project '{project}' not found in index."}
+
+        proj_path = proj_recs[0]["path"]
+
+        # Run incremental index via subprocess to avoid read-only DB constraint
+        cmd = [
+            sys.executable, "-m", "codespine.cli",
+            "analyse", proj_path,
+            "--incremental", "--no-embed", "--allow-running",
+        ]
+        t0 = time.time()
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        elapsed = round(time.time() - t0, 2)
+
+        if proc.returncode != 0:
+            return {
+                "available": False,
+                "note": f"Re-index failed (code {proc.returncode})",
+                "error": proc.stderr.strip() or proc.stdout.strip(),
+            }
+
+        return {
+            "available": True,
+            "file": abs_fp,
+            "project": project,
+            "elapsed_s": elapsed,
+            "note": f"Re-indexed project {project} incrementally in {elapsed}s.",
         }
 
     # ------------------------------------------------------------------

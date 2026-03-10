@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import os
+
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
 from codespine.search.rrf import reciprocal_rank_fusion
 from codespine.search.vector import _load_model, rank_semantic
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
+_SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
+
+
+def _read_snippet(file_path: str, line: int, context: int = _SNIPPET_CONTEXT_LINES) -> str | None:
+    """Best-effort extraction of source lines around a symbol declaration."""
+    if not file_path or not line or line < 1:
+        return None
+    try:
+        if not os.path.isfile(file_path):
+            return None
+        with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.readlines()
+        start = max(0, line - 1 - context)
+        end = min(len(all_lines), line + context)
+        snippet_lines = all_lines[start:end]
+        return "".join(snippet_lines).rstrip("\n")
+    except Exception:
+        return None
 
 
 def hybrid_search(store, query: str, k: int = 20, project: str | None = None) -> list[dict]:
@@ -26,6 +46,7 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
                s.name as name,
                s.fqname as fqname,
                s.embedding as embedding,
+               s.line as line,
                f.path as file_path,
                f.is_test as is_test
         """,
@@ -73,6 +94,7 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
                 "name": rec.get("name"),
                 "fqname": rec.get("fqname"),
                 "file_path": rec.get("file_path"),
+                "line": rec.get("line"),
                 "score": score * multiplier,
             }
         )
@@ -93,6 +115,14 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
             {"sid": item["id"]},
         )
         item["context"] = ctx
+
+    # Attach source code snippets (3–5 lines around the declaration) to the
+    # top results so agents have immediate context without reading the file.
+    for item in top_k:
+        if isinstance(item, dict) and item.get("file_path") and item.get("line"):
+            snippet = _read_snippet(item["file_path"], int(item["line"]))
+            if snippet:
+                item["snippet"] = snippet
 
     # Warn when all scores are near zero — the results are likely noise.
     # The threshold 0.05 is calibrated for embedding mode.  Without sentence-
