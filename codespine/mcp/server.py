@@ -253,11 +253,31 @@ def build_mcp_server(store, repo_path_provider):
         """
         Detect methods with no incoming calls (after Java-aware exemptions).
         Pass project to scope to a single module.
+
+        Returns dead_code list, count, and an exemption_stats dict showing
+        how many candidates were found and how many were filtered out by the
+        exemption rules — useful for validating that the feature is working
+        even when the dead list is empty.
         """
-        dead = detect_dead_code_analysis(store, limit=limit, project=project)
-        if dead is None:
+        raw = detect_dead_code_analysis(store, limit=limit, project=project)
+        if raw is None:
             return _no_symbols_response()
-        return {"available": True, "dead_code": dead, "count": len(dead)}
+
+        # Separate the sentinel stats entry appended by the analysis function.
+        stats: dict = {}
+        dead = []
+        for entry in raw:
+            if "_stats" in entry:
+                stats = entry["_stats"]
+            else:
+                dead.append(entry)
+
+        return {
+            "available": True,
+            "dead_code": dead,
+            "count": len(dead),
+            "exemption_stats": stats,
+        }
 
     @mcp.tool()
     def trace_execution_flows(entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None):
@@ -589,11 +609,24 @@ def build_mcp_server(store, repo_path_provider):
         }
 
     @mcp.tool()
-    def compare_branches(base_ref: str, head_ref: str):
-        """Symbol-level diff between two git refs (branches, tags, commits)."""
-        repo = repo_path_provider()
+    def compare_branches(base_ref: str, head_ref: str, project: str | None = None):
+        """
+        Symbol-level diff between two git refs (branches, tags, commits).
+        Pass project=<project_id> so the tool can resolve the correct git
+        repository root from the indexed project path rather than relying on
+        the MCP server's working directory (which may point to the graph DB
+        location, not the source tree).
+        """
+        repo = _resolve_repo_path(store, project, repo_path_provider)
         if not _git_available(repo):
-            return {"available": False, "note": "Not a git repository (or git not installed)."}
+            return {
+                "available": False,
+                "note": (
+                    "Not a git repository (or git not installed). "
+                    "Pass project=<project_id> so the tool can resolve the repo "
+                    "from the indexed project path. Use list_projects() to see available IDs."
+                ),
+            }
         result = compare_branches_analysis(repo, base_ref, head_ref)
         return {"available": True, **result}
 
@@ -981,6 +1014,7 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def run_cypher(query: str):
         """Run a raw Cypher query against the graph. For advanced exploration."""
-        return store.query_records(query)
+        records = store.query_records(query)
+        return {"available": True, "records": records, "count": len(records)}
 
     return mcp

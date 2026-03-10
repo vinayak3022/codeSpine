@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codespine"
-version = "0.4.2"
+version = "0.4.3"
 description = "Local Java code intelligence indexer backed by a graph database"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ dependencies = [
   "kuzu",
   "tree-sitter",
   "tree-sitter-java",
-  "fastmcp",
+  "fastmcp>=2.3.0",
   "psutil",
   "watchfiles"
 ]

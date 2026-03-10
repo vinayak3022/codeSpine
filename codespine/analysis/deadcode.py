@@ -74,8 +74,17 @@ def _modifier_tokens(modifiers) -> set[str]:
     return {str(m).strip() for m in modifiers}
 
 
-def detect_dead_code(store, limit: int = 200, project: str | None = None) -> list[dict]:
-    """Java-aware dead code detection with exemption passes."""
+def detect_dead_code(store, limit: int = 200, project: str | None = None) -> list[dict] | None:
+    """Java-aware dead code detection with exemption passes.
+
+    Returns a list of dead method dicts, each with:
+      method_id, name, signature, class_fqcn, file_path, reason.
+
+    The return value is augmented with a ``_stats`` entry (a sentinel dict
+    with key ``_stats``) containing pre/post-exemption counts so callers can
+    show users that the exemption logic is actually working:
+      candidates_with_no_callers, exempted, dead_returned
+    """
     if project:
         candidates = store.query_records(
             """
@@ -88,16 +97,17 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None) -> lis
                    m.modifiers as modifiers,
                    c.fqcn as class_fqcn,
                    m.is_constructor as is_constructor,
-                   m.is_test as is_test
+                   m.is_test as is_test,
+                   f.path as file_path
             LIMIT $limit
             """,
-            {"limit": int(limit * 3), "proj": project},
+            {"limit": int(limit * 5), "proj": project},
         )
     else:
         candidates = store.query_records(
             """
-            MATCH (m:Method), (c:Class)
-            WHERE m.class_id = c.id
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id
               AND NOT EXISTS { MATCH (:Method)-[:CALLS]->(m) }
             RETURN m.id as method_id,
                    m.name as name,
@@ -105,15 +115,17 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None) -> lis
                    m.modifiers as modifiers,
                    c.fqcn as class_fqcn,
                    m.is_constructor as is_constructor,
-                   m.is_test as is_test
+                   m.is_test as is_test,
+                   f.path as file_path
             LIMIT $limit
             """,
-            {"limit": int(limit * 3)},
+            {"limit": int(limit * 5)},
         )
 
     if not candidates:
         return []
 
+    n_candidates = len(candidates)
     exempt: set[str] = set()
 
     # Exempt constructors, test methods, and Java main entrypoints.
@@ -138,22 +150,19 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None) -> lis
         if name in {"valueOf", "fromString", "builder"}:
             exempt.add(c["method_id"])
 
-    # Exempt override/interface contract methods if relation exists.
+    # Exempt methods that DIRECTLY override another method (precise: only the
+    # specific overriding method is exempted, not the entire implementing class).
+    # NOTE: we intentionally do NOT use the class-level IMPLEMENTS relation here
+    # because that would exempt ALL methods of every class that implements ANY
+    # interface — in a typical Spring project that wipes out almost everything
+    # and produces 0 dead code results.
     override_methods = store.query_records(
         """
         MATCH (m:Method)-[:OVERRIDES]->(:Method)
         RETURN DISTINCT m.id as method_id
         """
     )
-    interface_methods = store.query_records(
-        """
-        MATCH (c:Class)-[:IMPLEMENTS]->(:Class), (m:Method)
-        WHERE m.class_id = c.id
-        RETURN DISTINCT m.id as method_id
-        """
-    )
     exempt.update(r["method_id"] for r in override_methods)
-    exempt.update(r["method_id"] for r in interface_methods)
 
     dead = []
     for c in candidates:
@@ -164,8 +173,30 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None) -> lis
                 "method_id": c["method_id"],
                 "name": c.get("name"),
                 "signature": c.get("signature"),
+                "class_fqcn": c.get("class_fqcn"),
+                "file_path": c.get("file_path"),
                 "reason": "no_incoming_calls_after_exemptions",
             }
         )
 
-    return dead[:limit]
+    result = dead[:limit]
+
+    # Append stats as a sentinel entry so the MCP layer can surface them
+    # without changing the return type.  Callers should strip entries that
+    # have a "_stats" key when iterating over method results.
+    result.append({
+        "_stats": {
+            "candidates_with_no_callers": n_candidates,
+            "exempted": len(exempt),
+            "dead_returned": len(result),
+            "note": (
+                "Exemptions cover: constructors, test methods, main(), "
+                "toString/hashCode/equals/compareTo, public getters/setters, "
+                "methods with DI/framework annotations, and direct method overrides. "
+                "The class-level IMPLEMENTS exemption has been removed — only "
+                "methods with direct OVERRIDES relations are now exempted."
+            ),
+        }
+    })
+
+    return result
