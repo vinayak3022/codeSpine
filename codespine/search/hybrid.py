@@ -3,7 +3,7 @@ from __future__ import annotations
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
 from codespine.search.rrf import reciprocal_rank_fusion
-from codespine.search.vector import rank_semantic
+from codespine.search.vector import _load_model, rank_semantic
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 
@@ -95,14 +95,27 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
         item["context"] = ctx
 
     # Warn when all scores are near zero — the results are likely noise.
+    # The threshold 0.05 is calibrated for embedding mode.  Without sentence-
+    # transformers the hash-fallback vector and BM25/fuzzy signals produce lower
+    # RRF scores, so the warning fires on nearly every query.  Make the note
+    # context-aware so the agent understands whether this is a calibration issue
+    # or a genuine low-relevance result.
     if top_k and top_k[0]["score"] < _LOW_CONFIDENCE_THRESHOLD:
+        has_model = _load_model() is not None
         for item in top_k:
             item["low_confidence"] = True
-        top_k.append({
-            "note": (
+        if has_model:
+            note = (
                 "Low confidence results — all scores below threshold. "
                 "If searching for an exact class or method name, use find_symbol instead."
             )
-        })
+        else:
+            note = (
+                "Low confidence results — scores are lower in BM25/fuzzy-only mode "
+                "(no embedding model detected). "
+                "This is expected without 'codespine[ml]' installed; results may still be correct. "
+                "For exact name matches, use find_symbol instead."
+            )
+        top_k.append({"note": note})
 
     return top_k

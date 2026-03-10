@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
+from codespine.analysis.impact import _resolve_method_metadata
+
 
 def _entry_methods(store, project: str | None = None) -> list[str]:
     if project:
@@ -107,5 +109,25 @@ def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int
                 "nodes": [{"symbol": n, "depth": d} for n, d in nodes_with_depth],
             }
         )
+
+    # ------------------------------------------------------------------ #
+    # Enrich every node with human-readable metadata so AI agents don't
+    # need a second round-trip to resolve raw method ID hashes.
+    # Collect all unique IDs across all flows, resolve in one bulk query.
+    # ------------------------------------------------------------------ #
+    all_ids = list({node["symbol"] for flow in flows for node in flow["nodes"]})
+    meta = _resolve_method_metadata(store, all_ids)
+
+    for flow in flows:
+        entry_m = meta.get(flow["entry"], {})
+        flow["entry_name"] = entry_m.get("name")
+        flow["entry_fqname"] = entry_m.get("fqname")
+        flow["entry_file_path"] = entry_m.get("file_path")
+        for node in flow["nodes"]:
+            m = meta.get(node["symbol"], {})
+            node["name"] = m.get("name")
+            node["fqname"] = m.get("fqname")
+            node["file_path"] = m.get("file_path")
+            node["project_id"] = m.get("project_id")
 
     return flows

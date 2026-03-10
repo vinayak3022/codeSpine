@@ -273,7 +273,10 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def get_symbol_community(symbol: str):
         """Return the architectural community cluster a symbol belongs to."""
-        detect_communities(store)
+        # NOTE: do NOT call detect_communities() here — the MCP server opens the
+        # graph DB read-only, so any write attempt raises "Cannot execute write
+        # operations in a read-only database!".  Communities are computed once
+        # during 'codespine analyse --deep' and persisted; we just read them.
         result = symbol_community(store, symbol)
         if not result.get("matches"):
             return {"available": False, "note": "No community data yet. Run 'codespine analyse --deep'."}
@@ -507,7 +510,7 @@ def build_mcp_server(store, repo_path_provider):
             MATCH (c:Class), (f:File)
             WHERE c.file_id = f.id {project_clause}
             RETURN c.package as package, f.project_id as project_id, count(c) as class_count
-            ORDER BY f.project_id, c.package
+            ORDER BY project_id, package
             LIMIT $lim
             """,
             params,

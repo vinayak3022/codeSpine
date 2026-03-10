@@ -21,6 +21,27 @@ def _resolve_symbol_ids(store, symbol_query: str, project: str | None = None) ->
     return [r["id"] for r in recs]
 
 
+def _resolve_method_metadata(store, method_ids: list[str]) -> dict[str, dict]:
+    """Bulk-resolve method IDs to human-readable metadata in a single query.
+
+    Returns a dict keyed by method ID with fields:
+      name, fqname (= m.signature), class_fqcn, file_path, project_id.
+    Any ID not found in the graph is silently omitted.
+    """
+    if not method_ids:
+        return {}
+    recs = store.query_records(
+        """
+        MATCH (m:Method), (c:Class), (f:File)
+        WHERE m.id IN $ids AND m.class_id = c.id AND c.file_id = f.id
+        RETURN m.id as id, m.name as name, m.signature as fqname,
+               c.fqcn as class_fqcn, f.path as file_path, f.project_id as project_id
+        """,
+        {"ids": method_ids},
+    )
+    return {r["id"]: r for r in recs}
+
+
 def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | None = None) -> dict:
     target_symbol_ids = _resolve_symbol_ids(store, symbol_query, project=project)
     if not target_symbol_ids:
@@ -85,9 +106,45 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
                 depth_groups["3+"].append(item)
             queue.append((src, next_depth, path + [src]))
 
+    # ------------------------------------------------------------------ #
+    # Enrich every caller entry with human-readable metadata so AI agents
+    # don't need a second round-trip to resolve raw ID hashes.
+    # A single bulk query resolves all collected method IDs at once.
+    # ------------------------------------------------------------------ #
+    all_caller_ids = [item["symbol"] for items in depth_groups.values() for item in items]
+    meta = _resolve_method_metadata(store, all_caller_ids)
+
+    for items in depth_groups.values():
+        for item in items:
+            m = meta.get(item["symbol"], {})
+            item["name"] = m.get("name")
+            item["fqname"] = m.get("fqname")
+            item["file_path"] = m.get("file_path")
+            item["project_id"] = m.get("project_id")
+            item["class_fqcn"] = m.get("class_fqcn")
+            # Convert the call-path from a list of raw IDs to human-readable names
+            # so an agent can read the chain without additional lookups.
+            item["path"] = [
+                meta.get(pid, {}).get("name") or pid
+                for pid in item["path"]
+            ]
+
+    # Also enrich the targets_resolved list for context
+    target_meta = _resolve_method_metadata(store, target_method_ids)
+    resolved_targets = [
+        {
+            "id": mid,
+            "name": target_meta.get(mid, {}).get("name"),
+            "fqname": target_meta.get(mid, {}).get("fqname"),
+            "file_path": target_meta.get(mid, {}).get("file_path"),
+            "class_fqcn": target_meta.get(mid, {}).get("class_fqcn"),
+        }
+        for mid in target_method_ids
+    ]
+
     return {
         "target": symbol_query,
-        "targets_resolved": target_method_ids,
+        "targets_resolved": resolved_targets,
         "depth_groups": depth_groups,
         "summary": {
             "direct": len(depth_groups["1"]),
