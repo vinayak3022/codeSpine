@@ -71,7 +71,9 @@ def build_mcp_server(store, repo_path_provider):
         Call this before other tools so you know what's ready without trial-and-error.
         Features marked false may need 'codespine analyse --deep' or optional dependencies.
         """
-        projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path")
+        projects = store.query_records(
+            "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
+        )
         sym_q = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
         comm_q = store.query_records("MATCH (c:Community) RETURN count(c) as count")
         flow_q = store.query_records("MATCH (f:Flow) RETURN count(f) as count")
@@ -97,7 +99,20 @@ def build_mcp_server(store, repo_path_provider):
         watch_running = _watch["proc"] is not None and _watch["proc"].poll() is None
         analyse_running = _analyse["proc"] is not None and _analyse["proc"].poll() is None
 
+        now = int(time.time())
+        stale_projects = []
+        for p in projects:
+            ts = int(p.get("indexed_at") or 0)
+            if ts and (now - ts) > 3600 and not watch_running:
+                age_h = (now - ts) // 3600
+                stale_projects.append(f"{p['id']} ({age_h}h old)")
+
         notes: dict[str, str] = {}
+        if stale_projects:
+            notes["stale_index"] = (
+                f"Index is stale for: {', '.join(stale_projects)}. "
+                "Run analyse_project() or start_watch() to refresh."
+            )
         if not n_comm:
             notes["community_detection"] = "Run 'codespine analyse --deep' to enable"
         if not n_flows:
@@ -156,9 +171,12 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def list_projects():
         """List all indexed projects with their symbol and file counts."""
-        projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path")
+        projects = store.query_records(
+            "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
+        )
         if not projects:
             return {"available": False, "note": "No projects indexed yet. Run 'codespine analyse <path>'."}
+        now = int(time.time())
         result = []
         for p in projects:
             sym = store.query_records(
@@ -173,14 +191,22 @@ def build_mcp_server(store, repo_path_provider):
                 "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as count",
                 {"pid": p["id"]},
             )
-            result.append(
-                {
-                    "project_id": p["id"],
-                    "path": p["path"],
-                    "symbol_count": sym[0]["count"] if sym else 0,
-                    "file_count": files[0]["count"] if files else 0,
-                }
-            )
+            indexed_at_ts = int(p.get("indexed_at") or 0)
+            age_s = now - indexed_at_ts if indexed_at_ts else None
+            entry: dict = {
+                "project_id": p["id"],
+                "path": p["path"],
+                "symbol_count": sym[0]["count"] if sym else 0,
+                "file_count": files[0]["count"] if files else 0,
+                "indexed_at_epoch": indexed_at_ts or None,
+                "index_age_seconds": age_s,
+            }
+            if age_s is not None and age_s > 3600:
+                entry["stale_warning"] = (
+                    f"Index is {age_s // 3600}h {(age_s % 3600) // 60}m old. "
+                    "Run analyse_project() or start_watch() to refresh."
+                )
+            result.append(entry)
         return {"available": True, "projects": result}
 
     # ------------------------------------------------------------------
@@ -371,7 +397,10 @@ def build_mcp_server(store, repo_path_provider):
         """
         name_lower = name.lower()
         project_clause = "AND f.project_id = $proj" if project else ""
-        params: dict = {"name": name, "namel": name_lower, "lim": limit}
+        # Note: only $namel and $lim are referenced in the queries below.
+        # Do NOT add extra keys here — some Kuzu versions raise "Parameter not found"
+        # when the params dict contains keys absent from the query string.
+        params: dict = {"namel": name_lower, "lim": limit}
         if project:
             params["proj"] = project
 
@@ -591,15 +620,40 @@ def build_mcp_server(store, repo_path_provider):
         if not os.path.isdir(abs_path):
             return {"available": False, "note": f"Path does not exist or is not a directory: {abs_path}"}
 
+        import tempfile as _tempfile
+        watch_err_file = _tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", prefix="codespine_watch_", delete=False
+        )
+        watch_err_path = watch_err_file.name
+        watch_err_file.close()
+
         proc = subprocess.Popen(
             [
                 sys.executable, "-m", "codespine.cli",
                 "watch", "--path", abs_path,
                 "--global-interval", str(global_interval),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=open(watch_err_path, "w", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
         )
+
+        # Brief health check — if the process dies within 1 s it crashed at startup.
+        time.sleep(1)
+        if proc.poll() is not None:
+            try:
+                with open(watch_err_path, "r", encoding="utf-8", errors="replace") as fh:
+                    err_tail = fh.read().strip().splitlines()[-10:]
+            except Exception:
+                err_tail = []
+            return {
+                "available": False,
+                "note": (
+                    f"Watch mode process exited immediately (code {proc.returncode}). "
+                    "Check that the path is valid and watchfiles is installed."
+                ),
+                "error_tail": err_tail,
+            }
+
         _watch["proc"] = proc
         _watch["path"] = abs_path
         _watch["started_at"] = time.time()

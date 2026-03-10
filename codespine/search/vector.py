@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
-import sqlite3
+import os
+import threading
 from functools import lru_cache
 
 from codespine.config import SETTINGS
@@ -33,71 +35,86 @@ def _load_model():
         return None
 
 
-@lru_cache(maxsize=1)
-def _embedding_cache_conn():
-    path = SETTINGS.embedding_cache_db
-    try:
-        os_dir = path.rsplit("/", 1)[0] if "/" in path else ""
-        if os_dir:
-            import os
+class _EmbeddingCache:
+    """Thread-safe in-memory embedding cache backed by a JSON file.
 
-            os.makedirs(os_dir, exist_ok=True)
-        conn = sqlite3.connect(path, check_same_thread=False)
-    except Exception:
-        conn = sqlite3.connect("/tmp/.codespine_embedding_cache.sqlite3", check_same_thread=False)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS embedding_cache (
-            cache_key TEXT PRIMARY KEY,
-            dim INTEGER NOT NULL,
-            vector_json TEXT NOT NULL
-        )
-        """
-    )
-    return conn
+    Replaces the previous SQLite-based cache which caused threading issues
+    (database is locked / created in wrong thread) under MCP server concurrency.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._data: dict[str, str] | None = None  # loaded lazily
+
+    def _ensure_loaded(self) -> None:
+        """Load cache from disk. Must be called with _lock held."""
+        if self._data is not None:
+            return
+        if os.path.isfile(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    self._data = loaded
+                    return
+            except Exception:
+                pass
+        self._data = {}
+
+    def _flush(self) -> None:
+        """Persist cache to disk atomically. Must be called with _lock held."""
+        try:
+            dir_path = os.path.dirname(self._path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, separators=(",", ":"))
+            os.replace(tmp, self._path)
+        except Exception:
+            pass
+
+    def get(self, key: str) -> list[float] | None:
+        with self._lock:
+            self._ensure_loaded()
+            raw = self._data.get(key)  # type: ignore[union-attr]
+        if raw is None:
+            return None
+        try:
+            return [float(x) for x in json.loads(raw)]
+        except Exception:
+            return None
+
+    def set(self, key: str, vec: list[float]) -> None:
+        with self._lock:
+            self._ensure_loaded()
+            self._data[key] = json.dumps(vec)  # type: ignore[index]
+            self._flush()
+
+
+_CACHE = _EmbeddingCache(SETTINGS.embedding_cache_path)
 
 
 def _cache_key(text: str, dim: int) -> str:
     return hashlib.sha1(f"{SETTINGS.embedding_model}|{dim}|{text}".encode("utf-8")).hexdigest()
 
 
-def _get_cached_embedding(text: str, dim: int) -> list[float] | None:
-    key = _cache_key(text, dim)
-    conn = _embedding_cache_conn()
-    row = conn.execute("SELECT vector_json FROM embedding_cache WHERE cache_key = ? AND dim = ?", (key, dim)).fetchone()
-    if not row:
-        return None
-    import json
-
-    return [float(x) for x in json.loads(row[0])]
-
-
-def _set_cached_embedding(text: str, dim: int, vec: list[float]) -> None:
-    key = _cache_key(text, dim)
-    conn = _embedding_cache_conn()
-    import json
-
-    conn.execute(
-        "INSERT OR REPLACE INTO embedding_cache(cache_key, dim, vector_json) VALUES (?, ?, ?)",
-        (key, dim, json.dumps(vec)),
-    )
-    conn.commit()
-
-
 def embed_text(text: str, dim: int | None = None) -> list[float]:
     dim = dim or SETTINGS.vector_dim
-    cached = _get_cached_embedding(text or "", dim)
+    key = _cache_key(text or "", dim)
+
+    cached = _CACHE.get(key)
     if cached is not None:
         return cached
 
     model = _load_model()
     if model is None:
         vec = _hash_vector(text, dim)
-        _set_cached_embedding(text or "", dim, vec)
-        return vec
+    else:
+        vec = [float(x) for x in model.encode([text or ""], normalize_embeddings=True)[0]]
 
-    vec = [float(x) for x in model.encode([text or ""], normalize_embeddings=True)[0]]
-    _set_cached_embedding(text or "", dim, vec)
+    _CACHE.set(key, vec)
     return vec
 
 

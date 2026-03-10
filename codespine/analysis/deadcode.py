@@ -1,17 +1,63 @@
 from __future__ import annotations
 
 EXEMPT_ANNOTATIONS = {
+    # Java standard
     "Override",
+    # JUnit / testing
     "Test",
     "ParameterizedTest",
+    "BeforeEach",
+    "AfterEach",
+    "BeforeAll",
+    "AfterAll",
+    # Spring – component model (class-level; methods inside are never "dead")
+    "Component",
+    "Service",
+    "Repository",
+    "Controller",
+    "RestController",
+    "Configuration",
     "Bean",
+    "Aspect",
+    # Spring – lifecycle / event hooks
     "PostConstruct",
     "PreDestroy",
-    "Scheduled",
-    "KafkaListener",
     "EventListener",
-    "JsonCreator",
+    "TransactionalEventListener",
+    "Scheduled",
+    # Spring – web entry points
+    "RequestMapping",
+    "GetMapping",
+    "PostMapping",
+    "PutMapping",
+    "DeleteMapping",
+    "PatchMapping",
+    "MessageMapping",
+    # Spring – messaging / async
+    "KafkaListener",
+    "RabbitListener",
+    "JmsListener",
+    "SqsListener",
+    "StreamListener",
+    # Spring Data / persistence
+    "Query",
+    "Modifying",
+    # Guice DI
     "Inject",
+    "Provides",
+    "Singleton",
+    "Named",
+    "Qualifier",
+    # Jakarta / javax DI (same semantics as Guice/Spring variants)
+    "ApplicationScoped",
+    "RequestScoped",
+    "SessionScoped",
+    "Dependent",
+    # Jackson / serialization (called reflectively)
+    "JsonCreator",
+    "JsonProperty",
+    "JsonDeserialize",
+    "JsonSerialize",
 }
 
 EXEMPT_CONTRACT_METHODS = {

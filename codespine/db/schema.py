@@ -10,7 +10,7 @@ NODE_TABLES: list[tuple[str, str]] = [
     ("SchemaMeta", "CREATE NODE TABLE SchemaMeta(key STRING, value STRING, PRIMARY KEY (key))"),
     (
         "Project",
-        "CREATE NODE TABLE Project(id STRING, path STRING, language STRING, PRIMARY KEY (id))",
+        "CREATE NODE TABLE Project(id STRING, path STRING, language STRING, indexed_at STRING, PRIMARY KEY (id))",
     ),
     (
         "File",
@@ -76,7 +76,10 @@ def ensure_schema(conn) -> None:
     _safe_execute(conn, "CALL CREATE_FTS_INDEX('method_fts', 'Method', ['name', 'signature'])")
     _safe_execute(conn, "CALL CREATE_FTS_INDEX('class_fts', 'Class', ['name', 'fqcn'])")
 
+    # Best-effort migration: add indexed_at column to existing Project tables.
+    _safe_execute(conn, "ALTER TABLE Project ADD indexed_at STRING DEFAULT ''")
+
     _safe_execute(
         conn,
-        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '2'",
+        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '3'",
     )

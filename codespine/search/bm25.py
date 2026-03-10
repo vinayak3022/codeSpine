@@ -5,10 +5,26 @@ import re
 from collections import Counter
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=\D)(?=\d)|(?<=\d)(?=\D)")
 
 
 def tokenize(text: str) -> list[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text or "")]
+    """Tokenize text, splitting on camelCase and underscores in addition to whitespace.
+
+    'SolicitPanFetchActionCompletionEvent' → ['solicit', 'pan', 'fetch', 'action', 'completion', 'event']
+    'get_symbol_context' → ['get', 'symbol', 'context']
+    """
+    raw_tokens = TOKEN_RE.findall(text or "")
+    out: list[str] = []
+    for tok in raw_tokens:
+        # Split underscore-joined segments first, then camelCase within each
+        for segment in tok.split("_"):
+            if not segment:
+                continue
+            for part in _CAMEL_SPLIT_RE.split(segment):
+                if part:
+                    out.append(part.lower())
+    return out
 
 
 def rank_bm25(query: str, docs: list[tuple[str, str]], k1: float = 1.2, b: float = 0.75) -> list[tuple[str, float]]:

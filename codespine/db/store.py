@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -69,7 +70,12 @@ class GraphStore:
                 self.execute("COMMIT")
         except Exception:
             if tx_started:
-                self.execute("ROLLBACK")
+                try:
+                    self.execute("ROLLBACK")
+                except Exception:
+                    # Kuzu may have already rolled back (e.g. on OOM), making a
+                    # second ROLLBACK raise "No active transaction". Swallow it.
+                    pass
             raise
 
     def clear_project(self, project_id: str) -> None:
@@ -108,8 +114,8 @@ class GraphStore:
 
     def upsert_project(self, project_id: str, path: str) -> None:
         self.execute(
-            "MERGE (p:Project {id: $id}) SET p.path = $path, p.language = 'java'",
-            {"id": project_id, "path": path},
+            "MERGE (p:Project {id: $id}) SET p.path = $path, p.language = 'java', p.indexed_at = $ts",
+            {"id": project_id, "path": path, "ts": str(int(time.time()))},
         )
 
     def project_file_hashes(self, project_id: str) -> dict[str, dict[str, str]]:
@@ -297,14 +303,18 @@ class GraphStore:
             "MERGE (c:Community {id: $id}) SET c.label = $label, c.cohesion = $cohesion",
             {"id": community_id, "label": label, "cohesion": cohesion},
         )
-        # Batch all symbol→community edges in one transaction to prevent buffer pool exhaustion
-        # on large projects (53 K+ symbols would OOM without a single commit boundary).
-        with self.transaction():
-            for sid in symbol_ids:
-                self.execute(
-                    "MATCH (s:Symbol {id: $sid}), (c:Community {id: $cid}) MERGE (s)-[:IN_COMMUNITY]->(c)",
-                    {"sid": sid, "cid": community_id},
-                )
+        # Commit in batches of 50 to keep Kuzu's buffer pool from OOMing on large
+        # communities. A single transaction over thousands of MERGE statements exhausts
+        # the 256 MB buffer pool before it can page out.
+        _BATCH = 50
+        for i in range(0, len(symbol_ids), _BATCH):
+            batch = symbol_ids[i : i + _BATCH]
+            with self.transaction():
+                for sid in batch:
+                    self.execute(
+                        "MATCH (s:Symbol {id: $sid}), (c:Community {id: $cid}) MERGE (s)-[:IN_COMMUNITY]->(c)",
+                        {"sid": sid, "cid": community_id},
+                    )
 
     def set_flow(self, flow_id: str, entry_symbol_id: str, kind: str, symbols_at_depth: list[tuple[str, int]]) -> None:
         self.execute(
