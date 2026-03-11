@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as _json_mod
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,16 @@ from codespine.analysis.flow import trace_execution_flows as trace_flows_analysi
 from codespine.analysis.impact import analyze_impact
 from codespine.diff.branch_diff import compare_branches as compare_branches_analysis
 from codespine.search.hybrid import hybrid_search
+
+
+def _json(data: dict) -> str:
+    """Serialize response dict to a JSON string.
+
+    FastMCP double-serialises dict return values on many transports (SSE,
+    stdio) producing duplicate JSON payloads that waste ~50 K tokens/session.
+    Returning a pre-serialised string guarantees a single TextContent block.
+    """
+    return _json_mod.dumps(data, separators=(",", ":"))
 
 
 def _git_available(path: str) -> bool:
@@ -44,14 +55,27 @@ def _resolve_repo_path(store, project: str | None, repo_path_provider) -> str:
     return repo_path_provider()
 
 
-def _no_symbols_response(note: str = "No symbols indexed. Run 'codespine analyse <path>' first.") -> dict:
-    return {"available": False, "note": note}
+def _no_symbols_response(note: str = "No symbols indexed. Run 'codespine analyse <path>' first.") -> str:
+    return _json({"available": False, "note": note})
 
 
-def _staleness_meta(store, response: dict, project: str | None = None) -> dict:
-    """Inject index staleness metadata into every tool response.
+def _parse_indexed_at(raw) -> int:
+    """Robustly parse an indexed_at value that may be str, int, float, or None."""
+    if raw is None:
+        return 0
+    try:
+        val = int(float(str(raw)))
+        # Sanity check: must look like a Unix timestamp (> year 2000)
+        return val if val > 946684800 else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def _staleness_meta(store, response: dict, project: str | None = None) -> str:
+    """Inject index staleness metadata into every tool response and serialise.
 
     Adds ``index_age_seconds`` and ``stale_warning`` when the index is old.
+    Returns a JSON string (not a dict) to avoid FastMCP double-serialisation.
     """
     try:
         if project:
@@ -64,10 +88,11 @@ def _staleness_meta(store, response: dict, project: str | None = None) -> dict:
                 "MATCH (p:Project) RETURN p.indexed_at as ts ORDER BY p.indexed_at ASC LIMIT 1"
             )
         if recs:
-            ts = int(recs[0].get("ts") or 0)
+            ts = _parse_indexed_at(recs[0].get("ts"))
             if ts:
                 age = int(time.time()) - ts
                 response["index_age_seconds"] = age
+                response["indexed_at_epoch"] = ts
                 if age > 3600:
                     response["stale_warning"] = (
                         f"Index is {age // 3600}h {(age % 3600) // 60}m old. "
@@ -75,11 +100,40 @@ def _staleness_meta(store, response: dict, project: str | None = None) -> dict:
                     )
     except Exception:
         pass
-    return response
+    return _json(response)
 
 
 def build_mcp_server(store, repo_path_provider):
-    mcp = FastMCP("codespine")
+    _raw_mcp = FastMCP("codespine")
+
+    # ── Anti-duplicate-JSON wrapper ────────────────────────────────────
+    # FastMCP double-serialises dict return values on many transports,
+    # producing duplicate JSON payloads that waste ~50 K tokens/session.
+    # We intercept tool registration so every tool's dict return is
+    # pre-serialised to a JSON string (single TextContent block).
+    import functools as _functools
+
+    class _JsonMCP:
+        """Thin proxy that wraps tool functions to return JSON strings."""
+        def __getattr__(self, name):
+            return getattr(_raw_mcp, name)
+
+        def tool(self, *args, **kwargs):
+            original_decorator = _raw_mcp.tool(*args, **kwargs)
+            def wrapper(fn):
+                @_functools.wraps(fn)
+                def json_fn(*a, **kw):
+                    result = fn(*a, **kw)
+                    if isinstance(result, dict):
+                        return _json(result)
+                    return result
+                return original_decorator(json_fn)
+            return wrapper
+
+        def run(self):
+            return _raw_mcp.run()
+
+    mcp = _JsonMCP()
 
     # Background job state (per-server-instance, persists across tool calls)
     _watch: dict = {"proc": None, "path": None, "started_at": None, "interval": 30}
@@ -92,7 +146,7 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def ping():
         """Verify the MCP server is alive. Call this first to confirm connectivity."""
-        return {"status": "ok", "version": __version__}
+        return _json({"status": "ok", "version": __version__})
 
     @mcp.tool()
     def get_capabilities():
@@ -1243,21 +1297,41 @@ def build_mcp_server(store, repo_path_provider):
 
         proj_path = proj_recs[0]["path"]
 
-        # Run incremental index via subprocess to avoid read-only DB constraint
+        # Run incremental index via subprocess to avoid read-only DB constraint.
+        # Use Popen + communicate() with a timeout so that a hang never crashes
+        # the MCP server process — the subprocess is killed gracefully instead.
         cmd = [
             sys.executable, "-m", "codespine.cli",
             "analyse", proj_path,
             "--incremental", "--no-embed", "--allow-running",
         ]
         t0 = time.time()
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        elapsed = round(time.time() - t0, 2)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            stdout, stderr = proc.communicate(timeout=30)
+            elapsed = round(time.time() - t0, 2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()  # reap zombie
+            elapsed = round(time.time() - t0, 2)
+            return {
+                "available": False,
+                "note": f"Re-index timed out after {elapsed}s. The project may be too large for single-file re-index. Use analyse_project() instead.",
+            }
+        except Exception as exc:
+            elapsed = round(time.time() - t0, 2)
+            return {
+                "available": False,
+                "note": f"Re-index error: {exc}",
+            }
 
         if proc.returncode != 0:
             return {
                 "available": False,
                 "note": f"Re-index failed (code {proc.returncode})",
-                "error": proc.stderr.strip() or proc.stdout.strip(),
+                "error": (stderr or stdout or "").strip()[:500],
             }
 
         return {
@@ -1278,4 +1352,4 @@ def build_mcp_server(store, repo_path_provider):
         records = store.query_records(query)
         return {"available": True, "records": records, "count": len(records)}
 
-    return mcp
+    return _raw_mcp
