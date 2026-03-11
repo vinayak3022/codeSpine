@@ -17,7 +17,7 @@ from codespine.db.schema import ensure_schema
 
 LOGGER = logging.getLogger(__name__)
 
-_BUFFER_POOL_SIZE = 256 * 1024 * 1024  # 256 MB – small enough for page eviction to work
+_BUFFER_POOL_SIZE = 512 * 1024 * 1024  # 512 MB – room for large community detection
 
 
 @dataclass
@@ -298,15 +298,23 @@ class GraphStore:
         )
         self.execute(query, {"src_id": src_id, "dst_id": dst_id, "confidence": confidence})
 
+    def _recycle_conn(self) -> None:
+        """Drop and recreate the per-thread connection to release buffer pages."""
+        try:
+            if hasattr(self._tls, "conn") and self._tls.conn is not None:
+                self._tls.conn = None
+        except Exception:
+            pass
+
     def set_community(self, community_id: str, label: str, cohesion: float, symbol_ids: list[str]) -> None:
         self.execute(
             "MERGE (c:Community {id: $id}) SET c.label = $label, c.cohesion = $cohesion",
             {"id": community_id, "label": label, "cohesion": cohesion},
         )
-        # Commit in batches of 50 to keep Kuzu's buffer pool from OOMing on large
-        # communities. A single transaction over thousands of MERGE statements exhausts
-        # the 256 MB buffer pool before it can page out.
-        _BATCH = 50
+        # Commit in batches of 500 to keep Kuzu's buffer pool from OOMing on
+        # large communities.  After each batch, recycle the connection so Kuzu
+        # can release buffer pages accumulated during the transaction.
+        _BATCH = 500
         for i in range(0, len(symbol_ids), _BATCH):
             batch = symbol_ids[i : i + _BATCH]
             with self.transaction():
@@ -315,17 +323,24 @@ class GraphStore:
                         "MATCH (s:Symbol {id: $sid}), (c:Community {id: $cid}) MERGE (s)-[:IN_COMMUNITY]->(c)",
                         {"sid": sid, "cid": community_id},
                     )
+            # Recycle connection after each batch to let Kuzu free buffer pages
+            self._recycle_conn()
 
     def set_flow(self, flow_id: str, entry_symbol_id: str, kind: str, symbols_at_depth: list[tuple[str, int]]) -> None:
         self.execute(
             "MERGE (f:Flow {id: $id}) SET f.entry_symbol_id = $entry, f.kind = $kind",
             {"id": flow_id, "entry": entry_symbol_id, "kind": kind},
         )
-        for sid, depth in symbols_at_depth:
-            self.execute(
-                "MATCH (s:Symbol {id: $sid}), (f:Flow {id: $fid}) MERGE (s)-[:IN_FLOW {depth: $depth}]->(f)",
-                {"sid": sid, "fid": flow_id, "depth": int(depth)},
-            )
+        _BATCH = 500
+        for i in range(0, len(symbols_at_depth), _BATCH):
+            batch = symbols_at_depth[i : i + _BATCH]
+            with self.transaction():
+                for sid, depth in batch:
+                    self.execute(
+                        "MATCH (s:Symbol {id: $sid}), (f:Flow {id: $fid}) MERGE (s)-[:IN_FLOW {depth: $depth}]->(f)",
+                        {"sid": sid, "fid": flow_id, "depth": int(depth)},
+                    )
+            self._recycle_conn()
 
     def upsert_coupling(self, file_a: str, file_b: str, strength: float, cochanges: int, months: int) -> None:
         self.execute(
