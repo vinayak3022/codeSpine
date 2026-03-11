@@ -3,8 +3,14 @@ from __future__ import annotations
 from collections import defaultdict
 
 
-def detect_communities(store) -> list[dict]:
+def detect_communities(store, progress=None) -> list[dict]:
+    def _ping(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    _ping("loading symbols")
     symbols = store.query_records("MATCH (s:Symbol) RETURN s.id as id, s.fqname as fqname")
+    _ping(f"{len(symbols)} symbols, loading edges")
     edges = store.query_records(
         """
         MATCH (a:Method)-[:CALLS]->(b:Method)
@@ -17,6 +23,7 @@ def detect_communities(store) -> list[dict]:
     ids = [s["id"] for s in symbols]
     index_of = {sid: i for i, sid in enumerate(ids)}
 
+    _ping(f"{len(edges)} edges, clustering")
     membership: dict[str, int] = {}
     try:
         import igraph as ig
@@ -44,11 +51,17 @@ def detect_communities(store) -> list[dict]:
     for sid, cid in membership.items():
         grouped[cid].append(sid)
 
+    _ping(f"{len(grouped)} clusters, persisting")
     communities: list[dict] = []
+    done_clusters = 0
+    total_clusters = len(grouped)
     for cid, symbol_ids in grouped.items():
         cohesion = 1.0 / max(len(symbol_ids), 1)
         label = f"community_{cid}"
         store.set_community(str(cid), label, cohesion, symbol_ids)
+        done_clusters += 1
+        if done_clusters % 200 == 0 or done_clusters == total_clusters:
+            _ping(f"persisting {done_clusters}/{total_clusters} clusters")
         communities.append(
             {
                 "community_id": str(cid),

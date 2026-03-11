@@ -47,11 +47,15 @@ def _param_count(sig: str) -> int:
     return 0 if not arg_str.strip() else arg_str.count(",") + 1
 
 
-def link_cross_module_calls(store, project_ids: list[str] | None = None) -> int:
+def link_cross_module_calls(store, project_ids: list[str] | None = None, progress=None) -> int:
     """Create CALLS edges between methods in different projects.
 
     Returns the number of new cross-module call edges created.
+    *progress* is an optional ``(status_str) -> None`` callback for live updates.
     """
+    def _ping(msg: str) -> None:
+        if progress:
+            progress(msg)
     if project_ids is None:
         proj_recs = store.query_records("MATCH (p:Project) RETURN p.id as id")
         project_ids = [r["id"] for r in proj_recs]
@@ -71,6 +75,8 @@ def link_cross_module_calls(store, project_ids: list[str] | None = None) -> int:
         RETURN c.id as cid, c.name as name, c.fqcn as fqcn, f.project_id as pid
         """
     )
+
+    _ping(f"building class index ({len(all_classes)} classes)")
 
     # class_name → [(class_id, project_id)]
     name_to_classes: dict[str, list[tuple[str, str]]] = defaultdict(list)
@@ -98,6 +104,8 @@ def link_cross_module_calls(store, project_ids: list[str] | None = None) -> int:
 
         if not other_class_names:
             continue
+
+        _ping(f"scanning {src_pid} methods")
 
         # Fetch all methods in this project
         src_methods = store.query_records(
@@ -181,5 +189,6 @@ def link_cross_module_calls(store, project_ids: list[str] | None = None) -> int:
                         except Exception as exc:
                             LOGGER.debug("Fallback edge failed: %s", exc)
 
+    _ping(f"{new_edges} edges created")
     LOGGER.info("Cross-module linking: created %d new call edges.", new_edges)
     return new_edges

@@ -217,13 +217,25 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         elif parse_state["indexed"] < parse_state["total"]:
             _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
 
+    # ── Helper for in-place progress updates ────────────────────────────
+    def _live_phase(label: str, status: str) -> None:
+        """Overwrite the current line with a status update."""
+        click.echo(f"\r{label:<30} {status:<50}", nl=False)
+
+    def _finish_phase(label: str, result: str) -> None:
+        """Finalise an in-place phase line and move to the next line."""
+        click.echo(f"\r{label:<30} {result:<50}")
+
     # ── Cross-module call linking ──────────────────────────────────────
-    # When multiple modules/projects are indexed, attempt to resolve call
-    # edges that span module boundaries using import + REFERENCES_TYPE info.
     if is_multi and len(modules_with_ids) > 1:
+        xmod_label = "Cross-module linking..."
+        _live_phase(xmod_label, "running")
         xmod_pids = [pid for _, pid in modules_with_ids]
-        xmod_edges = link_cross_module_calls(store, project_ids=xmod_pids)
-        _phase("Cross-module linking...", f"{xmod_edges} cross-module call edges")
+        xmod_edges = link_cross_module_calls(
+            store, project_ids=xmod_pids,
+            progress=lambda s: _live_phase(xmod_label, s),
+        )
+        _finish_phase(xmod_label, f"{xmod_edges} cross-module call edges")
     else:
         _phase("Cross-module linking...", "skipped (single module)")
 
@@ -234,16 +246,29 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
 
     should_run_deep = deep or total_files_found <= 1200
     if should_run_deep:
-        communities = detect_communities(store)
-        _phase("Detecting communities...", f"{len(communities)} clusters found")
+        comm_label = "Detecting communities..."
+        _live_phase(comm_label, "running")
+        communities = detect_communities(
+            store,
+            progress=lambda s: _live_phase(comm_label, s),
+        )
+        _finish_phase(comm_label, f"{len(communities)} clusters found")
 
-        flows = trace_execution_flows(store)
-        _phase("Detecting execution flows...", f"{len(flows)} processes found")
+        flow_label = "Detecting execution flows..."
+        _live_phase(flow_label, "running")
+        flows = trace_execution_flows(
+            store,
+            progress=lambda s: _live_phase(flow_label, s),
+        )
+        _finish_phase(flow_label, f"{len(flows)} processes found")
 
+        dead_label = "Finding dead code..."
+        _live_phase(dead_label, "running")
         dead = detect_dead_code(store, limit=500)
-        _phase("Finding dead code...", f"{len(dead)} unreachable symbols")
+        _finish_phase(dead_label, f"{len(dead)} unreachable symbols")
 
-        # Use the root path for git coupling; fallback to the single module path
+        coup_label = "Analyzing git history..."
+        _live_phase(coup_label, "running")
         coupling_root = abs_path
         coupling_project = root_basename if is_multi else (last_result.project_id if last_result else root_basename)
         coupling_pairs = compute_coupling(
@@ -253,8 +278,9 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
             months=SETTINGS.default_coupling_months,
             min_strength=SETTINGS.default_min_coupling_strength,
             min_cochanges=SETTINGS.default_min_cochanges,
+            progress=lambda s: _live_phase(coup_label, s),
         )
-        _phase("Analyzing git history...", f"{len(coupling_pairs)} coupled file pairs")
+        _finish_phase(coup_label, f"{len(coupling_pairs)} coupled file pairs")
     else:
         _phase("Detecting communities...", "skipped (large repo; rerun with --deep)")
         _phase("Detecting execution flows...", "skipped (large repo; rerun with --deep)")

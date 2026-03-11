@@ -48,7 +48,12 @@ def _entry_methods(store, project: str | None = None) -> list[str]:
     return [r["id"] for r in fallback]
 
 
-def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None) -> list[dict]:
+def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None, progress=None) -> list[dict]:
+    def _ping(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    _ping("loading call graph")
     edges = store.query_records(
         """
         MATCH (a:Method)-[:CALLS]->(b:Method)
@@ -85,8 +90,11 @@ def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int
     else:
         entries = _entry_methods(store, project=project)
 
+    _ping(f"{len(entries)} entry points, tracing")
     flows = []
-    for e in entries:
+    for idx, e in enumerate(entries):
+        if idx % 50 == 0 and idx > 0:
+            _ping(f"traced {idx}/{len(entries)} entry points")
         visited = {e}
         q = deque([(e, 0)])
         nodes_with_depth = [(e, 0)]
@@ -115,6 +123,7 @@ def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int
     # need a second round-trip to resolve raw method ID hashes.
     # Collect all unique IDs across all flows, resolve in one bulk query.
     # ------------------------------------------------------------------ #
+    _ping(f"{len(flows)} flows, enriching metadata")
     all_ids = list({node["symbol"] for flow in flows for node in flow["nodes"]})
     meta = _resolve_method_metadata(store, all_ids)
 

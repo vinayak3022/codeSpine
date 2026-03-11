@@ -46,11 +46,18 @@ def compute_coupling(
     months: int = SETTINGS.default_coupling_months,
     min_strength: float = SETTINGS.default_min_coupling_strength,
     min_cochanges: int = SETTINGS.default_min_cochanges,
+    progress=None,
 ) -> list[dict]:
+    def _ping(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    _ping("reading git history")
     changesets = _git_changed_file_sets(repo_path, months)
     if not changesets:
         return []
 
+    _ping(f"{len(changesets)} commits, computing co-changes")
     file_changes = Counter()
     co_changes: Counter[tuple[str, str]] = Counter()
 
@@ -60,6 +67,7 @@ def compute_coupling(
         for a, b in itertools.combinations(sorted(cs), 2):
             co_changes[(a, b)] += 1
 
+    _ping(f"{len(co_changes)} pairs, filtering and persisting")
     results = []
     for (a, b), pair_count in co_changes.items():
         denom = max(file_changes[a], file_changes[b])
