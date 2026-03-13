@@ -7,6 +7,12 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-03-14
+
+### Fixed
+
+- Automatically remove and rebuild corrupted or incompatible local Kuzu databases from older CodeSpine/Kuzu versions instead of failing at startup.
+
 ## [0.5.5] - 2026-03-14
 
 ### Added

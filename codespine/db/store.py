@@ -19,6 +19,15 @@ from codespine.db.schema import ensure_schema
 LOGGER = logging.getLogger(__name__)
 
 _BUFFER_POOL_SIZE = 512 * 1024 * 1024  # 512 MB – room for large community detection
+_RECOVERABLE_DB_ERROR_MARKERS = (
+    "storage version mismatch",
+    "catalog version mismatch",
+    "database version is not supported",
+    "wal version mismatch",
+    "corrupt",
+    "corrupted",
+    "invalid database",
+)
 
 
 @dataclass
@@ -32,13 +41,13 @@ class GraphStore:
 
         self.overlay_store = OverlayStore()
         try:
-            self.db = self._open_db(db_path)
+            self.db = self._open_with_recovery(db_path)
         except Exception as exc:
             fallback = os.path.join("/tmp", ".codespine_db")
             LOGGER.warning("Primary DB path failed (%s). Falling back to %s", exc, fallback)
-            self.db = self._open_db(fallback)
+            self.db = self._open_with_recovery(fallback)
         if not self.read_only:
-            ensure_schema(self._conn())
+            self._ensure_schema_with_recovery()
 
     def _open_db(self, path: str) -> kuzu.Database:
         # Newer Kuzu versions accept read_only; fall back for older ones.
@@ -46,6 +55,42 @@ class GraphStore:
             return kuzu.Database(path, buffer_pool_size=_BUFFER_POOL_SIZE, read_only=self.read_only)
         except TypeError:
             return kuzu.Database(path, buffer_pool_size=_BUFFER_POOL_SIZE)
+
+    @staticmethod
+    def _is_recoverable_db_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(marker in message for marker in _RECOVERABLE_DB_ERROR_MARKERS)
+
+    @staticmethod
+    def _remove_db_path(path: str) -> None:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+
+    def _open_with_recovery(self, path: str) -> kuzu.Database:
+        try:
+            return self._open_db(path)
+        except Exception as exc:
+            if not self._is_recoverable_db_error(exc):
+                raise
+            LOGGER.warning("Removing corrupted or incompatible Kuzu DB at %s: %s", path, exc)
+            self._remove_db_path(path)
+            self._tls = threading.local()
+            return self._open_db(path)
+
+    def _ensure_schema_with_recovery(self) -> None:
+        try:
+            ensure_schema(self._conn())
+        except Exception as exc:
+            path = getattr(self.db, "database_path", SETTINGS.db_path)
+            if not self._is_recoverable_db_error(exc):
+                raise
+            LOGGER.warning("Rebuilding corrupted or incompatible Kuzu DB at %s during schema init: %s", path, exc)
+            self._remove_db_path(path)
+            self.db = self._open_db(path)
+            self._tls = threading.local()
+            ensure_schema(self._conn())
 
     def _conn(self) -> kuzu.Connection:
         """Return the per-thread Kuzu connection, creating it lazily."""
@@ -447,16 +492,10 @@ class GraphStore:
         self._recycle_conn()
         path = SETTINGS.db_path
         try:
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            elif os.path.exists(path):
-                os.remove(path)
+            self._remove_db_path(path)
         except OSError:
             fallback = os.path.join("/tmp", ".codespine_db")
-            if os.path.isdir(fallback):
-                shutil.rmtree(fallback, ignore_errors=True)
-            elif os.path.exists(fallback):
-                os.remove(fallback)
+            self._remove_db_path(fallback)
             self.db = self._open_db(fallback)
         else:
             self.db = self._open_db(path)

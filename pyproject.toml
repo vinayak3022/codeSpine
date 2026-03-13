@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codespine"
-version = "0.5.5"
+version = "0.5.6"
 description = "Local Java code intelligence indexer backed by a graph database"
 readme = "README.md"
 requires-python = ">=3.10"
