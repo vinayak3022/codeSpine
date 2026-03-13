@@ -6,12 +6,15 @@ Instead of having an agent open dozens of `.java` files to answer one question, 
 
 It indexes classes, methods, calls, type relationships, cross-module links, git coupling, dead-code candidates, and execution flows so agents can work from graph answers first and source files second.
 
+It also keeps a separate dirty overlay for uncommitted Java edits, so agents can query current work-in-progress without forcing the committed base index to churn on every save.
+
 ## Why It Saves Tokens
 
 - One MCP call can replace many file opens. `get_symbol_context("PaymentService")` returns a resolved neighborhood instead of forcing the agent to read every caller and callee file manually.
 - Search is structure-aware. Agents can ask for a symbol, concept, impact radius, or dead-code candidate without scanning entire packages.
 - Multi-module repos stay scoped. Project-aware IDs and `project=` parameters reduce noise from unrelated modules and workspaces.
 - Repeat sessions get cheaper. Once indexed, the agent reuses the graph instead of re-discovering the same relationships every turn.
+- Active edits stay smooth. Dirty files are kept in an overlay and merged into fast queries until you commit, instead of hammering the main graph DB on each change.
 
 ## Install
 
@@ -35,6 +38,32 @@ pip install "codespine[ml]"
 - Change coupling: git-history-based file relationships
 - Multi-project and multi-module indexing: workspaces, Maven modules, Gradle subprojects
 - MCP server: structured tools for Claude, Cursor, Cline, Copilot, and similar clients
+
+## Editing Without Stale Indexes
+
+CodeSpine uses a two-layer model:
+
+- Base index: last committed state
+- Dirty overlay: uncommitted Java changes
+
+Fast tools read merged `base + overlay` state by default:
+
+- `search`
+- `context`
+- `impact`
+- MCP `search_hybrid`
+- MCP `find_symbol`
+- MCP `get_symbol_context`
+- MCP `get_impact`
+
+Deep analyses stay committed-only until promotion:
+
+- `deadcode`
+- `flow`
+- `community`
+- `coupling`
+
+`codespine watch` updates the dirty overlay after a debounce window, then promotes it into the base index when local `HEAD` changes.
 
 ## Quick Start
 
@@ -141,6 +170,7 @@ codespine analyse <path> --full
 codespine analyse <path> --deep
 codespine analyse <path> --embed
 codespine watch --path .
+codespine watch --path . --overlay-debounce-ms 1500
 codespine search "query"
 codespine context "symbol"
 codespine impact "symbol"
@@ -151,6 +181,9 @@ codespine coupling
 codespine diff main..feature
 codespine stats
 codespine list
+codespine overlay-status
+codespine overlay-promote
+codespine overlay-clear
 codespine clear-project <project_id>
 codespine clear-index
 ```
@@ -183,6 +216,8 @@ That same project ID can be passed into MCP tools and CLI analysis calls that su
 
 Use it when you want architecture-level context. Skip it when you just need the graph refreshed for search, context, and impact.
 
+When a dirty overlay exists, deep-analysis results intentionally exclude those uncommitted edits until promotion.
+
 `--embed` is also optional. Without it, CodeSpine still supports exact, keyword, and fuzzy search. Add embeddings when you need concept-level retrieval.
 
 ## Runtime Files
@@ -192,10 +227,12 @@ Use it when you want architecture-level context. Skip it when you just need the 
 - `~/.codespine.log` - server log
 - `~/.codespine_embedding_cache.json` - embedding cache
 - `~/.codespine_index_meta/` - incremental file metadata cache
+- `~/.codespine_overlay/` - uncommitted dirty overlay state
 
 ## Notes
 
 - `codespine start` launches a background MCP server. Most IDE MCP clients should use `codespine mcp` instead and manage the process themselves.
+- `codespine watch` updates the dirty overlay first; it does not rewrite the committed base index on every save.
 - `codespine clear-index` rebuilds the local index database from scratch.
 - For large Spring or JPA-heavy repos, dead-code results should still be reviewed before deletion. The tool is conservative, not authoritative.
 
