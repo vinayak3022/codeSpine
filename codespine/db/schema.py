@@ -10,7 +10,7 @@ NODE_TABLES: list[tuple[str, str]] = [
     ("SchemaMeta", "CREATE NODE TABLE SchemaMeta(key STRING, value STRING, PRIMARY KEY (key))"),
     (
         "Project",
-        "CREATE NODE TABLE Project(id STRING, path STRING, language STRING, indexed_at STRING, PRIMARY KEY (id))",
+        "CREATE NODE TABLE Project(id STRING, path STRING, language STRING, indexed_at STRING, indexed_commit STRING, overlay_dirty BOOL, PRIMARY KEY (id))",
     ),
     (
         "File",
@@ -81,5 +81,8 @@ def ensure_schema(conn) -> None:
 
     _safe_execute(
         conn,
-        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '3'",
+        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '4'",
     )
+
+    _safe_execute(conn, "ALTER TABLE Project ADD indexed_commit STRING DEFAULT ''")
+    _safe_execute(conn, "ALTER TABLE Project ADD overlay_dirty BOOL DEFAULT false")

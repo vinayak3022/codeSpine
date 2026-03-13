@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+from codespine.overlay.merge import merged_symbol_records
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
 from codespine.search.rrf import reciprocal_rank_fusion
@@ -29,29 +30,31 @@ def _read_snippet(file_path: str, line: int, context: int = _SNIPPET_CONTEXT_LIN
 
 
 def hybrid_search(store, query: str, k: int = 20, project: str | None = None) -> list[dict]:
-    project_clause = "AND f.project_id = $proj" if project else ""
-    params: dict = {}
-    if project:
-        params["proj"] = project
-
-    # No LIMIT — load all symbols for the scoped project so that exact class names
-    # are never missing from the candidate pool (previously capped at 2000 which
-    # caused exact matches on 4000+ file projects to be silently dropped).
-    recs = store.query_records(
-        f"""
-        MATCH (s:Symbol), (f:File)
-        WHERE s.file_id = f.id {project_clause}
-        RETURN s.id as id,
-               s.kind as kind,
-               s.name as name,
-               s.fqname as fqname,
-               s.embedding as embedding,
-               s.line as line,
-               f.path as file_path,
-               f.is_test as is_test
-        """,
-        params,
-    )
+    overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is not None:
+        recs = merged_symbol_records(store, overlay_store, project=project)
+    else:
+        project_clause = "AND f.project_id = $proj" if project else ""
+        params: dict = {}
+        if project:
+            params["proj"] = project
+        recs = store.query_records(
+            f"""
+            MATCH (s:Symbol), (f:File)
+            WHERE s.file_id = f.id {project_clause}
+            RETURN s.id as id,
+                   s.kind as kind,
+                   s.name as name,
+                   s.fqname as fqname,
+                   s.embedding as embedding,
+                   s.line as line,
+                   s.file_id as file_id,
+                   f.path as file_path,
+                   f.project_id as project_id,
+                   f.is_test as is_test
+            """,
+            params,
+        )
 
     if not recs:
         return []

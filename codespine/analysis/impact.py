@@ -2,22 +2,36 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
+from codespine.overlay.merge import merged_call_edges, merged_method_records, merged_symbol_records
+
 
 def _resolve_symbol_ids(store, symbol_query: str, project: str | None = None) -> list[str]:
-    project_clause = "AND f.project_id = $proj" if project else ""
-    params: dict = {"q": symbol_query}
-    if project:
-        params["proj"] = project
-    recs = store.query_records(
-        f"""
-        MATCH (s:Symbol), (f:File)
-        WHERE s.file_id = f.id {project_clause}
-        AND (s.id = $q OR lower(s.name) = lower($q) OR lower(s.fqname) = lower($q) OR lower(s.fqname) CONTAINS lower($q))
-        RETURN s.id as id
-        LIMIT 50
-        """,
-        params,
-    )
+    overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is not None:
+        recs = []
+        needle = symbol_query.lower()
+        for rec in merged_symbol_records(store, overlay_store, project=project):
+            name = str(rec.get("name") or "").lower()
+            fqname = str(rec.get("fqname") or "").lower()
+            if rec.get("id") == symbol_query or name == needle or fqname == needle or needle in fqname:
+                recs.append({"id": rec["id"]})
+                if len(recs) >= 50:
+                    break
+    else:
+        project_clause = "AND f.project_id = $proj" if project else ""
+        params: dict = {"q": symbol_query}
+        if project:
+            params["proj"] = project
+        recs = store.query_records(
+            f"""
+            MATCH (s:Symbol), (f:File)
+            WHERE s.file_id = f.id {project_clause}
+            AND (s.id = $q OR lower(s.name) = lower($q) OR lower(s.fqname) = lower($q) OR lower(s.fqname) CONTAINS lower($q))
+            RETURN s.id as id
+            LIMIT 50
+            """,
+            params,
+        )
     return [r["id"] for r in recs]
 
 
@@ -30,15 +44,21 @@ def _resolve_method_metadata(store, method_ids: list[str]) -> dict[str, dict]:
     """
     if not method_ids:
         return {}
-    recs = store.query_records(
-        """
-        MATCH (m:Method), (c:Class), (f:File)
-        WHERE m.id IN $ids AND m.class_id = c.id AND c.file_id = f.id
-        RETURN m.id as id, m.name as name, m.signature as fqname,
-               c.fqcn as class_fqcn, f.path as file_path, f.project_id as project_id
-        """,
-        {"ids": method_ids},
-    )
+    overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is not None:
+        recs = [r for r in merged_method_records(store, overlay_store) if r.get("id") in set(method_ids)]
+        for rec in recs:
+            rec["fqname"] = rec.get("signature")
+    else:
+        recs = store.query_records(
+            """
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.id IN $ids AND m.class_id = c.id AND c.file_id = f.id
+            RETURN m.id as id, m.name as name, m.signature as fqname,
+                   c.fqcn as class_fqcn, f.path as file_path, f.project_id as project_id
+            """,
+            {"ids": method_ids},
+        )
     return {r["id"]: r for r in recs}
 
 
@@ -47,16 +67,33 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
     if not target_symbol_ids:
         return {"target": symbol_query, "depth_groups": {"1": [], "2": [], "3+": []}}
 
-    symbol_to_method = {
-        r["sid"]: r["mid"]
-        for r in store.query_records(
-            """
-            MATCH (s:Symbol),(m:Method)
-            WHERE s.kind = 'method' AND s.fqname CONTAINS m.signature
-            RETURN s.id as sid, m.id as mid
-            """
-        )
-    }
+    overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is not None:
+        methods = merged_method_records(store, overlay_store, project=project)
+        symbols = merged_symbol_records(store, overlay_store, project=project)
+        fqname_and_file_to_method = {
+            (f"{rec.get('class_fqcn')}#{rec.get('signature')}", rec.get("file_id")): rec["id"]
+            for rec in methods
+        }
+        symbol_to_method = {}
+        for rec in symbols:
+            if rec.get("kind") != "method":
+                continue
+            method_key = (rec.get("fqname"), rec.get("file_id"))
+            method_id = fqname_and_file_to_method.get(method_key)
+            if method_id:
+                symbol_to_method[rec["id"]] = method_id
+    else:
+        symbol_to_method = {
+            r["sid"]: r["mid"]
+            for r in store.query_records(
+                """
+                MATCH (s:Symbol),(m:Method)
+                WHERE s.kind = 'method' AND s.fqname CONTAINS m.signature
+                RETURN s.id as sid, m.id as mid
+                """
+            )
+        }
 
     target_method_ids = [symbol_to_method[sid] for sid in target_symbol_ids if sid in symbol_to_method]
     if not target_method_ids:
@@ -64,14 +101,19 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
 
     # Load all call edges – cross-project callers are included intentionally so
     # impact analysis surfaces inter-module dependencies.
-    edges = store.query_records(
-        """
-        MATCH (a:Method)-[r:CALLS]->(b:Method)
-        RETURN a.id as src, b.id as dst, 'CALLS' as edge_type,
-               coalesce(r.confidence, 0.5) as confidence,
-               coalesce(r.reason, 'unknown') as reason
-        """
-    )
+    if overlay_store is not None:
+        edges = merged_call_edges(store, overlay_store, project=project)
+        for edge in edges:
+            edge["edge_type"] = "CALLS"
+    else:
+        edges = store.query_records(
+            """
+            MATCH (a:Method)-[r:CALLS]->(b:Method)
+            RETURN a.id as src, b.id as dst, 'CALLS' as edge_type,
+                   coalesce(r.confidence, 0.5) as confidence,
+                   coalesce(r.reason, 'unknown') as reason
+            """
+        )
 
     reverse_adj: dict[str, list[dict]] = defaultdict(list)
     for edge in edges:

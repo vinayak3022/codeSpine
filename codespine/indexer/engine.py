@@ -207,6 +207,8 @@ class JavaIndexer:
         methods_indexed = 0
         calls_resolved = 0
         type_relationships = 0
+        file_batch_size = max(1, int(getattr(SETTINGS, "index_file_batch_size", 64)))
+        edge_batch_size = max(1, int(getattr(SETTINGS, "edge_write_batch_size", 2000)))
 
         method_catalog: dict[str, dict] = self._existing_method_catalog(project_id) if not full else {}
         method_calls: dict[str, list] = {}
@@ -242,16 +244,24 @@ class JavaIndexer:
                         file_path=fp,
                     )
 
-        # ── Sequential DB writes ─────────────────────────────────────────────
-        with self.store.transaction():
-            self.store.upsert_project(project_id, root_path)
-            if full:
-                self.store.clear_project(project_id)
-            else:
-                for fid in deleted_file_ids:
-                    self.store.clear_file(fid)
+        # ── Chunked DB writes ─────────────────────────────────────────────────
+        if full:
+            self.store.clear_project(project_id)
+        elif deleted_file_ids:
+            for delete_chunk in self._chunked(deleted_file_ids, file_batch_size):
+                with self.store.transaction():
+                    for fid in delete_chunk:
+                        self.store.clear_file(fid)
+                self.store._recycle_conn()
+        self.store.upsert_project(project_id, root_path)
 
-            for pr in parse_results:
+        for parse_chunk in self._chunked(parse_results, file_batch_size):
+            file_rows: list[dict] = []
+            class_rows: list[dict] = []
+            method_rows: list[dict] = []
+            symbol_rows: list[dict] = []
+
+            for pr in parse_chunk:
                 file_path = pr["file_path"]
                 parsed = pr["parsed"]
                 f_id = pr["f_id"]
@@ -260,14 +270,28 @@ class JavaIndexer:
                 scope = pr["scope"]
                 source = pr["source"]
 
-                if not full:
-                    self.store.clear_file(f_id)
-                self.store.upsert_file(f_id, file_path, project_id, is_test, file_digest)
+                file_rows.append(
+                    {
+                        "id": f_id,
+                        "path": file_path,
+                        "project_id": project_id,
+                        "is_test": is_test,
+                        "hash": file_digest,
+                    }
+                )
                 self._update_meta_cache_entry(meta_cache, f_id, file_path, file_digest, len(source))
 
                 for cls in parsed.classes:
                     c_id = class_id(cls.fqcn, scope)
-                    self.store.upsert_class(c_id, cls.fqcn, cls.name, cls.package, f_id)
+                    class_rows.append(
+                        {
+                            "id": c_id,
+                            "fqcn": cls.fqcn,
+                            "name": cls.name,
+                            "package": cls.package,
+                            "file_id": f_id,
+                        }
+                    )
                     class_catalog.setdefault(cls.name, [])
                     if cls.fqcn not in class_catalog[cls.name]:
                         class_catalog[cls.name].append(cls.fqcn)
@@ -285,42 +309,47 @@ class JavaIndexer:
                     class_methods.setdefault(c_id, {})
 
                     cls_symbol_id = symbol_id("class", cls.fqcn, scope)
-                    self.store.upsert_symbol(
-                        symbol_id=cls_symbol_id,
-                        kind="class",
-                        name=cls.name,
-                        fqname=cls.fqcn,
-                        file_id=f_id,
-                        line=cls.line,
-                        col=cls.col,
-                        embedding=embed_text(f"class {cls.fqcn}") if embed else None,
+                    symbol_rows.append(
+                        {
+                            "id": cls_symbol_id,
+                            "kind": "class",
+                            "name": cls.name,
+                            "fqname": cls.fqcn,
+                            "file_id": f_id,
+                            "line": cls.line,
+                            "col": cls.col,
+                            "embedding": embed_text(f"class {cls.fqcn}") if embed else None,
+                        }
                     )
                     classes_indexed += 1
 
                     for method in cls.methods:
                         m_id = method_id(cls.fqcn, method.signature, scope)
-                        self.store.upsert_method(
-                            method_id=m_id,
-                            class_id=c_id,
-                            name=method.name,
-                            signature=method.signature,
-                            return_type=method.return_type,
-                            modifiers=method.modifiers + [f"@{a}" for a in method.annotations],
-                            is_constructor=(method.name == cls.name),
-                            is_test=is_test,
+                        method_rows.append(
+                            {
+                                "id": m_id,
+                                "class_id": c_id,
+                                "name": method.name,
+                                "signature": method.signature,
+                                "return_type": method.return_type,
+                                "modifiers": method.modifiers + [f"@{a}" for a in method.annotations],
+                                "is_constructor": method.name == cls.name,
+                                "is_test": is_test,
+                            }
                         )
 
                         fqname = f"{cls.fqcn}#{method.signature}"
-                        m_symbol_id = symbol_id("method", fqname, scope)
-                        self.store.upsert_symbol(
-                            symbol_id=m_symbol_id,
-                            kind="method",
-                            name=method.name,
-                            fqname=fqname,
-                            file_id=f_id,
-                            line=method.line,
-                            col=method.col,
-                            embedding=embed_text(f"method {fqname} returns {method.return_type}") if embed else None,
+                        symbol_rows.append(
+                            {
+                                "id": symbol_id("method", fqname, scope),
+                                "kind": "method",
+                                "name": method.name,
+                                "fqname": fqname,
+                                "file_id": f_id,
+                                "line": method.line,
+                                "col": method.col,
+                                "embedding": embed_text(f"method {fqname} returns {method.return_type}") if embed else None,
+                            }
                         )
                         methods_indexed += 1
 
@@ -343,22 +372,48 @@ class JavaIndexer:
                         class_methods[c_id][method.signature] = m_id
                 files_indexed += 1
 
-            self._emit(progress, "resolve_calls_start")
-            for src, dst, confidence, reason in resolve_calls(method_catalog, method_calls, method_context, class_catalog):
-                self.store.add_call(src, dst, confidence, reason)
-                calls_resolved += 1
-                if calls_resolved % 2000 == 0:
-                    self._emit(progress, "resolve_calls_progress", calls_resolved=calls_resolved)
-            self._emit(progress, "resolve_calls_done", calls_resolved=calls_resolved)
+            with self.store.transaction():
+                for row in file_rows:
+                    if not full:
+                        self.store.clear_file(row["id"])
+                self.store.upsert_files_batch(file_rows)
+                self.store.upsert_classes_batch(class_rows)
+                self.store.upsert_methods_batch(method_rows)
+                self.store.upsert_symbols_batch(symbol_rows)
+            self.store._recycle_conn()
 
-            self._emit(progress, "resolve_types_start")
-            type_relationships += self._build_inheritance_edges(
-                class_meta,
-                class_catalog,
-                class_methods,
-                fqcn_to_class_ids,
+        self._emit(progress, "resolve_calls_start")
+        call_rows: list[dict] = []
+        for src, dst, confidence, reason in resolve_calls(method_catalog, method_calls, method_context, class_catalog):
+            call_rows.append(
+                {
+                    "source_id": src,
+                    "target_id": dst,
+                    "confidence": confidence,
+                    "reason": reason,
+                }
             )
-            self._emit(progress, "resolve_types_done", type_relationships=type_relationships)
+        for call_chunk in self._chunked(call_rows, edge_batch_size):
+            with self.store.transaction():
+                self.store.add_calls_batch(call_chunk)
+            calls_resolved += len(call_chunk)
+            self.store._recycle_conn()
+            self._emit(progress, "resolve_calls_progress", calls_resolved=calls_resolved)
+        self._emit(progress, "resolve_calls_done", calls_resolved=calls_resolved)
+
+        self._emit(progress, "resolve_types_start")
+        type_rows = self._build_inheritance_edges(
+            class_meta,
+            class_catalog,
+            class_methods,
+            fqcn_to_class_ids,
+        )
+        for rel_chunk in self._chunked(type_rows, edge_batch_size):
+            with self.store.transaction():
+                self.store.add_references_batch(rel_chunk)
+            type_relationships += len(rel_chunk)
+            self.store._recycle_conn()
+        self._emit(progress, "resolve_types_done", type_relationships=type_relationships)
 
         self._prune_meta_cache(meta_cache, current_file_ids)
         self._save_file_meta_cache(project_id, meta_cache)
@@ -542,34 +597,71 @@ class JavaIndexer:
         class_catalog: dict[str, list[str]],
         class_methods: dict[str, dict[str, str]],
         fqcn_to_class_ids: dict[str, list[str]],
-    ) -> int:
-        rel_count = 0
+    ) -> list[dict]:
+        rel_rows: list[dict] = []
         for src_id, meta in class_meta.items():
             ctx = {"package": meta.get("package", ""), "imports": meta.get("imports", [])}
 
             parent_candidates = self._resolve_type_candidates(meta.get("extends"), ctx, class_catalog)
             for parent_fqcn in parent_candidates:
                 for dst_id in fqcn_to_class_ids.get(parent_fqcn, []):
-                    self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 0.8)
-                    rel_count += 1
+                    rel_rows.append(
+                        {
+                            "rel": "IMPLEMENTS",
+                            "src_label": "Class",
+                            "src_id": src_id,
+                            "dst_label": "Class",
+                            "dst_id": dst_id,
+                            "confidence": 0.8,
+                        }
+                    )
                     for sig, method_id in class_methods.get(src_id, {}).items():
                         parent_method = class_methods.get(dst_id, {}).get(sig)
                         if parent_method:
-                            self.store.add_reference("OVERRIDES", "Method", method_id, "Method", parent_method, 1.0)
-                            rel_count += 1
+                            rel_rows.append(
+                                {
+                                    "rel": "OVERRIDES",
+                                    "src_label": "Method",
+                                    "src_id": method_id,
+                                    "dst_label": "Method",
+                                    "dst_id": parent_method,
+                                    "confidence": 1.0,
+                                }
+                            )
 
             for iface in meta.get("interfaces", []):
                 iface_candidates = self._resolve_type_candidates(iface, ctx, class_catalog)
                 for iface_fqcn in iface_candidates:
                     for dst_id in fqcn_to_class_ids.get(iface_fqcn, []):
-                        self.store.add_reference("IMPLEMENTS", "Class", src_id, "Class", dst_id, 1.0)
-                        rel_count += 1
+                        rel_rows.append(
+                            {
+                                "rel": "IMPLEMENTS",
+                                "src_label": "Class",
+                                "src_id": src_id,
+                                "dst_label": "Class",
+                                "dst_id": dst_id,
+                                "confidence": 1.0,
+                            }
+                        )
                         for sig, method_id in class_methods.get(src_id, {}).items():
                             iface_method = class_methods.get(dst_id, {}).get(sig)
                             if iface_method:
-                                self.store.add_reference("OVERRIDES", "Method", method_id, "Method", iface_method, 1.0)
-                                rel_count += 1
-        return rel_count
+                                rel_rows.append(
+                                    {
+                                        "rel": "OVERRIDES",
+                                        "src_label": "Method",
+                                        "src_id": method_id,
+                                        "dst_label": "Method",
+                                        "dst_id": iface_method,
+                                        "confidence": 1.0,
+                                    }
+                                )
+        return rel_rows
+
+    @staticmethod
+    def _chunked(items: list, size: int):
+        for i in range(0, len(items), size):
+            yield items[i : i + size]
 
     @staticmethod
     def _meta_cache_path(project_id: str) -> str:

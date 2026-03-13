@@ -16,7 +16,14 @@ from codespine.analysis.deadcode import detect_dead_code as detect_dead_code_ana
 from codespine.analysis.flow import trace_execution_flows as trace_flows_analysis
 from codespine.analysis.impact import analyze_impact
 from codespine.diff.branch_diff import compare_branches as compare_branches_analysis
+from codespine.overlay.git_state import current_head
+from codespine.overlay.merge import overlay_summary
 from codespine.search.hybrid import hybrid_search
+from codespine.watch.watcher import (
+    clear_overlay as clear_overlay_state,
+    get_overlay_status as get_overlay_status_state,
+    promote_overlay as promote_overlay_state,
+)
 
 
 def _json(data: dict) -> str:
@@ -71,7 +78,13 @@ def _parse_indexed_at(raw) -> int:
         return 0
 
 
-def _staleness_meta(store, response: dict, project: str | None = None) -> str:
+def _staleness_meta(
+    store,
+    response: dict,
+    project: str | None = None,
+    overlay_store=None,
+    deep_scope: bool = False,
+) -> str:
     """Inject index staleness metadata into every tool response and serialise.
 
     Adds ``index_age_seconds`` and ``stale_warning`` when the index is old.
@@ -100,11 +113,25 @@ def _staleness_meta(store, response: dict, project: str | None = None) -> str:
                     )
     except Exception:
         pass
+    if overlay_store is not None:
+        try:
+            summary = overlay_summary(overlay_store, project=project)
+            response.update(summary)
+            if project:
+                meta = store.get_project_metadata(project) or {}
+                response["base_indexed_commit"] = meta.get("indexed_commit", "")
+                response["working_head_commit"] = current_head(meta.get("path") or response.get("path") or "")
+            if deep_scope and summary.get("overlay_present"):
+                response["overlay_excluded"] = True
+                response["note"] = "Results reflect committed index only; uncommitted overlay changes are excluded."
+        except Exception:
+            pass
     return _json(response)
 
 
 def build_mcp_server(store, repo_path_provider):
     _raw_mcp = FastMCP("codespine")
+    overlay_store = getattr(store, "overlay_store", None)
 
     # ── Anti-duplicate-JSON wrapper ────────────────────────────────────
     # FastMCP double-serialises dict return values on many transports,
@@ -157,7 +184,14 @@ def build_mcp_server(store, repo_path_provider):
         """
         try:
             projects = store.query_records(
-                "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
+                """
+                MATCH (p:Project)
+                RETURN p.id as id,
+                       p.path as path,
+                       p.indexed_at as indexed_at,
+                       p.indexed_commit as indexed_commit,
+                       p.overlay_dirty as overlay_dirty
+                """
             )
         except Exception:
             # Old DB schema (pre-0.4.0) doesn't have indexed_at column yet.
@@ -189,6 +223,8 @@ def build_mcp_server(store, repo_path_provider):
 
         watch_running = _watch["proc"] is not None and _watch["proc"].poll() is None
         analyse_running = _analyse["proc"] is not None and _analyse["proc"].poll() is None
+        overlay_meta = overlay_summary(overlay_store) if overlay_store is not None else {}
+        overlay_status = get_overlay_status_state(store) if overlay_store is not None else []
 
         now = int(time.time())
         stale_projects = []
@@ -227,6 +263,7 @@ def build_mcp_server(store, repo_path_provider):
             "available": True,
             "indexed_projects": projects,
             "symbol_count": n_sym,
+            **overlay_meta,
             "features": {
                 "ping": True,
                 "list_projects": True,
@@ -247,6 +284,9 @@ def build_mcp_server(store, repo_path_provider):
                 "reindex_file": True,
                 "watch_mode": True,
                 "analyse_project": True,
+                "get_overlay_status": True,
+                "promote_overlay": True,
+                "clear_overlay": True,
             },
             "background_jobs": {
                 "watch_running": watch_running,
@@ -254,6 +294,7 @@ def build_mcp_server(store, repo_path_provider):
                 "analyse_running": analyse_running,
                 "analyse_path": _analyse["path"] if analyse_running else None,
             },
+            "overlay_projects": overlay_status,
             "notes": notes,
         }
 
@@ -321,7 +362,7 @@ def build_mcp_server(store, repo_path_provider):
         results = hybrid_search(store, query, k=k, project=project)
         if not results:
             return _no_symbols_response()
-        return _staleness_meta(store, {"available": True, "results": results}, project)
+        return _staleness_meta(store, {"available": True, "results": results}, project, overlay_store=overlay_store)
 
     @mcp.tool()
     def get_impact(symbol: str, max_depth: int = 4, project: str | None = None):
@@ -332,7 +373,7 @@ def build_mcp_server(store, repo_path_provider):
         result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
         if not result.get("targets_resolved"):
             return {"available": False, "note": f"Symbol '{symbol}' not found in the index."}
-        return _staleness_meta(store, {"available": True, **result}, project)
+        return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
 
     @mcp.tool()
     def detect_dead_code(limit: int = 200, project: str | None = None, strict: bool = False):
@@ -373,7 +414,7 @@ def build_mcp_server(store, repo_path_provider):
             "dead_code": dead,
             "count": len(dead),
             "exemption_stats": stats,
-        }, project)
+        }, project, overlay_store=overlay_store, deep_scope=True)
 
     @mcp.tool()
     def trace_execution_flows(entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None):
@@ -384,7 +425,7 @@ def build_mcp_server(store, repo_path_provider):
         flows = trace_flows_analysis(store, entry_symbol=entry_symbol, max_depth=max_depth, project=project)
         if not flows:
             return _no_symbols_response("No entry points found. Run 'codespine analyse --deep' or provide entry_symbol.")
-        return _staleness_meta(store, {"available": True, "flows": flows}, project)
+        return _staleness_meta(store, {"available": True, "flows": flows}, project, overlay_store=overlay_store, deep_scope=True)
 
     @mcp.tool()
     def get_symbol_community(symbol: str):
@@ -396,7 +437,7 @@ def build_mcp_server(store, repo_path_provider):
         result = symbol_community(store, symbol)
         if not result.get("matches"):
             return {"available": False, "note": "No community data yet. Run 'codespine analyse --deep'."}
-        return _staleness_meta(store, {"available": True, **result})
+        return _staleness_meta(store, {"available": True, **result}, overlay_store=overlay_store, deep_scope=True)
 
     @mcp.tool()
     def get_change_coupling(
@@ -415,7 +456,7 @@ def build_mcp_server(store, repo_path_provider):
                 "available": False,
                 "note": "No coupling data. Run 'codespine analyse --deep' with a git repository.",
             }
-        return _staleness_meta(store, {"available": True, "coupling": result})
+        return _staleness_meta(store, {"available": True, "coupling": result}, overlay_store=overlay_store, deep_scope=True)
 
     @mcp.tool()
     def get_symbol_context(query: str, max_depth: int = 3, project: str | None = None):
@@ -426,7 +467,7 @@ def build_mcp_server(store, repo_path_provider):
         result = build_symbol_context(store, query, max_depth=max_depth, project=project)
         if not result.get("search_candidates"):
             return _no_symbols_response()
-        return _staleness_meta(store, {"available": True, **result}, project)
+        return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
 
     @mcp.tool()
     def get_codebase_stats():
@@ -437,7 +478,11 @@ def build_mcp_server(store, repo_path_provider):
         deciding which project= scope to pass to analysis tools.
         """
         projects = store.query_records(
-            "MATCH (p:Project) RETURN p.id as id, p.path as path ORDER BY p.id"
+            """
+            MATCH (p:Project)
+            RETURN p.id as id, p.path as path, p.indexed_commit as indexed_commit, p.overlay_dirty as overlay_dirty
+            ORDER BY p.id
+            """
         )
         if not projects:
             return {"available": False, "note": "No projects indexed yet. Run 'codespine analyse <path>'."}
@@ -478,6 +523,8 @@ def build_mcp_server(store, repo_path_provider):
                 "methods": n_methods,
                 "calls_out": n_calls,
                 "embeddings": n_emb,
+                "indexed_commit": p.get("indexed_commit", ""),
+                "overlay_dirty": bool(p.get("overlay_dirty", False)),
             })
             total_files += n_files
             total_classes += n_classes
@@ -485,7 +532,7 @@ def build_mcp_server(store, repo_path_provider):
             total_calls += n_calls
             total_emb += n_emb
 
-        return {
+        return _staleness_meta(store, {
             "available": True,
             "per_project": per_project,
             "totals": {
@@ -496,7 +543,7 @@ def build_mcp_server(store, repo_path_provider):
                 "calls": total_calls,
                 "embeddings": total_emb,
             },
-        }
+        }, overlay_store=overlay_store)
 
     # ------------------------------------------------------------------
     # Ambiguity resolution + structural exploration
@@ -535,44 +582,46 @@ def build_mcp_server(store, repo_path_provider):
         if project:
             params["proj"] = project
 
+        from codespine.overlay.merge import merged_class_records, merged_method_records
+
         classes: list[dict] = []
         methods: list[dict] = []
-
         if kind != "method":
-            c_recs = store.query_records(
-                f"""
-                MATCH (c:Class), (f:File)
-                WHERE c.file_id = f.id {project_clause}
-                  AND (lower(c.name) = $namel
-                    OR lower(c.fqcn) = $namel
-                    OR lower(c.fqcn) CONTAINS $namel
-                    OR lower(c.name) CONTAINS $namel)
-                RETURN c.id as id, c.name as name, c.fqcn as fqname,
-                       c.package as package,
-                       f.project_id as project_id, f.path as file_path
-                LIMIT $lim
-                """,
-                params,
-            )
-            classes = c_recs
+            for rec in merged_class_records(store, overlay_store, project=project):
+                rec_name = str(rec.get("name") or "").lower()
+                rec_fqcn = str(rec.get("fqcn") or "").lower()
+                if rec_name == name_lower or rec_fqcn == name_lower or name_lower in rec_fqcn or name_lower in rec_name:
+                    classes.append(
+                        {
+                            "id": rec.get("id"),
+                            "name": rec.get("name"),
+                            "fqname": rec.get("fqcn"),
+                            "package": rec.get("package"),
+                            "project_id": rec.get("project_id"),
+                            "file_path": rec.get("file_path"),
+                        }
+                    )
+                    if len(classes) >= limit:
+                        break
 
         if kind != "class":
-            m_recs = store.query_records(
-                f"""
-                MATCH (m:Method), (c:Class), (f:File)
-                WHERE m.class_id = c.id AND c.file_id = f.id {project_clause}
-                  AND (lower(m.name) = $namel
-                    OR lower(m.signature) CONTAINS $namel)
-                RETURN m.id as id, m.name as name,
-                       m.signature as fqname,
-                       c.fqcn as class_fqcn,
-                       f.project_id as project_id, f.path as file_path,
-                       m.return_type as return_type
-                LIMIT $lim
-                """,
-                params,
-            )
-            methods = m_recs
+            for rec in merged_method_records(store, overlay_store, project=project):
+                rec_name = str(rec.get("name") or "").lower()
+                signature = str(rec.get("signature") or "").lower()
+                if rec_name == name_lower or name_lower in signature:
+                    methods.append(
+                        {
+                            "id": rec.get("id"),
+                            "name": rec.get("name"),
+                            "fqname": rec.get("signature"),
+                            "class_fqcn": rec.get("class_fqcn"),
+                            "project_id": rec.get("project_id"),
+                            "file_path": rec.get("file_path"),
+                            "return_type": rec.get("return_type"),
+                        }
+                    )
+                    if len(methods) >= limit:
+                        break
 
         total = len(classes) + len(methods)
         if total == 0:
@@ -601,7 +650,39 @@ def build_mcp_server(store, repo_path_provider):
                 f"Found {total} match(es). If multiple projects contain the same name, "
                 "pass project=<project_id> to subsequent tools to avoid cross-project ambiguity."
             ) if total > 1 else None,
-        }, project)
+        }, project, overlay_store=overlay_store)
+
+    @mcp.tool()
+    def get_overlay_status(project: str | None = None):
+        """Report uncommitted overlay state by project/module."""
+        return _staleness_meta(
+            store,
+            {"available": True, "overlay": get_overlay_status_state(store, project=project)},
+            project,
+            overlay_store=overlay_store,
+        )
+
+    @mcp.tool()
+    def promote_overlay(project: str | None = None):
+        """Promote dirty overlay state into the committed base index immediately."""
+        result = promote_overlay_state(store, project=project, require_head_change=False)
+        return _staleness_meta(
+            store,
+            {"available": True, "promoted": result},
+            project,
+            overlay_store=overlay_store,
+        )
+
+    @mcp.tool()
+    def clear_overlay(project: str | None = None):
+        """Discard dirty overlay state without changing the committed base index."""
+        result = clear_overlay_state(store, project=project)
+        return _staleness_meta(
+            store,
+            {"available": True, "cleared": result},
+            project,
+            overlay_store=overlay_store,
+        )
 
     @mcp.tool()
     def list_packages(project: str | None = None, limit: int = 200):
@@ -648,7 +729,7 @@ def build_mcp_server(store, repo_path_provider):
             "available": True,
             "total_packages": len(recs),
             "by_project": by_project,
-        }, project)
+        }, project, overlay_store=overlay_store)
 
     # ------------------------------------------------------------------
     # Git tools
@@ -731,18 +812,21 @@ def build_mcp_server(store, repo_path_provider):
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def start_watch(path: str, global_interval: int = 30):
+    def start_watch(
+        path: str,
+        global_interval: int = 30,
+        overlay_debounce_ms: int = 1500,
+        promote_on_commit: bool = True,
+    ):
         """
-        Start watching a project directory for Java file changes and auto-reindex.
+        Start watching a project directory for Java file changes and update the dirty overlay.
 
-        Watch mode monitors .java files for changes and incrementally re-indexes
-        only the modified module(s). It also periodically runs community detection,
-        flow tracing, and coupling analysis every global_interval seconds.
+        Watch mode monitors .java files for changes, debounces saves, and updates
+        the dirty overlay instead of mutating the committed base index immediately.
+        When local HEAD changes, dirty overlay state is promoted into the base index.
 
-        RECOMMENDATION: Enable watch mode during active development. It keeps
-        CodeSpine's graph in sync with your code changes in real time, making
-        subsequent searches, impact analysis, and dead-code detection always
-        reflect the latest state of the codebase.
+        Fast tools (search/context/impact) read merged base+overlay state. Deep
+        analyses stay on the committed base index until promotion.
 
         Returns the PID of the background watch process and the path being watched.
         Use get_watch_status() to check if it's still running.
@@ -771,12 +855,17 @@ def build_mcp_server(store, repo_path_provider):
         watch_err_path = watch_err_file.name
         watch_err_file.close()
 
+        cmd = [
+            sys.executable, "-m", "codespine.cli",
+            "watch", "--path", abs_path,
+            "--global-interval", str(global_interval),
+            "--overlay-debounce-ms", str(overlay_debounce_ms),
+        ]
+        if not promote_on_commit:
+            cmd.append("--no-promote-on-commit")
+
         proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "codespine.cli",
-                "watch", "--path", abs_path,
-                "--global-interval", str(global_interval),
-            ],
+            cmd,
             stdout=open(watch_err_path, "w", encoding="utf-8"),
             stderr=subprocess.STDOUT,
         )
@@ -809,9 +898,11 @@ def build_mcp_server(store, repo_path_provider):
             "path": abs_path,
             "pid": proc.pid,
             "global_interval_s": global_interval,
+            "overlay_debounce_ms": overlay_debounce_ms,
+            "promote_on_commit": promote_on_commit,
             "note": (
-                "Watch mode started. CodeSpine will auto-reindex on every .java file change. "
-                f"Global analyses (communities, flows, coupling) refresh every {global_interval}s."
+                "Watch mode started. CodeSpine will update the dirty overlay after Java file changes "
+                "and promote it into the committed index when local HEAD changes."
             ),
         }
 

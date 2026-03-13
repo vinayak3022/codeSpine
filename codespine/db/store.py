@@ -28,6 +28,9 @@ class GraphStore:
     def __post_init__(self) -> None:
         db_path = SETTINGS.db_path
         self._tls: threading.local = threading.local()
+        from codespine.overlay.store import OverlayStore
+
+        self.overlay_store = OverlayStore()
         try:
             self.db = self._open_db(db_path)
         except Exception as exc:
@@ -94,9 +97,76 @@ class GraphStore:
 
     def upsert_project(self, project_id: str, path: str) -> None:
         self.execute(
-            "MERGE (p:Project {id: $id}) SET p.path = $path, p.language = 'java', p.indexed_at = $ts",
+            """
+            MERGE (p:Project {id: $id})
+            SET p.path = $path,
+                p.language = 'java',
+                p.indexed_at = $ts,
+                p.indexed_commit = coalesce(p.indexed_commit, ''),
+                p.overlay_dirty = coalesce(p.overlay_dirty, false)
+            """,
             {"id": project_id, "path": path, "ts": str(int(time.time()))},
         )
+
+    def set_project_overlay_dirty(self, project_id: str, dirty: bool) -> None:
+        self.execute(
+            "MATCH (p:Project {id: $id}) SET p.overlay_dirty = $dirty",
+            {"id": project_id, "dirty": bool(dirty)},
+        )
+
+    def set_project_indexed_commit(self, project_id: str, commit: str) -> None:
+        self.execute(
+            """
+            MATCH (p:Project {id: $id})
+            SET p.indexed_commit = $commit,
+                p.indexed_at = $ts
+            """,
+            {"id": project_id, "commit": commit, "ts": str(int(time.time()))},
+        )
+
+    def get_project_metadata(self, project_id: str) -> dict[str, Any] | None:
+        recs = self.query_records(
+            """
+            MATCH (p:Project)
+            WHERE p.id = $pid
+            RETURN p.id as id,
+                   p.path as path,
+                   p.language as language,
+                   p.indexed_at as indexed_at,
+                   p.indexed_commit as indexed_commit,
+                   p.overlay_dirty as overlay_dirty
+            LIMIT 1
+            """,
+            {"pid": project_id},
+        )
+        return recs[0] if recs else None
+
+    def list_project_metadata(self) -> list[dict[str, Any]]:
+        return self.query_records(
+            """
+            MATCH (p:Project)
+            RETURN p.id as id,
+                   p.path as path,
+                   p.language as language,
+                   p.indexed_at as indexed_at,
+                   p.indexed_commit as indexed_commit,
+                   p.overlay_dirty as overlay_dirty
+            ORDER BY p.id
+            """
+        )
+
+    def project_has_embeddings(self, project_id: str) -> bool:
+        recs = self.query_records(
+            """
+            MATCH (s:Symbol), (f:File)
+            WHERE s.file_id = f.id
+              AND f.project_id = $pid
+              AND s.embedding IS NOT NULL
+            RETURN count(s) as count
+            """,
+            {"pid": project_id},
+        )
+        return bool(recs and int(recs[0].get("count") or 0) > 0)
 
     def project_file_hashes(self, project_id: str) -> dict[str, dict[str, str]]:
         recs = self.query_records(
@@ -164,6 +234,16 @@ class GraphStore:
             },
         )
 
+    def upsert_files_batch(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            self.upsert_file(
+                file_id=record["id"],
+                path=record["path"],
+                project_id=record["project_id"],
+                is_test=bool(record["is_test"]),
+                digest=record["hash"],
+            )
+
     def upsert_class(self, class_id: str, fqcn: str, name: str, package: str, file_id: str) -> None:
         self.execute(
             """
@@ -178,6 +258,16 @@ class GraphStore:
                 "file_id": file_id,
             },
         )
+
+    def upsert_classes_batch(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            self.upsert_class(
+                class_id=record["id"],
+                fqcn=record["fqcn"],
+                name=record["name"],
+                package=record["package"],
+                file_id=record["file_id"],
+            )
 
     def upsert_method(
         self,
@@ -217,6 +307,19 @@ class GraphStore:
             {"cid": class_id, "mid": method_id},
         )
 
+    def upsert_methods_batch(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            self.upsert_method(
+                method_id=record["id"],
+                class_id=record["class_id"],
+                name=record["name"],
+                signature=record["signature"],
+                return_type=record["return_type"],
+                modifiers=record["modifiers"],
+                is_constructor=bool(record["is_constructor"]),
+                is_test=bool(record["is_test"]),
+            )
+
     def upsert_symbol(
         self,
         symbol_id: str,
@@ -255,6 +358,19 @@ class GraphStore:
             {"fid": file_id, "sid": symbol_id},
         )
 
+    def upsert_symbols_batch(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            self.upsert_symbol(
+                symbol_id=record["id"],
+                kind=record["kind"],
+                name=record["name"],
+                fqname=record["fqname"],
+                file_id=record["file_id"],
+                line=int(record["line"]),
+                col=int(record["col"]),
+                embedding=record.get("embedding"),
+            )
+
     def add_call(self, source_id: str, target_id: str, confidence: float, reason: str) -> None:
         self.execute(
             """
@@ -269,6 +385,15 @@ class GraphStore:
             },
         )
 
+    def add_calls_batch(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            self.add_call(
+                source_id=record["source_id"],
+                target_id=record["target_id"],
+                confidence=float(record["confidence"]),
+                reason=record["reason"],
+            )
+
     def add_reference(self, rel: str, src_label: str, src_id: str, dst_label: str, dst_id: str, confidence: float) -> None:
         if rel not in {"REFERENCES_TYPE", "IMPLEMENTS", "OVERRIDES"}:
             return
@@ -277,6 +402,17 @@ class GraphStore:
             f"MERGE (s)-[:{rel} {{confidence: $confidence}}]->(d)"
         )
         self.execute(query, {"src_id": src_id, "dst_id": dst_id, "confidence": confidence})
+
+    def add_references_batch(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            self.add_reference(
+                rel=record["rel"],
+                src_label=record["src_label"],
+                src_id=record["src_id"],
+                dst_label=record["dst_label"],
+                dst_id=record["dst_id"],
+                confidence=float(record["confidence"]),
+            )
 
     def _recycle_conn(self) -> None:
         """Drop and recreate the per-thread connection to release buffer pages."""

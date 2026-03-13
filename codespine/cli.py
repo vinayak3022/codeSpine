@@ -24,7 +24,7 @@ from codespine.diff.branch_diff import compare_branches
 from codespine.indexer.engine import JavaIndexer
 from codespine.mcp.server import build_mcp_server
 from codespine.search.hybrid import hybrid_search
-from codespine.watch.watcher import run_watch_mode
+from codespine.watch.watcher import clear_overlay, get_overlay_status, promote_overlay, run_watch_mode
 
 logging.basicConfig(filename=SETTINGS.log_file, level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -414,10 +414,23 @@ def coupling(months: int, min_strength: float, min_cochanges: int, as_json: bool
 @main.command()
 @click.option("--path", default=".", show_default=True, type=click.Path(exists=True))
 @click.option("--global-interval", default=30, show_default=True, type=int)
-def watch(path: str, global_interval: int) -> None:
+@click.option(
+    "--overlay-debounce-ms",
+    default=SETTINGS.default_overlay_debounce_ms,
+    show_default=True,
+    type=int,
+)
+@click.option("--promote-on-commit/--no-promote-on-commit", default=True, show_default=True)
+def watch(path: str, global_interval: int, overlay_debounce_ms: int, promote_on_commit: bool) -> None:
     """Live re-indexing and periodic global analysis refresh."""
     store = GraphStore(read_only=False)
-    run_watch_mode(store, os.path.abspath(path), global_interval=global_interval)
+    run_watch_mode(
+        store,
+        os.path.abspath(path),
+        global_interval=global_interval,
+        overlay_debounce_ms=overlay_debounce_ms,
+        promote_on_commit=promote_on_commit,
+    )
 
 
 @main.command()
@@ -521,6 +534,8 @@ def status(as_json: bool) -> None:
                 pid = int(f.read().strip())
         except Exception:
             pid = None
+    store = GraphStore(read_only=True)
+    overlay = get_overlay_status(store)
     payload = {
         "running": running,
         "pid": pid,
@@ -528,8 +543,39 @@ def status(as_json: bool) -> None:
         "db_path": SETTINGS.db_path,
         "db_size_bytes": _db_size_bytes(SETTINGS.db_path),
         "log_file": SETTINGS.log_file,
+        "overlay_dir": SETTINGS.overlay_dir,
+        "overlay_projects": overlay,
     }
     _echo_json(payload, as_json)
+
+
+@main.command("overlay-status")
+@click.option("--project", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def overlay_status_cmd(project: str | None, as_json: bool) -> None:
+    """Show dirty overlay status by project/module."""
+    store = GraphStore(read_only=True)
+    _echo_json(get_overlay_status(store, project=project), as_json)
+
+
+@main.command("overlay-clear")
+@click.option("--project", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def overlay_clear_cmd(project: str | None, as_json: bool) -> None:
+    """Clear dirty overlay data without touching the committed base index."""
+    store = GraphStore(read_only=False)
+    result = {"cleared": clear_overlay(store, project=project)}
+    _echo_json(result, as_json)
+
+
+@main.command("overlay-promote")
+@click.option("--project", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def overlay_promote_cmd(project: str | None, as_json: bool) -> None:
+    """Promote dirty overlay changes into the committed base index now."""
+    store = GraphStore(read_only=False)
+    result = {"promoted": promote_overlay(store, project=project, require_head_change=False)}
+    _echo_json(result, as_json)
 
 
 @main.command()
@@ -552,7 +598,7 @@ def clean(force: bool) -> None:
     if not force and not click.confirm("Remove local CodeSpine DB, PID, and logs?"):
         click.echo("Aborted.")
         return
-    for path in [SETTINGS.pid_file, SETTINGS.log_file, SETTINGS.db_path]:
+    for path in [SETTINGS.pid_file, SETTINGS.log_file, SETTINGS.db_path, SETTINGS.overlay_dir]:
         if not os.path.exists(path):
             continue
         if os.path.isdir(path):
@@ -591,6 +637,7 @@ def clear_project_cmd(project_id: str, allow_running: bool) -> None:
     project_path = recs[0].get("path", "")
     store.clear_analysis_artifacts()
     store.clear_project(project_id)
+    store.overlay_store.clear_project(project_id)
     meta_path = JavaIndexer._meta_cache_path(project_id)
     if os.path.exists(meta_path):
         try:
@@ -615,6 +662,7 @@ def clear_index_cmd(allow_running: bool) -> None:
     store = GraphStore(read_only=False)
     projects = store.query_records("MATCH (p:Project) RETURN p.id as id")
     store.rebuild_empty_db()
+    store.overlay_store.clear_all()
     for p in projects:
         meta_path = JavaIndexer._meta_cache_path(p["id"])
         if os.path.exists(meta_path):
