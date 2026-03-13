@@ -1,8 +1,17 @@
 # CodeSpine
 
-CodeSpine turns a Java codebase into a graph that coding agents can query over MCP.
+CodeSpine cuts token burn for coding agents working on Java codebases.
 
-It indexes classes, methods, calls, type relationships, cross-module links, git coupling, dead-code candidates, and execution flows so an agent can ask for structure directly instead of reading raw files first.
+Instead of having an agent open dozens of `.java` files to answer one question, CodeSpine indexes the codebase once and serves the structure over MCP. The agent asks for symbols, callers, impact, flows, dead code, and module boundaries directly, which means fewer file reads, fewer wasted context windows, and fewer hallucinated code paths.
+
+It indexes classes, methods, calls, type relationships, cross-module links, git coupling, dead-code candidates, and execution flows so agents can work from graph answers first and source files second.
+
+## Why It Saves Tokens
+
+- One MCP call can replace many file opens. `get_symbol_context("PaymentService")` returns a resolved neighborhood instead of forcing the agent to read every caller and callee file manually.
+- Search is structure-aware. Agents can ask for a symbol, concept, impact radius, or dead-code candidate without scanning entire packages.
+- Multi-module repos stay scoped. Project-aware IDs and `project=` parameters reduce noise from unrelated modules and workspaces.
+- Repeat sessions get cheaper. Once indexed, the agent reuses the graph instead of re-discovering the same relationships every turn.
 
 ## Install
 

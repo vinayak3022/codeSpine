@@ -7,6 +7,12 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-03-14
+
+### Changed
+
+- Repositioned README around token savings for coding agents and clarified the graph-first MCP workflow.
+
 ## [0.3.0] - 2026-03-03
 
 ### Added
