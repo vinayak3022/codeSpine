@@ -7,6 +7,16 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-03-14
+
+### Added
+
+- Dirty overlay indexing for uncommitted Java changes, with merged fast-query reads and promotion into the committed base index on local `HEAD` changes.
+
+### Changed
+
+- Chunked Kuzu write path for files, classes, methods, symbols, call edges, and type edges to reduce buffer-pool pressure during large indexes.
+
 ## [0.5.4] - 2026-03-14
 
 ### Changed
