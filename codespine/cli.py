@@ -71,6 +71,12 @@ def _phase(label: str, value: str) -> None:
     click.echo(f"{label:<30} {value}")
 
 
+def _dead_result_count(dead_result: list[dict] | None) -> int:
+    if not dead_result:
+        return 0
+    return sum(1 for item in dead_result if isinstance(item, dict) and "_stats" not in item)
+
+
 @click.group()
 def main() -> None:
     """CodeSpine CLI."""
@@ -265,10 +271,11 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         dead_label = "Finding dead code..."
         _live_phase(dead_label, "running")
         dead = detect_dead_code(store, limit=500)
-        _finish_phase(dead_label, f"{len(dead)} unreachable symbols")
+        _finish_phase(dead_label, f"{_dead_result_count(dead)} unreachable symbols")
 
         coup_label = "Analyzing git history..."
         _live_phase(coup_label, "running")
+        store.clear_coupling()
         coupling_root = abs_path
         coupling_project = root_basename if is_multi else (last_result.project_id if last_result else root_basename)
         coupling_pairs = compute_coupling(
@@ -582,8 +589,8 @@ def clear_project_cmd(project_id: str, allow_running: bool) -> None:
         click.secho(f"Project '{project_id}' not found in index.", fg="yellow")
         return
     project_path = recs[0].get("path", "")
+    store.clear_analysis_artifacts()
     store.clear_project(project_id)
-    store.execute("MATCH (p:Project) WHERE p.id = $pid DETACH DELETE p", {"pid": project_id})
     meta_path = JavaIndexer._meta_cache_path(project_id)
     if os.path.exists(meta_path):
         try:
@@ -607,17 +614,14 @@ def clear_index_cmd(allow_running: bool) -> None:
         return
     store = GraphStore(read_only=False)
     projects = store.query_records("MATCH (p:Project) RETURN p.id as id")
+    store.rebuild_empty_db()
     for p in projects:
-        store.clear_project(p["id"])
         meta_path = JavaIndexer._meta_cache_path(p["id"])
         if os.path.exists(meta_path):
             try:
                 os.remove(meta_path)
             except OSError:
                 pass
-    store.execute("MATCH (p:Project) DETACH DELETE p")
-    store.execute("MATCH (c:Community) DETACH DELETE c")
-    store.execute("MATCH (f:Flow) DETACH DELETE f")
     click.secho(f"Cleared {len(projects)} project(s). Index is now empty.", fg="green")
 
 

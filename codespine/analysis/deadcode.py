@@ -33,6 +33,14 @@ ENTRY_POINT_ANNOTATIONS = {
     "EventListener",
     "TransactionalEventListener",
     "Scheduled",
+    # JPA / ORM lifecycle hooks
+    "PrePersist",
+    "PostPersist",
+    "PreUpdate",
+    "PostUpdate",
+    "PreRemove",
+    "PostRemove",
+    "PostLoad",
 }
 
 # Broad annotations — exempt only in normal mode.  These indicate the
@@ -81,6 +89,39 @@ EXEMPT_CONTRACT_METHODS = {
     "compareTo",
 }
 
+EXEMPT_CLASS_NAME_SUFFIXES = {
+    "Controller",
+    "RestController",
+    "Service",
+    "Repository",
+    "Listener",
+    "Handler",
+    "Mapper",
+    "Converter",
+    "Factory",
+    "Configuration",
+    "Config",
+    "Entity",
+}
+
+EXEMPT_FILE_PATH_PARTS = {
+    "/controller/",
+    "/controllers/",
+    "/service/",
+    "/services/",
+    "/repository/",
+    "/repositories/",
+    "/listener/",
+    "/listeners/",
+    "/handler/",
+    "/handlers/",
+    "/mapper/",
+    "/mappers/",
+    "/entity/",
+    "/entities/",
+    "/config/",
+}
+
 
 def _modifier_tokens(modifiers) -> set[str]:
     if not modifiers:
@@ -115,6 +156,12 @@ def _assign_confidence(candidate: dict, strict: bool) -> str:
         return "low"
     # Default: protected / package-private
     return "medium"
+
+
+def _simple_class_name(fqcn: str | None) -> str:
+    if not fqcn:
+        return ""
+    return fqcn.rsplit(".", 1)[-1]
 
 
 def detect_dead_code(store, limit: int = 200, project: str | None = None, strict: bool = False) -> list[dict] | None:
@@ -212,6 +259,14 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None, strict
             if c.get("is_constructor"):
                 exempt[mid] = "constructor"
                 continue
+            simple_cls = _simple_class_name(c.get("class_fqcn"))
+            if any(simple_cls.endswith(suffix) for suffix in EXEMPT_CLASS_NAME_SUFFIXES):
+                exempt[mid] = f"class_role:{simple_cls}"
+                continue
+            file_path = (c.get("file_path") or "").replace("\\", "/").lower()
+            if any(part in file_path for part in EXEMPT_FILE_PATH_PARTS):
+                exempt[mid] = "framework_path"
+                continue
             if name in EXEMPT_CONTRACT_METHODS:
                 exempt[mid] = f"contract_method:{name}"
                 continue
@@ -240,6 +295,17 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None, strict
             mid = r["method_id"]
             if mid not in exempt:
                 exempt[mid] = "method_override"
+
+        base_contract_methods = store.query_records(
+            """
+            MATCH (:Method)-[:OVERRIDES]->(m:Method)
+            RETURN DISTINCT m.id as method_id
+            """
+        )
+        for r in base_contract_methods:
+            mid = r["method_id"]
+            if mid not in exempt:
+                exempt[mid] = "interface_or_base_contract"
 
     # ── Build dead list ───────────────────────────────────────────────
     dead = []

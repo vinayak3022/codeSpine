@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -67,7 +68,11 @@ class GraphStore:
         try:
             yield
             if tx_started:
-                self.execute("COMMIT")
+                try:
+                    self.execute("COMMIT")
+                except Exception as exc:
+                    if "No active transaction" not in str(exc):
+                        raise
         except Exception:
             if tx_started:
                 try:
@@ -79,38 +84,13 @@ class GraphStore:
             raise
 
     def clear_project(self, project_id: str) -> None:
-        # Keep project node and rebuild attached graph artifacts.
-        self.execute(
-            """
-            MATCH (s:Symbol), (f:File)
-            WHERE s.file_id = f.id AND f.project_id = $pid
-            DETACH DELETE s
-            """,
-            {"pid": project_id},
-        )
-        self.execute(
-            """
-            MATCH (m:Method), (c:Class), (f:File)
-            WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid
-            DETACH DELETE m
-            """,
-            {"pid": project_id},
-        )
-        self.execute(
-            """
-            MATCH (c:Class), (f:File)
-            WHERE c.file_id = f.id AND f.project_id = $pid
-            DETACH DELETE c
-            """,
-            {"pid": project_id},
-        )
-        self.execute(
-            """
-            MATCH (f:File) WHERE f.project_id = $pid
-            DETACH DELETE f
-            """,
-            {"pid": project_id},
-        )
+        file_recs = self.query_records("MATCH (f:File) WHERE f.project_id = $pid RETURN f.id as id", {"pid": project_id})
+        for idx, rec in enumerate(file_recs, start=1):
+            self.clear_file(rec["id"])
+            if idx % 50 == 0:
+                self._recycle_conn()
+        self.execute("MATCH (p:Project) WHERE p.id = $pid DETACH DELETE p", {"pid": project_id})
+        self._recycle_conn()
 
     def upsert_project(self, project_id: str, path: str) -> None:
         self.execute(
@@ -305,6 +285,47 @@ class GraphStore:
                 self._tls.conn = None
         except Exception:
             pass
+
+    def clear_communities(self) -> None:
+        self.execute("MATCH ()-[r:IN_COMMUNITY]->() DELETE r")
+        self._recycle_conn()
+        self.execute("MATCH (c:Community) DETACH DELETE c")
+        self._recycle_conn()
+
+    def clear_flows(self) -> None:
+        self.execute("MATCH ()-[r:IN_FLOW]->() DELETE r")
+        self._recycle_conn()
+        self.execute("MATCH (f:Flow) DETACH DELETE f")
+        self._recycle_conn()
+
+    def clear_coupling(self) -> None:
+        self.execute("MATCH ()-[r:CO_CHANGED_WITH]->() DELETE r")
+        self._recycle_conn()
+
+    def clear_analysis_artifacts(self) -> None:
+        self.clear_communities()
+        self.clear_flows()
+        self.clear_coupling()
+
+    def rebuild_empty_db(self) -> None:
+        self._recycle_conn()
+        path = SETTINGS.db_path
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            fallback = os.path.join("/tmp", ".codespine_db")
+            if os.path.isdir(fallback):
+                shutil.rmtree(fallback, ignore_errors=True)
+            elif os.path.exists(fallback):
+                os.remove(fallback)
+            self.db = self._open_db(fallback)
+        else:
+            self.db = self._open_db(path)
+        self._tls = threading.local()
+        ensure_schema(self._conn())
 
     def set_community(self, community_id: str, label: str, cohesion: float, symbol_ids: list[str]) -> None:
         self.execute(
