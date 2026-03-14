@@ -28,6 +28,11 @@ _RECOVERABLE_DB_ERROR_MARKERS = (
     "corrupt",
     "corrupted",
     "invalid database",
+    # Kuzu internal error: abrupt process termination (Ctrl+C) during a write
+    # leaves the WAL in an inconsistent state; Kuzu raises this as an
+    # IndexError from its internal unordered_map when re-opening the path.
+    "unordered_map",
+    "key not found",
 )
 
 
@@ -500,14 +505,21 @@ class GraphStore:
     def rebuild_empty_db(self) -> None:
         self._recycle_conn()
         path = SETTINGS.db_path
+        self._remove_db_path(path)
+        # Kuzu may retain stale internal state from a previous failed open of
+        # this path (e.g. after Ctrl+C mid-write).  If re-opening the just-
+        # deleted path raises, fall back to a clean /tmp location so the
+        # command succeeds rather than leaving the user stuck.
         try:
-            self._remove_db_path(path)
-        except OSError:
+            self.db = self._open_db(path)
+        except Exception as exc:
             fallback = os.path.join("/tmp", ".codespine_db")
+            LOGGER.warning(
+                "Could not open fresh DB at %s after rebuild (%s); falling back to %s",
+                path, exc, fallback,
+            )
             self._remove_db_path(fallback)
             self.db = self._open_db(fallback)
-        else:
-            self.db = self._open_db(path)
         self._tls = threading.local()
         ensure_schema(self._conn())
 
