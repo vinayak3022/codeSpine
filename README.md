@@ -8,6 +8,8 @@ It indexes classes, methods, calls, type relationships, cross-module links, git 
 
 It also keeps a separate dirty overlay for uncommitted Java edits, so agents can query current work-in-progress without forcing the committed base index to churn on every save.
 
+The MCP daemon and the indexer run independently. Querying while a full re-index is running no longer causes crashes or memory contention — reads go to an isolated snapshot that is atomically updated when indexing completes.
+
 ## Why It Saves Tokens
 
 - One MCP call can replace many file opens. `get_symbol_context("PaymentService")` returns a resolved neighborhood instead of forcing the agent to read every caller and callee file manually.
@@ -37,6 +39,8 @@ pip install "codespine[ml]"
 - Community detection: structural clusters for architectural context
 - Change coupling: git-history-based file relationships
 - Multi-project and multi-module indexing: workspaces, Maven modules, Gradle subprojects
+- Cross-module call linking: signature-based detection of calls between Maven/Gradle modules
+- Concurrent read/write isolation: MCP queries run against a read replica; the indexer writes separately, with no memory contention
 - MCP server: structured tools for Claude, Cursor, Cline, Copilot, and similar clients
 
 ## Editing Without Stale Indexes
@@ -95,14 +99,22 @@ Parsing code...                8/8
 Tracing calls...               847 calls resolved
 Analyzing types...             234 type relationships
 Cross-module linking...        skipped (single module)
+Detecting communities...       loading symbols
+Detecting communities...       623 symbols, 1204 structural edges
+Detecting communities...       persisting 8/8 clusters
 Detecting communities...       8 clusters found
+Detecting execution flows...   34 entry points, tracing
 Detecting execution flows...   34 processes found
 Finding dead code...           12 unreachable symbols
+Analyzing git history...       18 commits, computing co-changes
 Analyzing git history...       18 coupled file pairs
 Generating embeddings...       0 vectors stored
 
 Done in 4.2s - 623 symbols, 1847 edges, 8 clusters, 34 flows (no embeddings; rerun with --embed for semantic search)
+Publishing read replica...     MCP will reload automatically
 ```
+
+Each analysis phase streams live progress in place. The final step publishes a read replica so the MCP daemon picks up the new index without restarting.
 
 Search the index:
 
@@ -220,9 +232,22 @@ When a dirty overlay exists, deep-analysis results intentionally exclude those u
 
 `--embed` is also optional. Without it, CodeSpine still supports exact, keyword, and fuzzy search. Add embeddings when you need concept-level retrieval.
 
+## Concurrent Indexing and Querying
+
+The indexer (write) and the MCP daemon (read) use separate database paths:
+
+- The indexer writes to `~/.codespine_db` with a 512 MB buffer pool.
+- When indexing completes, `analyse` atomically copies the database to `~/.codespine_db_read` and touches a sentinel file.
+- The MCP daemon and all read-only CLI commands open `~/.codespine_db_read` with a 128 MB buffer pool.
+- The MCP daemon watches the sentinel file and silently reloads from the new snapshot on the next tool call — no restart needed.
+
+Running `codespine analyse --deep --embed` on one project while querying a different one no longer causes buffer pool OOM or lock contention.
+
 ## Runtime Files
 
-- `~/.codespine_db` - graph database
+- `~/.codespine_db` - graph database (write)
+- `~/.codespine_db_read` - read replica used by MCP and CLI queries
+- `~/.codespine_db_read.updated` - sentinel file; touched after each successful snapshot
 - `~/.codespine.pid` - MCP background server PID
 - `~/.codespine.log` - server log
 - `~/.codespine_embedding_cache.json` - embedding cache
@@ -233,8 +258,9 @@ When a dirty overlay exists, deep-analysis results intentionally exclude those u
 
 - `codespine start` launches a background MCP server. Most IDE MCP clients should use `codespine mcp` instead and manage the process themselves.
 - `codespine watch` updates the dirty overlay first; it does not rewrite the committed base index on every save.
-- `codespine clear-index` rebuilds the local index database from scratch.
+- `codespine clear-index` rebuilds the local index database from scratch. This also removes the read replica; run `analyse` again to republish it.
 - For large Spring or JPA-heavy repos, dead-code results should still be reviewed before deletion. The tool is conservative, not authoritative.
+- The first run after upgrading to v0.5.7 will not have a read replica yet. Run `codespine analyse` once to create it.
 
 ## Project Docs
 
