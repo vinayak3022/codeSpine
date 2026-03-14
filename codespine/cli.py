@@ -77,6 +77,19 @@ def _dead_result_count(dead_result: list[dict] | None) -> int:
     return sum(1 for item in dead_result if isinstance(item, dict) and "_stats" not in item)
 
 
+def _bar(done: int, total: int, width: int = 20) -> str:
+    """Return an ASCII progress bar like [████████░░░░]  40%."""
+    if total <= 0:
+        return f"[{'░' * width}]  ---%"
+    frac = min(done / total, 1.0)
+    filled = int(width * frac)
+    return f"[{'█' * filled}{'░' * (width - filled)}] {int(frac * 100):3d}%"
+
+
+def _spinner_char() -> str:
+    return "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.perf_counter() * 8) % 10]
+
+
 @click.group()
 def main() -> None:
     """CodeSpine CLI."""
@@ -141,7 +154,7 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
 
     # Shared progress state (reset per module)
     parse_state = {"shown": False, "indexed": 0, "total": 0, "last_ts": 0.0, "printed_zero": False}
-    call_state = {"shown": False, "count": 0, "last_ts": 0.0}
+    call_state = {"shown": False, "count": 0, "last_ts": 0.0, "started_at": 0.0}
 
     def _reset_state() -> None:
         for k in list(parse_state):
@@ -171,22 +184,28 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
             if total == 0:
                 return
             if indexed == total or (now - parse_state["last_ts"]) >= 0.2:
-                click.echo(f"\rParsing code...                {indexed}/{total}", nl=False)
+                click.echo(f"\rParsing code...   {_bar(indexed, total)} {indexed}/{total}  ", nl=False)
                 parse_state["shown"] = True
                 parse_state["last_ts"] = now
             return
         if event == "resolve_calls_start" and parse_state["shown"]:
             click.echo()
             parse_state["shown"] = False
-            _phase("Tracing calls...", "running")
+            call_state["started_at"] = now
+            _phase("Tracing calls...", "starting...")
             return
         if event == "resolve_calls_start":
-            _phase("Tracing calls...", "running")
+            call_state["started_at"] = now
+            _phase("Tracing calls...", "starting...")
             return
         if event == "resolve_calls_progress":
             call_state["count"] = int(payload.get("calls_resolved", 0))
             if (now - call_state["last_ts"]) >= 0.25:
-                click.echo(f"\rTracing calls...               {call_state['count']} resolved", nl=False)
+                elapsed_s = now - call_state["started_at"]
+                click.echo(
+                    f"\r{_spinner_char()} Tracing calls...   {call_state['count']:>6} resolved  {elapsed_s:.1f}s  ",
+                    nl=False,
+                )
                 call_state["shown"] = True
                 call_state["last_ts"] = now
             return
@@ -194,7 +213,8 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
             if call_state["shown"]:
                 click.echo()
             call_state["shown"] = False
-            _phase("Tracing calls...", f"{int(payload.get('calls_resolved', 0))} calls resolved")
+            elapsed_s = (now - call_state["started_at"]) if call_state["started_at"] else 0.0
+            _phase("Tracing calls...", f"{int(payload.get('calls_resolved', 0))} calls resolved  ({elapsed_s:.1f}s)")
             return
         if event == "resolve_types_start":
             _phase("Analyzing types...", "running")
@@ -226,11 +246,11 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
     # ── Helper for in-place progress updates ────────────────────────────
     def _live_phase(label: str, status: str) -> None:
         """Overwrite the current line with a status update."""
-        click.echo(f"\r{label:<30} {status:<50}", nl=False)
+        click.echo(f"\r{_spinner_char()} {label:<28} {status:<48}", nl=False)
 
     def _finish_phase(label: str, result: str) -> None:
         """Finalise an in-place phase line and move to the next line."""
-        click.echo(f"\r{label:<30} {result:<50}")
+        click.echo(f"\r✓ {label:<28} {result:<48}")
 
     # ── Cross-module call linking ──────────────────────────────────────
     if is_multi and len(modules_with_ids) > 1:
