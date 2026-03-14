@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json as _json_mod
+import logging
+import os
 import subprocess
 import sys
 import tempfile
 import time
 
 from fastmcp import FastMCP
+
+from codespine.config import SETTINGS
+
+_LOGGER = logging.getLogger(__name__)
 
 from codespine import __version__
 from codespine.analysis.community import detect_communities, symbol_community
@@ -129,7 +135,47 @@ def _staleness_meta(
     return _json(response)
 
 
+class _StoreProxy:
+    """Wraps a GraphStore and hot-reloads from the read replica when the
+    post-analyse sentinel file is touched.
+
+    After `codespine analyse` finishes it copies the write DB to
+    ``~/.codespine_db_read`` and writes ``~/.codespine_db_read.updated``.
+    This proxy checks that sentinel's mtime before every attribute access and
+    silently swaps in a fresh read-only GraphStore so the MCP daemon picks up
+    the new index without restarting.
+    """
+
+    def __init__(self, store) -> None:
+        object.__setattr__(self, "_store", store)
+        object.__setattr__(self, "_sentinel", SETTINGS.db_snapshot_path + ".updated")
+        object.__setattr__(self, "_last_mtime", self._sentinel_mtime())
+
+    def _sentinel_mtime(self) -> float:
+        try:
+            return os.path.getmtime(object.__getattribute__(self, "_sentinel"))
+        except FileNotFoundError:
+            return 0.0
+
+    def _maybe_reload(self) -> None:
+        current = self._sentinel_mtime()
+        if current > object.__getattribute__(self, "_last_mtime"):
+            from codespine.db.store import GraphStore as _GS
+            try:
+                new_store = _GS(read_only=True)
+                object.__setattr__(self, "_store", new_store)
+                object.__setattr__(self, "_last_mtime", current)
+                _LOGGER.info("MCP: hot-reloaded GraphStore from updated snapshot")
+            except Exception as exc:
+                _LOGGER.warning("MCP: hot-reload failed: %s", exc)
+
+    def __getattr__(self, name: str):
+        self._maybe_reload()
+        return getattr(object.__getattribute__(self, "_store"), name)
+
+
 def build_mcp_server(store, repo_path_provider):
+    store = _StoreProxy(store)
     _raw_mcp = FastMCP("codespine")
     overlay_store = getattr(store, "overlay_store", None)
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Settings:
     db_path: str = os.path.expanduser("~/.codespine_db")
+    db_snapshot_path: str = os.path.expanduser("~/.codespine_db_read")
     pid_file: str = os.path.expanduser("~/.codespine.pid")
     log_file: str = os.path.expanduser("~/.codespine.log")
     embedding_cache_path: str = os.path.expanduser("~/.codespine_embedding_cache.json")

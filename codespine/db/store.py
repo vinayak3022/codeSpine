@@ -18,7 +18,8 @@ from codespine.db.schema import ensure_schema
 
 LOGGER = logging.getLogger(__name__)
 
-_BUFFER_POOL_SIZE = 512 * 1024 * 1024  # 512 MB – room for large community detection
+_WRITE_BUFFER_POOL_SIZE = 512 * 1024 * 1024  # 512 MB – room for large community detection
+_READ_BUFFER_POOL_SIZE = 128 * 1024 * 1024   # 128 MB – point queries only; keep footprint small
 _RECOVERABLE_DB_ERROR_MARKERS = (
     "storage version mismatch",
     "catalog version mismatch",
@@ -35,11 +36,18 @@ class GraphStore:
     read_only: bool = False
 
     def __post_init__(self) -> None:
-        db_path = SETTINGS.db_path
         self._tls: threading.local = threading.local()
         from codespine.overlay.store import OverlayStore
 
         self.overlay_store = OverlayStore()
+
+        # Read-only callers (MCP, CLI reads) use the read replica when available.
+        # This isolates them from the write process's buffer pool and WAL churn.
+        if self.read_only and os.path.exists(SETTINGS.db_snapshot_path):
+            db_path = SETTINGS.db_snapshot_path
+        else:
+            db_path = SETTINGS.db_path
+
         try:
             self.db = self._open_with_recovery(db_path)
         except Exception as exc:
@@ -50,11 +58,12 @@ class GraphStore:
             self._ensure_schema_with_recovery()
 
     def _open_db(self, path: str) -> kuzu.Database:
+        pool = _READ_BUFFER_POOL_SIZE if self.read_only else _WRITE_BUFFER_POOL_SIZE
         # Newer Kuzu versions accept read_only; fall back for older ones.
         try:
-            return kuzu.Database(path, buffer_pool_size=_BUFFER_POOL_SIZE, read_only=self.read_only)
+            return kuzu.Database(path, buffer_pool_size=pool, read_only=self.read_only)
         except TypeError:
-            return kuzu.Database(path, buffer_pool_size=_BUFFER_POOL_SIZE)
+            return kuzu.Database(path, buffer_pool_size=pool)
 
     @staticmethod
     def _is_recoverable_db_error(exc: Exception) -> bool:
@@ -552,6 +561,41 @@ class GraphStore:
                 "months": int(months),
             },
         )
+
+    @staticmethod
+    def snapshot_to_read_replica() -> bool:
+        """Atomically copy the write DB to the read-replica path.
+
+        The read replica is used by the MCP daemon and all read-only CLI
+        commands so they never contend with the write process's buffer pool.
+        Returns True on success, False if the source DB does not exist.
+        """
+        src = SETTINGS.db_path
+        dst = SETTINGS.db_snapshot_path
+        if not os.path.exists(src):
+            return False
+        tmp = dst + ".tmp"
+        try:
+            if os.path.exists(tmp):
+                shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.isdir(src):
+                shutil.copytree(src, tmp)
+            else:
+                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+                shutil.copy2(src, tmp)
+            if os.path.exists(dst):
+                shutil.rmtree(dst, ignore_errors=True)
+            os.rename(tmp, dst)
+            # Sentinel: MCP daemon watches this file's mtime to know when to reload.
+            sentinel = dst + ".updated"
+            with open(sentinel, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
+            return True
+        except Exception as exc:
+            LOGGER.warning("Snapshot to read replica failed: %s", exc)
+            if os.path.exists(tmp):
+                shutil.rmtree(tmp, ignore_errors=True)
+            return False
 
     def query_records(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         frame = self.execute(query, params or {}).get_as_df()

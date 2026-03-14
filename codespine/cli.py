@@ -319,6 +319,16 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         fg="green",
     )
 
+    # Publish a read replica so MCP and read-only CLI commands (search, stats…)
+    # run against an isolated snapshot rather than competing with the write
+    # process's buffer pool.  The MCP daemon detects the sentinel file and
+    # hot-reloads without restarting.
+    snap_label = "Publishing read replica..."
+    _live_phase(snap_label, "copying")
+    store._recycle_conn()
+    snapped = GraphStore.snapshot_to_read_replica()
+    _finish_phase(snap_label, "MCP will reload automatically" if snapped else "skipped (source DB not found)")
+
 
 @main.command()
 @click.argument("query")
@@ -462,19 +472,43 @@ def stats(as_json: bool) -> None:
             "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n", {"pid": pid}
         )
         classes = store.query_records(
-            "MATCH (c:Class), (f:File) WHERE c.file_id = f.id AND f.project_id = $pid RETURN count(c) as n",
+            """
+            MATCH (f:File) WHERE f.project_id = $pid
+            WITH f
+            MATCH (c:Class) WHERE c.file_id = f.id
+            RETURN count(c) as n
+            """,
             {"pid": pid},
         )
         methods = store.query_records(
-            "MATCH (m:Method), (c:Class), (f:File) WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid RETURN count(m) as n",
+            """
+            MATCH (f:File) WHERE f.project_id = $pid
+            WITH f
+            MATCH (c:Class) WHERE c.file_id = f.id
+            WITH c
+            MATCH (c)-[:HAS_METHOD]->(m:Method)
+            RETURN count(m) as n
+            """,
             {"pid": pid},
         )
         calls = store.query_records(
-            "MATCH (ma:Method)-[:CALLS]->(mb:Method), (ca:Class), (fa:File) WHERE ma.class_id = ca.id AND ca.file_id = fa.id AND fa.project_id = $pid RETURN count(*) as n",
+            """
+            MATCH (f:File) WHERE f.project_id = $pid
+            WITH f
+            MATCH (c:Class) WHERE c.file_id = f.id
+            WITH c
+            MATCH (c)-[:HAS_METHOD]->(m:Method)-[:CALLS]->()
+            RETURN count(*) as n
+            """,
             {"pid": pid},
         )
         emb = store.query_records(
-            "MATCH (s:Symbol), (f:File) WHERE s.file_id = f.id AND f.project_id = $pid AND s.embedding IS NOT NULL RETURN count(s) as n",
+            """
+            MATCH (f:File) WHERE f.project_id = $pid
+            WITH f
+            MATCH (s:Symbol) WHERE s.file_id = f.id AND s.embedding IS NOT NULL
+            RETURN count(s) as n
+            """,
             {"pid": pid},
         )
         rows.append({
