@@ -147,10 +147,13 @@ class GraphStore:
 
     def clear_project(self, project_id: str) -> None:
         file_recs = self.query_records("MATCH (f:File) WHERE f.project_id = $pid RETURN f.id as id", {"pid": project_id})
+        # Small batches (10 files per tx) prevent buffer pool OOM on large projects.
         for idx, rec in enumerate(file_recs, start=1):
-            self.clear_file(rec["id"])
-            if idx % 50 == 0:
+            with self.transaction():
+                self.clear_file(rec["id"])
+            if idx % 10 == 0:
                 self._recycle_conn()
+        self._recycle_conn()
         self.execute("MATCH (p:Project) WHERE p.id = $pid DETACH DELETE p", {"pid": project_id})
         self._recycle_conn()
 
@@ -501,6 +504,48 @@ class GraphStore:
         self.clear_communities()
         self.clear_flows()
         self.clear_coupling()
+
+    @staticmethod
+    def force_delete_all_data() -> list[str]:
+        """Delete all CodeSpine data files without touching the Kuzu engine.
+
+        This is the nuclear option for OOM recovery: when the buffer pool is
+        exhausted, normal DB writes (including reset_project / clear_project)
+        also fail.  This bypasses Kuzu entirely by removing the data files
+        from disk, allowing a fresh start.
+
+        Returns the list of paths that were removed.
+        """
+        removed: list[str] = []
+        for path in [
+            SETTINGS.db_path,
+            SETTINGS.db_snapshot_path,
+            SETTINGS.db_snapshot_path + ".updated",
+            SETTINGS.db_snapshot_path + ".tmp",
+            SETTINGS.embedding_cache_path,
+            SETTINGS.overlay_dir,
+            SETTINGS.index_meta_dir,
+        ]:
+            if not os.path.exists(path):
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                removed.append(path)
+            except OSError:
+                pass
+        # Also remove any stale WAL files next to the DB
+        for suffix in (".wal", ".lock"):
+            wal_path = SETTINGS.db_path + suffix
+            if os.path.exists(wal_path):
+                try:
+                    os.remove(wal_path)
+                    removed.append(wal_path)
+                except OSError:
+                    pass
+        return removed
 
     def rebuild_empty_db(self) -> None:
         self._recycle_conn()

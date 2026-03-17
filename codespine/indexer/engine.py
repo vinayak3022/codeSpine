@@ -253,6 +253,20 @@ class JavaIndexer:
                     for fid in delete_chunk:
                         self.store.clear_file(fid)
                 self.store._recycle_conn()
+
+        # Clean up stale project entries that point to the same path under a
+        # different ID (e.g. re-indexing "vision-server" directly after it was
+        # previously indexed as "vision::vision-server" from a workspace root).
+        try:
+            stale = self.store.query_records(
+                "MATCH (p:Project) WHERE p.path = $path AND p.id <> $pid RETURN p.id as id",
+                {"path": root_path, "pid": project_id},
+            )
+            for old in stale:
+                self.store.clear_project(old["id"])
+        except Exception:
+            pass  # best-effort cleanup
+
         self.store.upsert_project(project_id, root_path)
 
         for parse_chunk in self._chunked(parse_results, file_batch_size):
@@ -279,7 +293,7 @@ class JavaIndexer:
                         "hash": file_digest,
                     }
                 )
-                self._update_meta_cache_entry(meta_cache, f_id, file_path, file_digest, len(source))
+                self._update_meta_cache_entry(meta_cache, f_id, file_path, file_digest, len(source), imports=parsed.imports)
 
                 for cls in parsed.classes:
                     c_id = class_id(cls.fqcn, scope)
@@ -372,15 +386,31 @@ class JavaIndexer:
                         class_methods[c_id][method.signature] = m_id
                 files_indexed += 1
 
+            # Split writes into smaller transactions and recycle between each
+            # to prevent Kuzu WAL from exhausting the buffer pool on large
+            # incremental re-indexes (GH feedback: 1,604-file OOM).
+            if not full:
+                for clear_sub in self._chunked(file_rows, 10):
+                    with self.store.transaction():
+                        for row in clear_sub:
+                            self.store.clear_file(row["id"])
+                    self.store._recycle_conn()
             with self.store.transaction():
-                for row in file_rows:
-                    if not full:
-                        self.store.clear_file(row["id"])
                 self.store.upsert_files_batch(file_rows)
-                self.store.upsert_classes_batch(class_rows)
-                self.store.upsert_methods_batch(method_rows)
-                self.store.upsert_symbols_batch(symbol_rows)
             self.store._recycle_conn()
+            with self.store.transaction():
+                self.store.upsert_classes_batch(class_rows)
+            self.store._recycle_conn()
+            _METHOD_SUB_BATCH = 200
+            for method_sub in self._chunked(method_rows, _METHOD_SUB_BATCH):
+                with self.store.transaction():
+                    self.store.upsert_methods_batch(method_sub)
+                self.store._recycle_conn()
+            _SYMBOL_SUB_BATCH = 200
+            for symbol_sub in self._chunked(symbol_rows, _SYMBOL_SUB_BATCH):
+                with self.store.transaction():
+                    self.store.upsert_symbols_batch(symbol_sub)
+                self.store._recycle_conn()
 
         self._emit(progress, "resolve_calls_start")
         call_rows: list[dict] = []
@@ -697,7 +727,10 @@ class JavaIndexer:
             return
 
     @staticmethod
-    def _update_meta_cache_entry(meta_cache: dict[str, dict], fid: str, file_path: str, digest: str, size_hint: int) -> None:
+    def _update_meta_cache_entry(
+        meta_cache: dict[str, dict], fid: str, file_path: str, digest: str, size_hint: int,
+        imports: list[str] | None = None,
+    ) -> None:
         try:
             st = os.stat(file_path)
             mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
@@ -705,7 +738,10 @@ class JavaIndexer:
         except OSError:
             mtime_ns = -1
             size = size_hint
-        meta_cache[fid] = {"mtime_ns": mtime_ns, "size": size, "hash": digest}
+        entry: dict = {"mtime_ns": mtime_ns, "size": size, "hash": digest}
+        if imports is not None:
+            entry["imports"] = imports
+        meta_cache[fid] = entry
 
     @staticmethod
     def _prune_meta_cache(meta_cache: dict[str, dict], current_file_ids: set[str]) -> None:
@@ -728,3 +764,76 @@ class JavaIndexer:
             return normalized.split("/src/", 1)[0]
         scope = os.path.dirname(normalized).strip()
         return scope or "."
+
+    @staticmethod
+    def detect_unresolved_imports(store) -> dict[str, list[str]]:
+        """Detect imports that reference packages not covered by any indexed project.
+
+        Returns a dict mapping unresolved base packages (e.g. "com.foo.bar")
+        to a list of sample import FQCNs.  Useful for suggesting which sibling
+        projects to index.
+
+        Only reports project-internal packages (not java.*, javax.*, org.apache.*
+        etc.).
+        """
+        # 1. Collect all indexed class FQCNs
+        try:
+            recs = store.query_records("MATCH (c:Class) RETURN c.fqcn as fqcn")
+        except Exception:
+            return {}
+        indexed_fqcns = {r["fqcn"] for r in recs if r.get("fqcn")}
+        indexed_packages = set()
+        for fqcn in indexed_fqcns:
+            parts = fqcn.rsplit(".", 1)
+            if len(parts) == 2:
+                indexed_packages.add(parts[0])
+
+        # 2. Collect all imports from overlay + any stored file data
+        # Parse imports from the parsed file metadata if available
+        meta_dir = SETTINGS.index_meta_dir
+        all_imports: set[str] = set()
+        if os.path.isdir(meta_dir):
+            for fname in os.listdir(meta_dir):
+                if not fname.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(meta_dir, fname), "r") as f:
+                        data = json.load(f)
+                    for fid, fmeta in data.items():
+                        for imp in fmeta.get("imports", []):
+                            all_imports.add(imp)
+                except Exception:
+                    pass
+
+        # 3. Also scan the DB for CALLS edges that reference unknown targets
+        # (lightweight — just check which classes were resolved vs not)
+
+        # 4. Filter: skip standard library / well-known third-party packages
+        _SKIP_PREFIXES = (
+            "java.", "javax.", "jakarta.",
+            "org.apache.", "org.springframework.", "org.hibernate.",
+            "org.slf4j.", "org.junit.", "org.mockito.",
+            "com.google.", "com.fasterxml.", "com.sun.",
+            "io.micrometer.", "io.netty.", "io.lettuce.",
+            "lombok.", "reactor.", "rx.",
+        )
+
+        unresolved: dict[str, list[str]] = {}
+        for imp in all_imports:
+            if any(imp.startswith(prefix) for prefix in _SKIP_PREFIXES):
+                continue
+            # Check if this import's class exists in the index
+            simple_name = imp.rsplit(".", 1)[-1]
+            pkg = imp.rsplit(".", 1)[0] if "." in imp else ""
+            if imp in indexed_fqcns:
+                continue
+            if pkg in indexed_packages:
+                continue  # same package, just not this specific class
+            # Group by top 3 package segments
+            parts = imp.split(".")
+            base_pkg = ".".join(parts[:min(3, len(parts))])
+            if base_pkg not in unresolved:
+                unresolved[base_pkg] = []
+            if len(unresolved[base_pkg]) < 5:
+                unresolved[base_pkg].append(imp)
+        return unresolved

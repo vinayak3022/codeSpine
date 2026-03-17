@@ -59,12 +59,15 @@ def _git_available(path: str) -> bool:
 def _resolve_repo_path(store, project: str | None, repo_path_provider) -> str:
     """Resolve the filesystem path for a given project_id, falling back to cwd."""
     if project:
-        recs = store.query_records(
-            "MATCH (p:Project) WHERE p.id = $pid RETURN p.path as path LIMIT 1",
-            {"pid": project},
-        )
-        if recs and recs[0].get("path"):
-            return recs[0]["path"]
+        try:
+            recs = store.query_records(
+                "MATCH (p:Project) WHERE p.id = $pid RETURN p.path as path LIMIT 1",
+                {"pid": project},
+            )
+            if recs and recs[0].get("path"):
+                return recs[0]["path"]
+        except Exception:
+            pass
     return repo_path_provider()
 
 
@@ -305,6 +308,20 @@ def build_mcp_server(store, repo_path_provider):
                 "RECOMMENDED: start watch mode during active development."
             )
 
+        # Detect unresolved imports → hint about unindexed sibling projects
+        unresolved_imports: dict[str, list[str]] = {}
+        try:
+            from codespine.indexer.engine import JavaIndexer as _JI
+            unresolved_imports = _JI.detect_unresolved_imports(store)
+            if unresolved_imports:
+                pkgs = list(unresolved_imports.keys())[:5]
+                notes["unresolved_imports"] = (
+                    f"Imports from unindexed packages detected: {', '.join(pkgs)}. "
+                    "Consider indexing these projects for complete cross-project tracing."
+                )
+        except Exception:
+            pass
+
         return {
             "available": True,
             "indexed_projects": projects,
@@ -333,6 +350,7 @@ def build_mcp_server(store, repo_path_provider):
                 "get_overlay_status": True,
                 "promote_overlay": True,
                 "clear_overlay": True,
+                "force_reset_index": True,
             },
             "background_jobs": {
                 "watch_running": watch_running,
@@ -787,20 +805,36 @@ def build_mcp_server(store, repo_path_provider):
         Recent git commits for the project (or a specific file).
         Returns available=false if the directory is not a git repository.
         Use project=<project_id> to target a specific indexed module's repo.
+        TIP: Always pass project= to ensure the correct repo is used.
         """
         repo = _resolve_repo_path(store, project, repo_path_provider)
+        if not os.path.isdir(repo):
+            return {
+                "available": False,
+                "note": f"Path does not exist: {repo}. Pass project=<project_id> to resolve the repo from the index.",
+            }
         if not _git_available(repo):
-            return {"available": False, "note": "Not a git repository (or git not installed)."}
+            return {
+                "available": False,
+                "note": (
+                    f"Not a git repository at {repo}. "
+                    "Pass project=<project_id> so the tool resolves the correct repo root. "
+                    "Use list_projects() to see available IDs."
+                ),
+            }
         cmd = ["git", "log", f"--max-count={limit}", "--oneline", "--no-decorate"]
         if file_path:
             cmd += ["--", file_path]
         r = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            return {"available": False, "error": r.stderr.strip()}
+            return {"available": False, "error": r.stderr.strip(), "repo_path": repo}
+        log_lines = r.stdout.strip().splitlines()
         return {
             "available": True,
             "project": project or repo,
-            "log": r.stdout.strip().splitlines(),
+            "repo_path": repo,
+            "log": log_lines,
+            "note": f"{len(log_lines)} commit(s)" + (" (no commits yet)" if not log_lines else ""),
         }
 
     @mcp.tool()
@@ -809,26 +843,42 @@ def build_mcp_server(store, repo_path_provider):
         Show git diff (working tree vs ref, or between two refs separated by '...').
         Output is truncated to 200 lines.
         Returns available=false if the directory is not a git repository.
+        TIP: Always pass project= to ensure the correct repo is used.
         """
         repo = _resolve_repo_path(store, project, repo_path_provider)
+        if not os.path.isdir(repo):
+            return {
+                "available": False,
+                "note": f"Path does not exist: {repo}. Pass project=<project_id> to resolve the repo from the index.",
+            }
         if not _git_available(repo):
-            return {"available": False, "note": "Not a git repository (or git not installed)."}
+            return {
+                "available": False,
+                "note": (
+                    f"Not a git repository at {repo}. "
+                    "Pass project=<project_id> so the tool resolves the correct repo root. "
+                    "Use list_projects() to see available IDs."
+                ),
+            }
         cmd = ["git", "diff", ref]
         if file_path:
             cmd += ["--", file_path]
         r = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            return {"available": False, "error": r.stderr.strip()}
+            return {"available": False, "error": r.stderr.strip(), "repo_path": repo}
         lines = r.stdout.splitlines()
         truncated = False
         if len(lines) > 200:
             lines = lines[:200]
             truncated = True
+        diff_text = "\n".join(lines)
         return {
             "available": True,
             "project": project or repo,
-            "diff": "\n".join(lines),
+            "repo_path": repo,
+            "diff": diff_text,
             "truncated": truncated,
+            "note": f"{len(lines)} line(s)" + (" — no changes" if not diff_text.strip() else ""),
         }
 
     @mcp.tool()
@@ -1240,6 +1290,38 @@ def build_mcp_server(store, repo_path_provider):
             ),
         }
 
+    @mcp.tool()
+    def force_reset_index():
+        """
+        Emergency reset: delete ALL CodeSpine data files without touching the
+        DB engine.
+
+        Use this when the buffer pool is exhausted and normal reset/clear
+        commands also fail with OOM errors.  This bypasses Kuzu entirely by
+        removing all data files from disk.
+
+        After calling this, restart the MCP server and re-index all projects
+        with analyse_project().
+
+        This is the nuclear option — only use when reset_project() and
+        reset_index() fail with buffer pool errors.
+        """
+        from codespine.db.store import GraphStore as _GS
+
+        removed = _GS.force_delete_all_data()
+        return {
+            "available": True,
+            "removed_paths": removed,
+            "removed_count": len(removed),
+            "note": (
+                f"Force-reset complete. {len(removed)} path(s) removed. "
+                "Restart the MCP server (codespine stop && codespine start) "
+                "and re-index projects with analyse_project()."
+                if removed else
+                "Nothing to remove — already clean."
+            ),
+        }
+
     # ------------------------------------------------------------------
     # Neighborhood exploration
     # ------------------------------------------------------------------
@@ -1395,6 +1477,10 @@ def build_mcp_server(store, repo_path_provider):
         Use this after editing a file to immediately refresh the graph without
         waiting for watch mode or running a full analysis.
 
+        The file is parsed and its symbols are stored in the overlay (just like
+        watch mode), so the updated data is immediately visible in search and
+        find_symbol results.
+
         Parameters:
           file_path – Absolute path to the .java file.
           project   – Optional project_id. If omitted, the tool infers the
@@ -1408,9 +1494,12 @@ def build_mcp_server(store, repo_path_provider):
 
         # Resolve project from indexed projects if not given
         if not project:
-            projects = store.query_records(
-                "MATCH (p:Project) RETURN p.id as id, p.path as path"
-            )
+            try:
+                projects = store.query_records(
+                    "MATCH (p:Project) RETURN p.id as id, p.path as path"
+                )
+            except Exception as exc:
+                return {"available": False, "note": f"DB read failed: {exc}"}
             for p in projects:
                 if abs_fp.startswith(p["path"] + _os.sep):
                     project = p["id"]
@@ -1425,58 +1514,64 @@ def build_mcp_server(store, repo_path_provider):
                 }
 
         # Find the project path to use as root for indexing
-        proj_recs = store.query_records(
-            "MATCH (p:Project) WHERE p.id = $pid RETURN p.path as path LIMIT 1",
-            {"pid": project},
-        )
+        try:
+            proj_recs = store.query_records(
+                "MATCH (p:Project) WHERE p.id = $pid RETURN p.path as path LIMIT 1",
+                {"pid": project},
+            )
+        except Exception as exc:
+            return {"available": False, "note": f"DB read failed: {exc}"}
         if not proj_recs:
             return {"available": False, "note": f"Project '{project}' not found in index."}
 
         proj_path = proj_recs[0]["path"]
 
-        # Run incremental index via subprocess to avoid read-only DB constraint.
-        # Use Popen + communicate() with a timeout so that a hang never crashes
-        # the MCP server process — the subprocess is killed gracefully instead.
-        cmd = [
-            sys.executable, "-m", "codespine.cli",
-            "analyse", proj_path,
-            "--incremental", "--no-embed", "--allow-running",
-        ]
+        # Use overlay-based single-file update (same mechanism as watch mode).
+        # This avoids spawning a subprocess and contending with the write DB.
+        from codespine.watch.watcher import _update_overlay_for_files
+
         t0 = time.time()
         try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            stdout, stderr = proc.communicate(timeout=30)
+            result = _update_overlay_for_files(store, proj_path, project, [abs_fp])
             elapsed = round(time.time() - t0, 2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()  # reap zombie
-            elapsed = round(time.time() - t0, 2)
-            return {
-                "available": False,
-                "note": f"Re-index timed out after {elapsed}s. The project may be too large for single-file re-index. Use analyse_project() instead.",
-            }
         except Exception as exc:
             elapsed = round(time.time() - t0, 2)
-            return {
-                "available": False,
-                "note": f"Re-index error: {exc}",
-            }
-
-        if proc.returncode != 0:
-            return {
-                "available": False,
-                "note": f"Re-index failed (code {proc.returncode})",
-                "error": (stderr or stdout or "").strip()[:500],
-            }
+            _LOGGER.warning("reindex_file failed: %s", exc)
+            # Fall back to subprocess approach
+            cmd = [
+                sys.executable, "-m", "codespine.cli",
+                "analyse", proj_path,
+                "--incremental", "--no-embed", "--allow-running",
+            ]
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                stdout, stderr = proc.communicate(timeout=60)
+                elapsed = round(time.time() - t0, 2)
+                if proc.returncode != 0:
+                    return {
+                        "available": False,
+                        "note": f"Re-index failed (code {proc.returncode})",
+                        "error": (stderr or stdout or "").strip()[:500],
+                    }
+                return {
+                    "available": True,
+                    "file": abs_fp,
+                    "project": project,
+                    "elapsed_s": elapsed,
+                    "note": f"Overlay update failed; fell back to full incremental re-index in {elapsed}s.",
+                }
+            except Exception as fallback_exc:
+                return {"available": False, "note": f"Re-index error: overlay={exc}, subprocess={fallback_exc}"}
 
         return {
             "available": True,
             "file": abs_fp,
             "project": project,
             "elapsed_s": elapsed,
-            "note": f"Re-indexed project {project} incrementally in {elapsed}s.",
+            "changed": result.get("changed", 0),
+            "note": f"Re-indexed {abs_fp} via overlay in {elapsed}s.",
         }
 
     # ------------------------------------------------------------------

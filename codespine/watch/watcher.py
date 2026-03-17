@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
+import traceback
 
 from codespine.analysis.community import detect_communities
 from codespine.analysis.coupling import compute_coupling
@@ -12,6 +14,8 @@ from codespine.config import SETTINGS
 from codespine.indexer.engine import JavaIndexer
 from codespine.overlay.git_state import current_head, git_repo_root
 from codespine.overlay.store import OverlayStore, build_overlay_file_entry
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _project_modules(root_path: str) -> tuple[dict[str, str], list[str], bool]:
@@ -39,15 +43,22 @@ def get_overlay_status(store, project: str | None = None) -> list[dict]:
     statuses = overlay_store.status(project)
     out: list[dict] = []
     for item in statuses:
-        metadata = store.get_project_metadata(item["project_id"]) or {}
+        try:
+            metadata = store.get_project_metadata(item["project_id"]) or {}
+        except Exception:
+            metadata = {}
+        # The overlay JSON on disk is the source of truth; the DB flag
+        # may be stale if the watch process couldn't write to the DB.
+        overlay_present = bool(item.get("overlay_present"))
+        db_dirty = bool(metadata.get("overlay_dirty", False))
         out.append(
             {
                 **item,
                 "indexed_commit": metadata.get("indexed_commit", ""),
-                "overlay_dirty": bool(metadata.get("overlay_dirty", False)),
+                "overlay_dirty": overlay_present or db_dirty,
                 "indexed_at": metadata.get("indexed_at", ""),
                 "promotion_pending": bool(
-                    item.get("overlay_present")
+                    overlay_present
                     and item.get("current_head")
                     and metadata.get("indexed_commit")
                     and item.get("current_head") != metadata.get("indexed_commit")
@@ -107,68 +118,98 @@ def promote_overlay(store, project: str | None = None, require_head_change: bool
 def _update_overlay_for_files(store, project_path: str, project_id: str, file_paths: list[str]) -> dict:
     overlay_store: OverlayStore = store.overlay_store
     indexer = JavaIndexer(store)
-    metadata = store.get_project_metadata(project_id) or {}
     repo_root = git_repo_root(project_path)
-    indexed_commit = str(metadata.get("indexed_commit") or "")
     head = current_head(project_path)
+
+    # DB reads can fail if the write DB is busy; fall back to empty catalogs
+    # so the overlay still captures the file changes from tree-sitter alone.
+    try:
+        metadata = store.get_project_metadata(project_id) or {}
+    except Exception as exc:
+        LOGGER.warning("watch: DB read failed for project metadata (%s), using empty", exc)
+        metadata = {}
+    indexed_commit = str(metadata.get("indexed_commit") or "")
+
+    try:
+        base_method_catalog = indexer._existing_method_catalog(project_id)
+        base_class_catalog = indexer._existing_class_catalog(project_id)
+        base_class_ids = indexer._existing_class_ids_by_fqcn(project_id)
+        base_class_methods = indexer._existing_class_methods(project_id)
+    except Exception as exc:
+        LOGGER.warning("watch: DB read failed for catalogs (%s), using empty", exc)
+        base_method_catalog = {}
+        base_class_catalog = {}
+        base_class_ids = {}
+        base_class_methods = {}
+
+    try:
+        embed = store.project_has_embeddings(project_id)
+    except Exception:
+        embed = False
+
     existing_doc = overlay_store.load_project(project_id)
 
-    base_method_catalog = indexer._existing_method_catalog(project_id)
-    base_class_catalog = indexer._existing_class_catalog(project_id)
-    base_class_ids = indexer._existing_class_ids_by_fqcn(project_id)
-    base_class_methods = indexer._existing_class_methods(project_id)
-    embed = store.project_has_embeddings(project_id)
-
-    changed = deleted = 0
+    changed = deleted = errors = 0
     for file_path in sorted(set(os.path.abspath(p) for p in file_paths)):
         if not file_path.endswith(".java"):
             continue
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as fh:
-                source = fh.read()
-            entry = build_overlay_file_entry(
-                store=store,
-                project_id=project_id,
-                project_path=project_path,
-                file_path=file_path,
-                source=source,
-                embed=embed,
-                base_method_catalog=base_method_catalog,
-                base_class_catalog=base_class_catalog,
-                base_class_ids_by_fqcn=base_class_ids,
-                base_class_methods=base_class_methods,
-                existing_overlay_doc=existing_doc,
-            )
-            overlay_store.upsert_file(
-                project_id=project_id,
-                project_path=project_path,
-                repo_root=repo_root,
-                base_commit=indexed_commit,
-                current_head=head,
-                file_path=file_path,
-                entry=entry,
-            )
-            existing_doc = overlay_store.load_project(project_id)
-            changed += 1
-        else:
-            overlay_store.mark_deleted(
-                project_id=project_id,
-                project_path=project_path,
-                repo_root=repo_root,
-                base_commit=indexed_commit,
-                current_head=head,
-                file_path=file_path,
-            )
-            existing_doc = overlay_store.load_project(project_id)
-            deleted += 1
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as fh:
+                    source = fh.read()
+                entry = build_overlay_file_entry(
+                    store=store,
+                    project_id=project_id,
+                    project_path=project_path,
+                    file_path=file_path,
+                    source=source,
+                    embed=embed,
+                    base_method_catalog=base_method_catalog,
+                    base_class_catalog=base_class_catalog,
+                    base_class_ids_by_fqcn=base_class_ids,
+                    base_class_methods=base_class_methods,
+                    existing_overlay_doc=existing_doc,
+                )
+                overlay_store.upsert_file(
+                    project_id=project_id,
+                    project_path=project_path,
+                    repo_root=repo_root,
+                    base_commit=indexed_commit,
+                    current_head=head,
+                    file_path=file_path,
+                    entry=entry,
+                )
+                existing_doc = overlay_store.load_project(project_id)
+                changed += 1
+            else:
+                overlay_store.mark_deleted(
+                    project_id=project_id,
+                    project_path=project_path,
+                    repo_root=repo_root,
+                    base_commit=indexed_commit,
+                    current_head=head,
+                    file_path=file_path,
+                )
+                existing_doc = overlay_store.load_project(project_id)
+                deleted += 1
+        except Exception as exc:
+            LOGGER.warning("watch: failed to process %s: %s", file_path, exc)
+            errors += 1
+
     if changed or deleted:
-        if metadata:
-            store.set_project_overlay_dirty(project_id, True)
-        else:
-            store.upsert_project(project_id, project_path)
-            store.set_project_indexed_commit(project_id, indexed_commit)
-            store.set_project_overlay_dirty(project_id, True)
-    return {"project_id": project_id, "changed": changed, "deleted": deleted}
+        # Try to mark dirty in the DB; if the DB is busy (write contention),
+        # the overlay JSON on disk is still correct and will be picked up on
+        # next read.  Don't let a DB write failure discard overlay work.
+        try:
+            if metadata:
+                store.set_project_overlay_dirty(project_id, True)
+            else:
+                store.upsert_project(project_id, project_path)
+                store.set_project_indexed_commit(project_id, indexed_commit)
+                store.set_project_overlay_dirty(project_id, True)
+        except Exception as exc:
+            LOGGER.warning("watch: DB write failed for overlay_dirty flag (%s); overlay is still on disk", exc)
+    return {"project_id": project_id, "changed": changed, "deleted": deleted, "errors": errors}
 
 
 def run_watch_mode(
@@ -227,11 +268,17 @@ def run_watch_mode(
             for module_path, files in sorted(grouped.items()):
                 project_id = module_map.get(module_path, os.path.basename(module_path))
                 start = time.time()
-                result = _update_overlay_for_files(store, module_path, project_id, files)
+                try:
+                    result = _update_overlay_for_files(store, module_path, project_id, files)
+                except Exception as exc:
+                    LOGGER.error("watch: overlay update failed for %s: %s\n%s", project_id, exc, traceback.format_exc())
+                    print(f"[{time.strftime('%H:%M:%S')}] {project_id}: ERROR updating overlay — {exc}")
+                    continue
                 elapsed = time.time() - start
+                err_note = f", {result.get('errors', 0)} errors" if result.get("errors") else ""
                 print(
                     f"[{time.strftime('%H:%M:%S')}] {project_id}: overlay updated "
-                    f"({result['changed']} changed, {result['deleted']} deleted) in {elapsed:.1f}s"
+                    f"({result['changed']} changed, {result['deleted']} deleted{err_note}) in {elapsed:.1f}s"
                 )
 
             if promote_on_commit:
