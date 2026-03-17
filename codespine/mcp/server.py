@@ -1227,9 +1227,13 @@ def build_mcp_server(store, repo_path_provider):
             timeout=60,
         )
         if proc.returncode != 0:
+            error_text = (proc.stderr.strip() or proc.stdout.strip())[:300]
             return {
                 "available": False,
-                "note": f"Reset failed: {proc.stderr.strip() or proc.stdout.strip()}",
+                "note": (
+                    f"Reset failed: {error_text}. "
+                    "If this is a buffer pool or DB corruption error, use force_reset_index() instead."
+                ),
             }
         return {
             "available": True,
@@ -1268,9 +1272,13 @@ def build_mcp_server(store, repo_path_provider):
             timeout=120,
         )
         if proc.returncode != 0:
+            error_text = (proc.stderr.strip() or proc.stdout.strip())[:300]
             return {
                 "available": False,
-                "note": f"Reset failed: {proc.stderr.strip() or proc.stdout.strip()}",
+                "note": (
+                    f"Reset failed: {error_text}. "
+                    "If this is a buffer pool or DB corruption error, use force_reset_index() instead."
+                ),
             }
 
         cleared = [{"project_id": p["id"], "path": p["path"]} for p in projects]

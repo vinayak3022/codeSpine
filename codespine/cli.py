@@ -751,17 +751,25 @@ def clear_project_cmd(project_id: str, allow_running: bool) -> None:
     if not allow_running and _is_running():
         click.secho("Stop MCP first ('codespine stop') to modify index.", fg="yellow")
         return
-    store = GraphStore(read_only=False)
-    recs = store.query_records(
-        "MATCH (p:Project) WHERE p.id = $pid RETURN p.id as id, p.path as path",
-        {"pid": project_id},
-    )
+    try:
+        store = GraphStore(read_only=False)
+        recs = store.query_records(
+            "MATCH (p:Project) WHERE p.id = $pid RETURN p.id as id, p.path as path",
+            {"pid": project_id},
+        )
+    except Exception as exc:
+        click.secho(f"DB is corrupted ({exc}). Use 'codespine force-reset' to wipe all data.", fg="red")
+        return
     if not recs:
         click.secho(f"Project '{project_id}' not found in index.", fg="yellow")
         return
     project_path = recs[0].get("path", "")
-    store.clear_analysis_artifacts()
-    store.clear_project(project_id)
+    try:
+        store.clear_analysis_artifacts()
+        store.clear_project(project_id)
+    except Exception as exc:
+        click.secho(f"DB write failed ({exc}). Use 'codespine force-reset' to recover.", fg="red")
+        return
     store.overlay_store.clear_project(project_id)
     meta_path = JavaIndexer._meta_cache_path(project_id)
     if os.path.exists(meta_path):
@@ -784,9 +792,23 @@ def clear_index_cmd(allow_running: bool) -> None:
     if not allow_running and _is_running():
         click.secho("Stop MCP first ('codespine stop') to modify index.", fg="yellow")
         return
-    store = GraphStore(read_only=False)
-    projects = store.query_records("MATCH (p:Project) RETURN p.id as id")
-    store.rebuild_empty_db()
+    try:
+        store = GraphStore(read_only=False)
+        projects = store.query_records("MATCH (p:Project) RETURN p.id as id")
+    except Exception:
+        # DB is corrupted — can't even open it.  Force-delete everything.
+        click.secho("DB is corrupted. Running force-reset instead...", fg="yellow")
+        removed = GraphStore.force_delete_all_data()
+        click.secho(f"Force-reset complete. {len(removed)} path(s) removed. Index is now empty.", fg="green")
+        return
+    try:
+        store.rebuild_empty_db()
+    except Exception as exc:
+        # rebuild_empty_db failed even with fallbacks — force-delete.
+        click.secho(f"rebuild failed ({exc}). Running force-reset...", fg="yellow")
+        GraphStore.force_delete_all_data()
+        click.secho("Force-reset complete. Index is now empty.", fg="green")
+        return
     store.overlay_store.clear_all()
     for p in projects:
         meta_path = JavaIndexer._meta_cache_path(p["id"])

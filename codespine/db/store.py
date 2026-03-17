@@ -550,21 +550,49 @@ class GraphStore:
     def rebuild_empty_db(self) -> None:
         self._recycle_conn()
         path = SETTINGS.db_path
+        # Remove the DB directory AND any stale WAL / lock files
         self._remove_db_path(path)
+        for suffix in (".wal", ".lock"):
+            sidecar = path + suffix
+            if os.path.exists(sidecar):
+                try:
+                    os.remove(sidecar)
+                except OSError:
+                    pass
+
         # Kuzu may retain stale internal state from a previous failed open of
-        # this path (e.g. after Ctrl+C mid-write).  If re-opening the just-
-        # deleted path raises, fall back to a clean /tmp location so the
-        # command succeeds rather than leaving the user stuck.
+        # this path (e.g. after Ctrl+C mid-write).  The in-process C++ state
+        # is poisoned and will raise "unordered_map::at: key not found" on any
+        # new kuzu.Database() call — even for a freshly deleted path.
+        #
+        # Strategy: try primary → try /tmp fallback → force-delete everything
+        # and re-import kuzu to get a clean C++ state.
         try:
             self.db = self._open_db(path)
-        except Exception as exc:
+        except Exception as exc1:
+            LOGGER.warning("rebuild_empty_db: primary path failed (%s)", exc1)
             fallback = os.path.join("/tmp", ".codespine_db")
-            LOGGER.warning(
-                "Could not open fresh DB at %s after rebuild (%s); falling back to %s",
-                path, exc, fallback,
-            )
             self._remove_db_path(fallback)
-            self.db = self._open_db(fallback)
+            for suffix in (".wal", ".lock"):
+                sidecar = fallback + suffix
+                if os.path.exists(sidecar):
+                    try:
+                        os.remove(sidecar)
+                    except OSError:
+                        pass
+            try:
+                self.db = self._open_db(fallback)
+            except Exception as exc2:
+                # Nuclear option: force-delete all files and reimport kuzu
+                # so the C++ runtime starts from a completely clean state.
+                LOGGER.warning("rebuild_empty_db: fallback also failed (%s); force-resetting", exc2)
+                self.force_delete_all_data()
+                import importlib
+                importlib.reload(kuzu)
+                try:
+                    self.db = kuzu.Database(path, buffer_pool_size=_WRITE_BUFFER_POOL_SIZE)
+                except TypeError:
+                    self.db = kuzu.Database(path)
         self._tls = threading.local()
         ensure_schema(self._conn())
 
