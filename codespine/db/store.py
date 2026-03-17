@@ -604,6 +604,13 @@ class GraphStore:
                     self.db = kuzu.Database(path)
         self._tls = threading.local()
         ensure_schema(self._conn())
+        # Force Kuzu to flush the WAL to the main data files so that a
+        # subsequent read-only open (stats, MCP snapshot) can see the schema
+        # without needing WAL replay (which read-only mode cannot do).
+        try:
+            self._conn().execute("CHECKPOINT")
+        except Exception:
+            pass
 
     def set_community(self, community_id: str, label: str, cohesion: float, symbol_ids: list[str]) -> None:
         self.execute(
@@ -692,7 +699,15 @@ class GraphStore:
             return False
 
     def query_records(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        frame = self.execute(query, params or {}).get_as_df()
+        try:
+            frame = self.execute(query, params or {}).get_as_df()
+        except RuntimeError as exc:
+            # In read-only mode the DB may have been cleared but the schema
+            # hasn't been flushed from WAL, or the DB is brand-new.  Return
+            # an empty result instead of crashing callers (stats, MCP, etc.).
+            if self.read_only and "does not exist" in str(exc).lower():
+                return []
+            raise
         if frame.empty:
             return []
         return json.loads(frame.to_json(orient="records"))
