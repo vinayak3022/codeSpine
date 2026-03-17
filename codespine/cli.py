@@ -853,6 +853,18 @@ def force_reset_cmd(force: bool) -> None:
 
 
 @main.command()
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+def guide(as_json: bool) -> None:
+    """Show what CodeSpine can do: tool catalog, workflows, and tips."""
+    from codespine.guide import GUIDE_SECTIONS, format_guide_terminal
+
+    if as_json:
+        _echo_json({"sections": GUIDE_SECTIONS}, as_json=True)
+    else:
+        click.echo(format_guide_terminal())
+
+
+@main.command()
 def setup() -> None:
     """Print local setup checks and next steps."""
     checks = {

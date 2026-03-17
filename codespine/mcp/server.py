@@ -363,6 +363,22 @@ def build_mcp_server(store, repo_path_provider):
         }
 
     # ------------------------------------------------------------------
+    # Guide – static tool catalog + workflows for agents
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def guide():
+        """
+        How to use CodeSpine: system overview, tool catalog, recommended
+        workflows, and tips.  Call this FIRST if you have never used
+        CodeSpine before.  For live index state (what is indexed right now),
+        call get_capabilities() instead.
+        """
+        from codespine.guide import GUIDE_SECTIONS
+
+        return _json({"version": __version__, "sections": GUIDE_SECTIONS})
+
+    # ------------------------------------------------------------------
     # Project listing
     # ------------------------------------------------------------------
 
