@@ -560,6 +560,15 @@ class GraphStore:
                 except OSError:
                     pass
 
+        # Also remove the read replica so that read-only callers (stats, MCP)
+        # don't continue to see stale data from before the wipe.
+        for stale in [
+            SETTINGS.db_snapshot_path,
+            SETTINGS.db_snapshot_path + ".tmp",
+            SETTINGS.db_snapshot_path + ".updated",
+        ]:
+            self._remove_db_path(stale)
+
         # Kuzu may retain stale internal state from a previous failed open of
         # this path (e.g. after Ctrl+C mid-write).  The in-process C++ state
         # is poisoned and will raise "unordered_map::at: key not found" on any

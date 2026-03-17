@@ -777,6 +777,8 @@ def clear_project_cmd(project_id: str, allow_running: bool) -> None:
             os.remove(meta_path)
         except OSError:
             pass
+    # Update the read replica so read-only callers (stats, MCP) see the change.
+    GraphStore.snapshot_to_read_replica()
     click.secho(f"Cleared project '{project_id}' (was at {project_path}).", fg="green")
 
 
@@ -817,6 +819,9 @@ def clear_index_cmd(allow_running: bool) -> None:
                 os.remove(meta_path)
             except OSError:
                 pass
+    # Publish an empty read replica so that read-only callers (stats, MCP)
+    # immediately see the cleared state and the MCP daemon hot-reloads.
+    GraphStore.snapshot_to_read_replica()
     click.secho(f"Cleared {len(projects)} project(s). Index is now empty.", fg="green")
 
 
