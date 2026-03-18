@@ -203,7 +203,7 @@ codespine guide --json   # structured JSON for tooling
 | `detect_dead_code(limit, project, strict)` | Methods with no callers (Java-aware exemptions). |
 | `trace_execution_flows(entry_symbol, max_depth, project)` | Execution paths from entry points. |
 | `get_symbol_community(symbol)` | Architectural community cluster for a symbol. |
-| `get_change_coupling(months, min_strength, min_cochanges)` | Files that historically change together. |
+| `get_change_coupling(days, min_strength, min_cochanges)` | Files that changed together in the last N days (default 5). |
 
 **Git**
 
