@@ -648,18 +648,18 @@ class GraphStore:
                     )
             self._recycle_conn()
 
-    def upsert_coupling(self, file_a: str, file_b: str, strength: float, cochanges: int, months: int) -> None:
+    def upsert_coupling(self, file_a: str, file_b: str, strength: float, cochanges: int, days: int) -> None:
         self.execute(
             """
             MATCH (a:File {id: $a}), (b:File {id: $b})
-            MERGE (a)-[:CO_CHANGED_WITH {strength: $strength, cochanges: $cochanges, months: $months}]->(b)
+            MERGE (a)-[:CO_CHANGED_WITH {strength: $strength, cochanges: $cochanges, days: $days}]->(b)
             """,
             {
                 "a": file_a,
                 "b": file_b,
                 "strength": strength,
                 "cochanges": int(cochanges),
-                "months": int(months),
+                "days": int(days),
             },
         )
 

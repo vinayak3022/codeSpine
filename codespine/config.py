@@ -18,7 +18,7 @@ class Settings:
     write_batch_size: int = 500
     index_file_batch_size: int = 20
     edge_write_batch_size: int = 500
-    default_coupling_months: int = 6
+    default_coupling_days: int = 5
     default_min_coupling_strength: float = 0.3
     default_min_cochanges: int = 3
     default_global_interval_s: int = 30

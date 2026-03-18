@@ -522,15 +522,15 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def get_change_coupling(
         symbol: str | None = None,
-        months: int = 6,
+        days: int = 5,
         min_strength: float = 0.3,
         min_cochanges: int = 3,
     ):
         """
-        Files that historically change together (git co-change coupling).
+        Files that changed together in the last N days (git co-change coupling).
         Requires 'codespine analyse --deep' to have been run.
         """
-        result = get_coupling(store, symbol=symbol, months=months, min_strength=min_strength, min_cochanges=min_cochanges)
+        result = get_coupling(store, symbol=symbol, days=days, min_strength=min_strength, min_cochanges=min_cochanges)
         if not result:
             return {
                 "available": False,

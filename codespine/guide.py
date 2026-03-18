@@ -60,7 +60,7 @@ GUIDE_SECTIONS: list[dict] = [
             {"name": "detect_dead_code", "one_liner": "Methods with no callers (Java-aware exemptions). strict=True for thorough audit."},
             {"name": "trace_execution_flows", "one_liner": "Execution paths from entry points (main methods, tests, controllers)."},
             {"name": "get_symbol_community", "one_liner": "Architectural community cluster a symbol belongs to."},
-            {"name": "get_change_coupling", "one_liner": "Files that historically change together (git co-change analysis)."},
+            {"name": "get_change_coupling", "one_liner": "Files that changed together in the last N days (default 5). git co-change analysis."},
         ],
     },
     {

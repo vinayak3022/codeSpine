@@ -314,7 +314,7 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
             store,
             coupling_root,
             coupling_project,
-            months=SETTINGS.default_coupling_months,
+            days=SETTINGS.default_coupling_days,
             min_strength=SETTINGS.default_min_coupling_strength,
             min_cochanges=SETTINGS.default_min_cochanges,
             progress=lambda s: _live_phase(coup_label, s),
@@ -467,20 +467,20 @@ def community(symbol: str | None, as_json: bool) -> None:
 
 
 @main.command()
-@click.option("--months", default=6, show_default=True, type=int)
+@click.option("--days", default=5, show_default=True, type=int)
 @click.option("--min-strength", default=0.3, show_default=True, type=float)
 @click.option("--min-cochanges", default=3, show_default=True, type=int)
 @click.option("--json", "as_json", is_flag=True)
-def coupling(months: int, min_strength: float, min_cochanges: int, as_json: bool) -> None:
+def coupling(days: int, min_strength: float, min_cochanges: int, as_json: bool) -> None:
     """Compute and query git change coupling."""
     store = GraphStore(read_only=False)
     project = store.query_records("MATCH (p:Project) RETURN p.id as id LIMIT 1")
     project_id = project[0]["id"] if project else os.path.basename(os.getcwd())
-    compute_coupling(store, os.getcwd(), project_id, months=months, min_strength=min_strength, min_cochanges=min_cochanges)
+    compute_coupling(store, os.getcwd(), project_id, days=days, min_strength=min_strength, min_cochanges=min_cochanges)
     result = get_coupling(
         store,
         symbol=None,
-        months=months,
+        days=days,
         min_strength=min_strength,
         min_cochanges=min_cochanges,
     )

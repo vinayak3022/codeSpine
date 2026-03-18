@@ -9,7 +9,7 @@ from codespine.config import SETTINGS
 from codespine.indexer.symbol_builder import file_id
 
 
-def _git_changed_file_sets(repo_path: str, months: int) -> list[set[str]]:
+def _git_changed_file_sets(repo_path: str, days: int) -> list[set[str]]:
     cmd = [
         "git",
         "-C",
@@ -17,7 +17,7 @@ def _git_changed_file_sets(repo_path: str, months: int) -> list[set[str]]:
         "log",
         "--name-only",
         "--pretty=format:__COMMIT__",
-        f"--since={months}.months",
+        f"--since={days}.days",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
@@ -43,7 +43,7 @@ def compute_coupling(
     store,
     repo_path: str,
     project_id: str,
-    months: int = SETTINGS.default_coupling_months,
+    days: int = SETTINGS.default_coupling_days,
     min_strength: float = SETTINGS.default_min_coupling_strength,
     min_cochanges: int = SETTINGS.default_min_cochanges,
     progress=None,
@@ -53,7 +53,7 @@ def compute_coupling(
             progress(msg)
 
     _ping("reading git history")
-    changesets = _git_changed_file_sets(repo_path, months)
+    changesets = _git_changed_file_sets(repo_path, days)
     if not changesets:
         return []
 
@@ -77,7 +77,7 @@ def compute_coupling(
 
         aid = file_id(project_id, a)
         bid = file_id(project_id, b)
-        store.upsert_coupling(aid, bid, strength, pair_count, months)
+        store.upsert_coupling(aid, bid, strength, pair_count, days)
         results.append(
             {
                 "file_a": a,
@@ -91,7 +91,7 @@ def compute_coupling(
     return results
 
 
-def get_coupling(store, symbol: str | None = None, months: int = 6, min_strength: float = 0.3, min_cochanges: int = 3) -> dict:
+def get_coupling(store, symbol: str | None = None, days: int = 5, min_strength: float = 0.3, min_cochanges: int = 3) -> dict:
     if symbol:
         recs = store.query_records(
             """
@@ -113,13 +113,13 @@ def get_coupling(store, symbol: str | None = None, months: int = 6, min_strength
     recs = store.query_records(
         """
         MATCH (f:File)-[r:CO_CHANGED_WITH]-(f2:File)
-        WHERE r.months = $months AND r.strength >= $min_strength AND r.cochanges >= $min_cochanges
+        WHERE r.days = $days AND r.strength >= $min_strength AND r.cochanges >= $min_cochanges
         RETURN f.path as file, f2.path as coupled_file, r.strength as strength, r.cochanges as cochanges
         ORDER BY strength DESC, cochanges DESC
         LIMIT 500
         """,
         {
-            "months": months,
+            "days": days,
             "min_strength": min_strength,
             "min_cochanges": min_cochanges,
         },
