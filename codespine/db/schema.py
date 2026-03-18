@@ -49,7 +49,7 @@ REL_TABLES: Iterable[tuple[str, str]] = [
     ("IN_FLOW", "CREATE REL TABLE IN_FLOW(FROM Symbol TO Flow, depth INT64)"),
     (
         "CO_CHANGED_WITH",
-        "CREATE REL TABLE CO_CHANGED_WITH(FROM File TO File, strength DOUBLE, cochanges INT64, months INT64)",
+        "CREATE REL TABLE CO_CHANGED_WITH(FROM File TO File, strength DOUBLE, cochanges INT64, days INT64)",
     ),
 ]
 
@@ -86,3 +86,8 @@ def ensure_schema(conn) -> None:
 
     _safe_execute(conn, "ALTER TABLE Project ADD indexed_commit STRING DEFAULT ''")
     _safe_execute(conn, "ALTER TABLE Project ADD overlay_dirty BOOL DEFAULT false")
+
+    # v0.7.3: renamed CO_CHANGED_WITH.months → days (days-based window).
+    # ALTER TABLE is a no-op on fresh DBs that already have 'days'; safe_execute
+    # swallows the error if the column already exists or the table doesn't yet.
+    _safe_execute(conn, "ALTER TABLE CO_CHANGED_WITH ADD days INT64 DEFAULT 0")
