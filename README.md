@@ -159,45 +159,134 @@ If the client launches the wrong Python environment, use the absolute binary pat
 }
 ```
 
-Common MCP tools:
+### Agent Onboarding
 
-- `search_hybrid(query, k, project)`
-- `find_symbol(name, kind, project, limit)`
-- `get_symbol_context(query, max_depth, project)`
-- `get_impact(symbol, max_depth, project)`
-- `detect_dead_code(limit, project, strict)`
-- `trace_execution_flows(entry_symbol, max_depth, project)`
-- `get_symbol_community(symbol)`
-- `get_change_coupling(months, min_strength, min_cochanges, project)`
-- `compare_branches(base_ref, head_ref)`
-- `get_codebase_stats()`
+When an agent connects to CodeSpine for the first time, it should call:
+
+1. **`guide()`** — returns a structured catalog of every tool, organized by category, with recommended workflows and tips.
+2. **`get_capabilities()`** — returns what is indexed right now, which features are ready, and what's missing.
+
+The same information is available from the CLI:
+
+```bash
+codespine guide          # tool catalog, workflows, tips
+codespine guide --json   # structured JSON for tooling
+```
+
+### MCP Tools
+
+**Discovery & Status**
+
+| Tool | Description |
+|------|-------------|
+| `guide()` | Tool catalog, workflows, and tips. Call first if new to CodeSpine. |
+| `get_capabilities()` | What is indexed and which features are available right now. |
+| `list_projects()` | All indexed projects with symbol/file counts. |
+| `get_codebase_stats()` | Per-project stats: files, classes, methods, call edges, embeddings. |
+| `list_packages(project)` | Java packages in the index. |
+| `ping()` | Verify the MCP server is alive. |
+
+**Search & Lookup**
+
+| Tool | Description |
+|------|-------------|
+| `search_hybrid(query, k, project)` | Ranked symbol search (BM25 + vector + fuzzy via RRF). |
+| `find_symbol(name, kind, project, limit)` | Exact/prefix name lookup across all projects. |
+| `get_symbol_context(query, max_depth, project)` | One-shot deep context: search + impact + community + flows. |
+| `get_neighborhood(symbol, project)` | Callers, callees, siblings, and override/implements. |
+
+**Analysis**
+
+| Tool | Description |
+|------|-------------|
+| `get_impact(symbol, max_depth, project)` | Caller-tree impact analysis with confidence scores. |
+| `detect_dead_code(limit, project, strict)` | Methods with no callers (Java-aware exemptions). |
+| `trace_execution_flows(entry_symbol, max_depth, project)` | Execution paths from entry points. |
+| `get_symbol_community(symbol)` | Architectural community cluster for a symbol. |
+| `get_change_coupling(months, min_strength, min_cochanges)` | Files that historically change together. |
+
+**Git**
+
+| Tool | Description |
+|------|-------------|
+| `git_log(file_path, limit, project)` | Recent git commits. |
+| `git_diff(ref, file_path, project)` | Git diff (working tree vs ref, or between refs). |
+| `compare_branches(base_ref, head_ref, project)` | Symbol-level diff between two git refs. |
+
+**Indexing & Watch**
+
+| Tool | Description |
+|------|-------------|
+| `analyse_project(path, full, deep, embed)` | Index a Java project (background job). |
+| `get_analyse_status()` | Poll analysis progress. |
+| `reindex_file(file_path, project)` | Re-index a single `.java` file (<1 s). |
+| `start_watch(path)` | Watch for `.java` changes and update overlay in real time. |
+| `stop_watch()` | Stop the background watch process. |
+| `get_watch_status()` | Watch mode status: running, path, uptime. |
+
+**Overlay**
+
+| Tool | Description |
+|------|-------------|
+| `get_overlay_status(project)` | Uncommitted overlay state by project/module. |
+| `promote_overlay(project)` | Commit dirty overlay into the base index. |
+| `clear_overlay(project)` | Discard dirty overlay without changing the base. |
+
+**Reset**
+
+| Tool | Description |
+|------|-------------|
+| `reset_project(project_id)` | Remove all data for one project. |
+| `reset_index()` | Remove ALL data across every project. |
+| `force_reset_index()` | Emergency: delete data files when normal reset fails. |
+
+**Advanced**
+
+| Tool | Description |
+|------|-------------|
+| `run_cypher(query)` | Run a raw Cypher query against the graph DB. |
 
 ## CLI
 
-Core commands:
-
 ```bash
-codespine analyse <path>
-codespine analyse <path> --full
-codespine analyse <path> --deep
-codespine analyse <path> --embed
-codespine watch --path .
-codespine watch --path . --overlay-debounce-ms 1500
-codespine search "query"
-codespine context "symbol"
-codespine impact "symbol"
-codespine deadcode
-codespine flow
-codespine community
-codespine coupling
-codespine diff main..feature
-codespine stats
-codespine list
-codespine overlay-status
-codespine overlay-promote
-codespine overlay-clear
-codespine clear-project <project_id>
-codespine clear-index
+# Indexing
+codespine analyse <path>                     # incremental index
+codespine analyse <path> --full              # full re-index
+codespine analyse <path> --deep              # + communities, flows, dead code, coupling
+codespine analyse <path> --embed             # + vector embeddings
+codespine watch --path .                     # live re-index on file changes
+
+# Search & Analysis
+codespine search "query"                     # hybrid search
+codespine context "symbol"                   # one-shot deep context
+codespine impact "symbol"                    # caller-tree impact
+codespine deadcode                           # dead code candidates
+codespine flow                               # execution flows
+codespine community                          # architectural clusters
+codespine coupling                           # git change coupling
+codespine diff main..feature                 # symbol-level branch diff
+
+# Status & Info
+codespine stats                              # per-project statistics
+codespine list                               # indexed projects
+codespine status                             # service and database status
+codespine guide                              # tool catalog and workflows
+
+# Overlay
+codespine overlay-status                     # dirty overlay state
+codespine overlay-promote                    # commit overlay to base
+codespine overlay-clear                      # discard overlay
+
+# Server Management
+codespine start                              # launch background MCP server
+codespine stop                               # stop background MCP server
+codespine mcp                                # foreground MCP (stdio, for IDE)
+
+# Cleanup & Reset
+codespine clear-project <project_id>         # remove one project
+codespine clear-index                        # remove all indexed data
+codespine force-reset                        # emergency: delete all data files
+codespine setup                              # check dependencies
 ```
 
 `analyse` defaults to incremental mode. Repeat runs are designed to be fast when files have not changed.
@@ -259,8 +348,8 @@ Running `codespine analyse --deep --embed` on one project while querying a diffe
 - `codespine start` launches a background MCP server. Most IDE MCP clients should use `codespine mcp` instead and manage the process themselves.
 - `codespine watch` updates the dirty overlay first; it does not rewrite the committed base index on every save.
 - `codespine clear-index` rebuilds the local index database from scratch. This also removes the read replica; run `analyse` again to republish it.
+- `codespine force-reset` is the nuclear option — it deletes all data files without going through the DB engine. Use it when `clear-index` fails due to DB corruption.
 - For large Spring or JPA-heavy repos, dead-code results should still be reviewed before deletion. The tool is conservative, not authoritative.
-- The first run after upgrading to v0.5.7 will not have a read replica yet. Run `codespine analyse` once to create it.
 
 ## Project Docs
 
