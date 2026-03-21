@@ -74,9 +74,12 @@ def clear_overlay(store, project: str | None = None) -> list[str]:
     cleared: list[str] = []
     for project_id in targets:
         overlay_store.clear_project(project_id)
-        meta = store.get_project_metadata(project_id)
-        if meta:
-            store.set_project_overlay_dirty(project_id, False)
+        try:
+            meta = store.get_project_metadata(project_id)
+            if meta:
+                store.set_project_overlay_dirty(project_id, False)
+        except Exception as exc:
+            LOGGER.warning("clear_overlay: could not update DB dirty flag for %s (%s); overlay files cleared", project_id, exc)
         cleared.append(project_id)
     return cleared
 

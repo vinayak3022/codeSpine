@@ -75,6 +75,21 @@ def _no_symbols_response(note: str = "No symbols indexed. Run 'codespine analyse
     return _json({"available": False, "note": note})
 
 
+def _normalize_symbol_input(raw: str) -> str:
+    """Normalize a symbol string so that various user input formats work.
+
+    Handles:
+      - ``com.example.MyClass#myMethod(int,String)`` → ``myMethod(int,String)``
+      - ``MyClass#myMethod``                         → ``myMethod``
+      - ``myMethod(int,String)``                     → unchanged
+      - ``myMethod``                                 → unchanged
+    """
+    s = raw.strip()
+    if "#" in s:
+        s = s[s.index("#") + 1:]
+    return s
+
+
 def _parse_indexed_at(raw) -> int:
     """Robustly parse an indexed_at value that may be str, int, float, or None."""
     if raw is None:
@@ -256,8 +271,18 @@ def build_mcp_server(store, repo_path_provider):
         from codespine.search.vector import _load_model
         has_embeddings = _load_model() is not None
 
+        # Check git availability on the default path AND on each indexed
+        # project path.  Project-scoped git operations (git_log, git_diff,
+        # compare_branches) work when the project path is a git repo, even
+        # if the default path (cwd) is not.
         repo = repo_path_provider()
         git_ok = _git_available(repo)
+        if not git_ok:
+            for p in projects:
+                pp = p.get("path", "")
+                if pp and os.path.isdir(pp) and _git_available(pp):
+                    git_ok = True
+                    break
 
         n_sym = sym_q[0]["count"] if sym_q else 0
         n_comm = comm_q[0]["count"] if comm_q else 0
@@ -450,7 +475,11 @@ def build_mcp_server(store, repo_path_provider):
         Caller-tree impact analysis for a symbol.
         project scopes the target symbol lookup; cross-project callers are always included.
         """
-        result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
+        normalized = _normalize_symbol_input(symbol)
+        result = analyze_impact(store, normalized, max_depth=max_depth, project=project)
+        if not result.get("targets_resolved"):
+            # Retry with the raw input in case the ID matched exactly.
+            result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
         if not result.get("targets_resolved"):
             return {"available": False, "note": f"Symbol '{symbol}' not found in the index."}
         return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
@@ -502,6 +531,8 @@ def build_mcp_server(store, repo_path_provider):
         Trace execution flows from entry points (main methods, tests).
         Pass project to scope entry-point discovery to a single module.
         """
+        if entry_symbol:
+            entry_symbol = _normalize_symbol_input(entry_symbol)
         flows = trace_flows_analysis(store, entry_symbol=entry_symbol, max_depth=max_depth, project=project)
         if not flows:
             return _no_symbols_response("No entry points found. Run 'codespine analyse --deep' or provide entry_symbol.")
@@ -514,7 +545,10 @@ def build_mcp_server(store, repo_path_provider):
         # graph DB read-only, so any write attempt raises "Cannot execute write
         # operations in a read-only database!".  Communities are computed once
         # during 'codespine analyse --deep' and persisted; we just read them.
-        result = symbol_community(store, symbol)
+        normalized = _normalize_symbol_input(symbol)
+        result = symbol_community(store, normalized)
+        if not result.get("matches"):
+            result = symbol_community(store, symbol)
         if not result.get("matches"):
             return {"available": False, "note": "No community data yet. Run 'codespine analyse --deep'."}
         return _staleness_meta(store, {"available": True, **result}, overlay_store=overlay_store, deep_scope=True)
@@ -646,7 +680,7 @@ def build_mcp_server(store, repo_path_provider):
         Parameters:
           name    – Simple class/method name, fully-qualified name, or prefix.
                     Matching is case-insensitive on the simple name; exact on the FQCN.
-          kind    – Optional filter: "class" or "method".
+          kind    – Optional filter: "class", "method", or "field".
           project – Optional project_id to restrict the search.
           limit   – Max results per kind (default 50).
 
@@ -703,7 +737,39 @@ def build_mcp_server(store, repo_path_provider):
                     if len(methods) >= limit:
                         break
 
-        total = len(classes) + len(methods)
+        fields: list[dict] = []
+        if kind in (None, "field"):
+            project_clause_f = "AND f.project_id = $proj" if project else ""
+            field_params: dict = {"namel": name_lower, "lim": limit}
+            if project:
+                field_params["proj"] = project
+            field_recs = store.query_records(
+                f"""
+                MATCH (s:Symbol), (f:File)
+                WHERE s.file_id = f.id AND s.kind = 'field'
+                  AND (lower(s.name) = $namel OR lower(s.fqname) CONTAINS $namel)
+                  {project_clause_f}
+                RETURN s.id as id, s.name as name, s.fqname as fqname,
+                       f.project_id as project_id, f.path as file_path,
+                       s.line as line, s.col as col
+                LIMIT $lim
+                """,
+                field_params,
+            )
+            for rec in field_recs:
+                fields.append(
+                    {
+                        "id": rec.get("id"),
+                        "name": rec.get("name"),
+                        "fqname": rec.get("fqname"),
+                        "project_id": rec.get("project_id"),
+                        "file_path": rec.get("file_path"),
+                        "line": rec.get("line"),
+                        "col": rec.get("col"),
+                    }
+                )
+
+        total = len(classes) + len(methods) + len(fields)
         if total == 0:
             return {
                 "available": False,
@@ -714,12 +780,16 @@ def build_mcp_server(store, repo_path_provider):
         by_project: dict[str, dict] = {}
         for c in classes:
             pid = c.get("project_id", "?")
-            by_project.setdefault(pid, {"classes": [], "methods": []})
+            by_project.setdefault(pid, {"classes": [], "methods": [], "fields": []})
             by_project[pid]["classes"].append(c)
         for m in methods:
             pid = m.get("project_id", "?")
-            by_project.setdefault(pid, {"classes": [], "methods": []})
+            by_project.setdefault(pid, {"classes": [], "methods": [], "fields": []})
             by_project[pid]["methods"].append(m)
+        for f in fields:
+            pid = f.get("project_id", "?")
+            by_project.setdefault(pid, {"classes": [], "methods": [], "fields": []})
+            by_project[pid]["fields"].append(f)
 
         return _staleness_meta(store, {
             "available": True,
@@ -1367,17 +1437,22 @@ def build_mcp_server(store, repo_path_provider):
         """
         from codespine.analysis.impact import _resolve_method_metadata
 
+        # Normalize FQN inputs: "Class#method(sig)" → "method(sig)"
+        normalized = _normalize_symbol_input(symbol)
+
         project_clause = "AND f.project_id = $proj" if project else ""
-        params: dict = {"q": symbol}
+        params: dict = {"q": normalized, "raw": symbol}
         if project:
             params["proj"] = project
 
-        # 1. Resolve the symbol to method IDs
+        # 1. Resolve the symbol to method IDs.  Try both the normalized
+        #    form and the raw input so exact-ID matches still work.
         method_recs = store.query_records(
             f"""
             MATCH (m:Method), (c:Class), (f:File)
             WHERE m.class_id = c.id AND c.file_id = f.id {project_clause}
-              AND (m.id = $q OR lower(m.name) = lower($q)
+              AND (m.id = $q OR m.id = $raw
+                   OR lower(m.name) = lower($q)
                    OR lower(m.signature) CONTAINS lower($q))
             RETURN m.id as id, m.name as name, m.signature as signature,
                    c.id as class_id, c.fqcn as class_fqcn,
@@ -1393,20 +1468,22 @@ def build_mcp_server(store, repo_path_provider):
         mid = target["id"]
         cid = target["class_id"]
 
-        # 2. Callers (upstream)
+        # 2. Callers (upstream) — exclude low-confidence cross-module fallback edges
         callers = store.query_records(
             """
             MATCH (caller:Method)-[r:CALLS]->(m:Method {id: $mid})
+            WHERE coalesce(r.confidence, 0.5) >= 0.5
             RETURN caller.id as id, coalesce(r.confidence, 0.5) as confidence,
                    coalesce(r.reason, 'unknown') as reason
             """,
             {"mid": mid},
         )
 
-        # 3. Callees (downstream)
+        # 3. Callees (downstream) — exclude low-confidence cross-module fallback edges
         callees = store.query_records(
             """
             MATCH (m:Method {id: $mid})-[r:CALLS]->(callee:Method)
+            WHERE coalesce(r.confidence, 0.5) >= 0.5
             RETURN callee.id as id, coalesce(r.confidence, 0.5) as confidence,
                    coalesce(r.reason, 'unknown') as reason
             """,

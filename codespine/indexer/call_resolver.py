@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Iterator
 
-from codespine.noise.blocklist import NOISE_METHOD_NAMES
+from codespine.noise.blocklist import MIN_FUZZY_NAME_LEN, NOISE_METHOD_NAMES
 
 MAX_FUZZY_TARGETS = 12
 
@@ -84,8 +84,6 @@ def resolve_calls(
 
         for call in call_sites:
             call_name = call.name
-            if call_name in NOISE_METHOD_NAMES:
-                continue
 
             key = (call_name, int(call.arg_count))
             targets: list[str] = []
@@ -123,6 +121,12 @@ def resolve_calls(
                     reason = "intra_class_exact"
 
             if not targets:
+                # Skip noise method names and short names in the fuzzy global
+                # fallback — they are too ambiguous without receiver context.
+                if call_name in NOISE_METHOD_NAMES:
+                    continue
+                if len(call_name) < MIN_FUZZY_NAME_LEN:
+                    continue
                 # Prefer same-package candidates before global fallback.
                 src_pkg = src_ctx.get("package", "")
                 same_pkg = []

@@ -36,6 +36,14 @@ class ParsedCall:
 
 
 @dataclass
+class ParsedField:
+    name: str
+    type_name: str
+    line: int
+    col: int
+
+
+@dataclass
 class ParsedClass:
     name: str
     package: str
@@ -49,6 +57,7 @@ class ParsedClass:
     field_types: dict[str, str] = field(default_factory=dict)
     body_hash: str = ""
     methods: list[ParsedMethod] = field(default_factory=list)
+    fields: list[ParsedField] = field(default_factory=list)
 
 
 @dataclass
@@ -193,7 +202,7 @@ def _extract_local_types(method_node) -> dict[str, str]:
     return locals_map
 
 
-def _extract_field_types(class_node) -> dict[str, str]:
+def _extract_field_types(class_node) -> tuple[dict[str, str], list[ParsedField]]:
     q = Query(
         JAVA_LANGUAGE,
         """
@@ -204,13 +213,21 @@ def _extract_field_types(class_node) -> dict[str, str]:
     )
     captures = _captures(q, class_node)
     field_map: dict[str, str] = {}
+    field_list: list[ParsedField] = []
     current_type = None
     for node, tag in captures:
         if tag == "type":
             current_type = _node_type_name(node)
         elif tag == "name" and current_type:
-            field_map[_text(node)] = current_type
-    return field_map
+            name = _text(node)
+            field_map[name] = current_type
+            field_list.append(ParsedField(
+                name=name,
+                type_name=current_type,
+                line=node.start_point[0] + 1,
+                col=node.start_point[1] + 1,
+            ))
+    return field_map, field_list
 
 
 def _extract_parameter_types(params_node) -> list[str]:
@@ -338,6 +355,7 @@ def parse_java_source(source: bytes) -> ParsedFile:
         fqcn = f"{package_name}.{cls_name}" if package_name else cls_name
         cls_modifiers, cls_annotations = _extract_modifiers_and_annotations(node)
         extends_name, interface_names = _extract_inheritance(node)
+        ft_map, ft_list = _extract_field_types(node)
         parsed_class = ParsedClass(
             name=cls_name,
             package=package_name,
@@ -348,8 +366,9 @@ def parse_java_source(source: bytes) -> ParsedFile:
             annotations=cls_annotations,
             extends=extends_name,
             interfaces=interface_names,
-            field_types=_extract_field_types(node),
+            field_types=ft_map,
             body_hash=_hash_node(node),
+            fields=ft_list,
         )
 
         method_nodes = [n for n, t in _captures(method_query, node) if t == "method_decl"]

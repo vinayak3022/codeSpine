@@ -17,11 +17,10 @@ Two linking strategies are applied:
       parameter count as a method M_dst in the referenced class.  This catches
       delegation, interface-implementation forwarding, and adapter patterns.
 
-  Strategy B — Type-reference fallback  (confidence 0.4)
-      For every *public, non-constructor* method in the referenced class that
-      received NO name-match edge, create ONE low-confidence edge from the
-      referencing method.  This prevents methods that are genuinely used
-      cross-module from appearing as dead code.
+  Strategy B — Direct parameter/return type reference  (confidence 0.6)
+      When the referenced class name appears directly as a parameter type or
+      return type of the source method, create an edge to the class's
+      constructor (if any).  This catches model/DTO/context instantiation.
 """
 from __future__ import annotations
 
@@ -165,29 +164,28 @@ def link_cross_module_calls(store, project_ids: list[str] | None = None, progres
                                         LOGGER.debug("Name-match edge failed: %s", exc)
                                 matched_dst_mids.add(dm["mid"])
 
-                    # Strategy B: fallback for unmatched public dst methods
-                    for dm in dst_methods:
-                        if dm["mid"] in matched_dst_mids:
-                            continue
-                        if dm.get("is_ctor"):
-                            continue
-                        mods = dm.get("modifiers") or []
-                        mod_strs = {str(m).strip() for m in mods} if mods else set()
-                        if "private" in mod_strs:
-                            continue
-
-                        pair = (sm["mid"], dm["mid"])
-                        if pair in seen:
-                            continue
-                        seen.add(pair)
-                        try:
-                            store.add_call(
-                                sm["mid"], dm["mid"],
-                                0.4, "cross_module_type_ref",
-                            )
-                            new_edges += 1
-                        except Exception as exc:
-                            LOGGER.debug("Fallback edge failed: %s", exc)
+                    # Strategy B: if the referenced class name appears directly
+                    # in the source method's parameter types or return type,
+                    # link to the class's constructor (model/DTO instantiation).
+                    if not matched_dst_mids:
+                        rtype_tokens = set(_TOKEN_RE.findall(rtype))
+                        sig_tokens = set(_TOKEN_RE.findall(sig))
+                        if class_name in rtype_tokens or class_name in sig_tokens:
+                            for dm in dst_methods:
+                                if not dm.get("is_ctor"):
+                                    continue
+                                pair = (sm["mid"], dm["mid"])
+                                if pair in seen:
+                                    continue
+                                seen.add(pair)
+                                try:
+                                    store.add_call(
+                                        sm["mid"], dm["mid"],
+                                        0.6, "cross_module_ctor_ref",
+                                    )
+                                    new_edges += 1
+                                except Exception as exc:
+                                    LOGGER.debug("Ctor-ref edge failed: %s", exc)
 
     _ping(f"{new_edges} edges created")
     LOGGER.info("Cross-module linking: created %d new call edges.", new_edges)

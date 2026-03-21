@@ -153,7 +153,20 @@ class JavaIndexer:
     ) -> IndexResult:
         root_path = os.path.abspath(root_path)
         if project_id is None:
-            project_id = os.path.basename(root_path)
+            # Reuse the existing project ID for this path if one exists.
+            # This prevents ID drift when the same module is re-indexed
+            # directly (vision-server) vs from a workspace root (vision::vision-server).
+            try:
+                existing = self.store.query_records(
+                    "MATCH (p:Project) WHERE p.path = $path RETURN p.id as id LIMIT 1",
+                    {"path": root_path},
+                )
+                if existing:
+                    project_id = existing[0]["id"]
+            except Exception:
+                pass
+            if project_id is None:
+                project_id = os.path.basename(root_path)
         current_files = self._collect_java_files(root_path)
         self._emit(progress, "scan_done", files_found=len(current_files))
         db_files = self.store.project_file_hashes(project_id) if not full else {}
@@ -336,6 +349,21 @@ class JavaIndexer:
                         }
                     )
                     classes_indexed += 1
+
+                    for fld in cls.fields:
+                        fqfield = f"{cls.fqcn}#{fld.name}"
+                        symbol_rows.append(
+                            {
+                                "id": symbol_id("field", fqfield, scope),
+                                "kind": "field",
+                                "name": fld.name,
+                                "fqname": fqfield,
+                                "file_id": f_id,
+                                "line": fld.line,
+                                "col": fld.col,
+                                "embedding": embed_text(f"field {fqfield} {fld.type_name}") if embed else None,
+                            }
+                        )
 
                     for method in cls.methods:
                         m_id = method_id(cls.fqcn, method.signature, scope)
