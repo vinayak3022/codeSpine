@@ -297,14 +297,20 @@ class GraphStore:
         )
 
     def upsert_files_batch(self, records: list[dict[str, Any]]) -> None:
-        for record in records:
-            self.upsert_file(
-                file_id=record["id"],
-                path=record["path"],
-                project_id=record["project_id"],
-                is_test=bool(record["is_test"]),
-                digest=record["hash"],
-            )
+        if not records:
+            return
+        self.execute(
+            """
+            UNWIND $rows AS row
+            MERGE (f:File {id: row.id})
+            SET f.path = row.path,
+                f.project_id = row.project_id,
+                f.is_test = row.is_test,
+                f.hash = row.hash
+            """,
+            {"rows": [{"id": r["id"], "path": r["path"], "project_id": r["project_id"],
+                        "is_test": bool(r["is_test"]), "hash": r["hash"]} for r in records]},
+        )
 
     def upsert_class(self, class_id: str, fqcn: str, name: str, package: str, file_id: str) -> None:
         self.execute(
@@ -322,14 +328,20 @@ class GraphStore:
         )
 
     def upsert_classes_batch(self, records: list[dict[str, Any]]) -> None:
-        for record in records:
-            self.upsert_class(
-                class_id=record["id"],
-                fqcn=record["fqcn"],
-                name=record["name"],
-                package=record["package"],
-                file_id=record["file_id"],
-            )
+        if not records:
+            return
+        self.execute(
+            """
+            UNWIND $rows AS row
+            MERGE (c:Class {id: row.id})
+            SET c.fqcn = row.fqcn,
+                c.name = row.name,
+                c.package = row.package,
+                c.file_id = row.file_id
+            """,
+            {"rows": [{"id": r["id"], "fqcn": r["fqcn"], "name": r["name"],
+                        "package": r["package"], "file_id": r["file_id"]} for r in records]},
+        )
 
     def upsert_method(
         self,
@@ -370,17 +382,28 @@ class GraphStore:
         )
 
     def upsert_methods_batch(self, records: list[dict[str, Any]]) -> None:
-        for record in records:
-            self.upsert_method(
-                method_id=record["id"],
-                class_id=record["class_id"],
-                name=record["name"],
-                signature=record["signature"],
-                return_type=record["return_type"],
-                modifiers=record["modifiers"],
-                is_constructor=bool(record["is_constructor"]),
-                is_test=bool(record["is_test"]),
-            )
+        if not records:
+            return
+        # Single UNWIND: upsert node + HAS_METHOD relationship in one round-trip.
+        self.execute(
+            """
+            UNWIND $rows AS row
+            MATCH (c:Class {id: row.class_id})
+            MERGE (m:Method {id: row.id})
+            SET m.class_id = row.class_id,
+                m.name = row.name,
+                m.signature = row.signature,
+                m.return_type = row.return_type,
+                m.modifiers = row.modifiers,
+                m.is_constructor = row.is_constructor,
+                m.is_test = row.is_test
+            MERGE (c)-[:HAS_METHOD]->(m)
+            """,
+            {"rows": [{"id": r["id"], "class_id": r["class_id"], "name": r["name"],
+                        "signature": r["signature"], "return_type": r["return_type"],
+                        "modifiers": r["modifiers"], "is_constructor": bool(r["is_constructor"]),
+                        "is_test": bool(r["is_test"])} for r in records]},
+        )
 
     def upsert_symbol(
         self,
@@ -421,17 +444,28 @@ class GraphStore:
         )
 
     def upsert_symbols_batch(self, records: list[dict[str, Any]]) -> None:
-        for record in records:
-            self.upsert_symbol(
-                symbol_id=record["id"],
-                kind=record["kind"],
-                name=record["name"],
-                fqname=record["fqname"],
-                file_id=record["file_id"],
-                line=int(record["line"]),
-                col=int(record["col"]),
-                embedding=record.get("embedding"),
-            )
+        if not records:
+            return
+        # Single UNWIND: upsert node + DECLARES relationship in one round-trip.
+        self.execute(
+            """
+            UNWIND $rows AS row
+            MATCH (f:File {id: row.file_id})
+            MERGE (s:Symbol {id: row.id})
+            SET s.kind = row.kind,
+                s.name = row.name,
+                s.fqname = row.fqname,
+                s.file_id = row.file_id,
+                s.line = row.line,
+                s.col = row.col,
+                s.embedding = row.embedding
+            MERGE (f)-[:DECLARES]->(s)
+            """,
+            {"rows": [{"id": r["id"], "kind": r["kind"], "name": r["name"],
+                        "fqname": r["fqname"], "file_id": r["file_id"],
+                        "line": int(r["line"]), "col": int(r["col"]),
+                        "embedding": r.get("embedding")} for r in records]},
+        )
 
     def add_call(self, source_id: str, target_id: str, confidence: float, reason: str) -> None:
         self.execute(
@@ -448,13 +482,18 @@ class GraphStore:
         )
 
     def add_calls_batch(self, records: list[dict[str, Any]]) -> None:
-        for record in records:
-            self.add_call(
-                source_id=record["source_id"],
-                target_id=record["target_id"],
-                confidence=float(record["confidence"]),
-                reason=record["reason"],
-            )
+        if not records:
+            return
+        self.execute(
+            """
+            UNWIND $rows AS row
+            MATCH (src:Method {id: row.source_id}), (dst:Method {id: row.target_id})
+            MERGE (src)-[:CALLS {confidence: row.confidence, reason: row.reason}]->(dst)
+            """,
+            {"rows": [{"source_id": r["source_id"], "target_id": r["target_id"],
+                        "confidence": float(r["confidence"]), "reason": r["reason"]}
+                       for r in records]},
+        )
 
     def add_reference(self, rel: str, src_label: str, src_id: str, dst_label: str, dst_id: str, confidence: float) -> None:
         if rel not in {"REFERENCES_TYPE", "IMPLEMENTS", "OVERRIDES"}:
@@ -466,14 +505,25 @@ class GraphStore:
         self.execute(query, {"src_id": src_id, "dst_id": dst_id, "confidence": confidence})
 
     def add_references_batch(self, records: list[dict[str, Any]]) -> None:
-        for record in records:
-            self.add_reference(
-                rel=record["rel"],
-                src_label=record["src_label"],
-                src_id=record["src_id"],
-                dst_label=record["dst_label"],
-                dst_id=record["dst_id"],
-                confidence=float(record["confidence"]),
+        if not records:
+            return
+        # Group by (rel, src_label, dst_label) so each group can use a single UNWIND.
+        from collections import defaultdict
+        groups: dict[tuple, list[dict]] = defaultdict(list)
+        for rec in records:
+            rel = rec.get("rel")
+            if rel not in {"REFERENCES_TYPE", "IMPLEMENTS", "OVERRIDES"}:
+                continue
+            groups[(rel, rec["src_label"], rec["dst_label"])].append(
+                {"src_id": rec["src_id"], "dst_id": rec["dst_id"],
+                 "confidence": float(rec["confidence"])}
+            )
+        for (rel, src_label, dst_label), batch in groups.items():
+            self.execute(
+                f"UNWIND $rows AS row "
+                f"MATCH (s:{src_label} {{id: row.src_id}}), (d:{dst_label} {{id: row.dst_id}}) "
+                f"MERGE (s)-[:{rel} {{confidence: row.confidence}}]->(d)",
+                {"rows": batch},
             )
 
     def add_injection(
@@ -603,17 +653,17 @@ class GraphStore:
                 self.upsert_symbols_batch(batch)
             self._recycle_conn()
 
-        # 6. Write call edges in sub-batches of 500
+        # 6. Write call edges in sub-batches of 500 (normalise key names to match add_calls_batch)
         for i in range(0, len(calls), self._FILE_CALL_SUB_BATCH):
             batch = calls[i: i + self._FILE_CALL_SUB_BATCH]
+            normalised = [
+                {"source_id": rec["src"], "target_id": rec["dst"],
+                 "confidence": float(rec.get("confidence", 0.5)),
+                 "reason": rec.get("reason", "unknown")}
+                for rec in batch
+            ]
             with self.transaction():
-                for rec in batch:
-                    self.add_call(
-                        source_id=rec["src"],
-                        target_id=rec["dst"],
-                        confidence=float(rec.get("confidence", 0.5)),
-                        reason=rec.get("reason", "unknown"),
-                    )
+                self.add_calls_batch(normalised)
             self._recycle_conn()
 
         # 7. Write type relations (IMPLEMENTS, OVERRIDES, REFERENCES_TYPE)
