@@ -820,14 +820,56 @@ class GraphStore:
             },
         )
 
+    # Lock and flag for background snapshot coalescing.
+    # Only one snapshot runs at a time; a pending request supersedes queued ones.
+    _snapshot_lock: threading.Lock = threading.Lock()
+    _snapshot_pending: threading.Event = threading.Event()
+
     @staticmethod
-    def snapshot_to_read_replica() -> bool:
+    def snapshot_to_read_replica(background: bool = False) -> bool:
         """Atomically copy the write DB to the read-replica path.
 
         The read replica is used by the MCP daemon and all read-only CLI
         commands so they never contend with the write process's buffer pool.
-        Returns True on success, False if the source DB does not exist.
+
+        Parameters
+        ----------
+        background:
+            When True the copy runs in a daemon thread and this call returns
+            immediately (always returns True). Only one copy runs at a time;
+            rapid successive background calls are coalesced — the next copy
+            starts only after the current one finishes, so the sentinel is
+            always written with the *latest* data.
+
+        Returns True on success (or when dispatched to background), False if
+        the source DB does not exist.
         """
+        src = SETTINGS.db_path
+        if not os.path.exists(src):
+            return False
+
+        if background:
+            # Signal that a snapshot is wanted, then ensure a worker is running.
+            GraphStore._snapshot_pending.set()
+
+            def _worker() -> None:
+                while GraphStore._snapshot_pending.is_set():
+                    GraphStore._snapshot_pending.clear()
+                    with GraphStore._snapshot_lock:
+                        GraphStore._do_snapshot()
+
+            if not GraphStore._snapshot_lock.locked():
+                t = threading.Thread(target=_worker, daemon=True, name="codespine-snapshot")
+                t.start()
+            return True
+
+        # Foreground (blocking) path — used by CLI analyse and tests.
+        with GraphStore._snapshot_lock:
+            return GraphStore._do_snapshot()
+
+    @staticmethod
+    def _do_snapshot() -> bool:
+        """Perform the actual copy.  Must be called with _snapshot_lock held."""
         src = SETTINGS.db_path
         dst = SETTINGS.db_snapshot_path
         if not os.path.exists(src):

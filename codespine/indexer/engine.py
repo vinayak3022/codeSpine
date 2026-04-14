@@ -223,13 +223,18 @@ class JavaIndexer:
         file_batch_size = max(1, int(getattr(SETTINGS, "index_file_batch_size", 64)))
         edge_batch_size = max(1, int(getattr(SETTINGS, "edge_write_batch_size", 2000)))
 
-        method_catalog: dict[str, dict] = self._existing_method_catalog(project_id) if not full else {}
+        if not full:
+            method_catalog, class_catalog, fqcn_to_class_ids, class_methods = (
+                self._existing_catalogs(project_id)
+            )
+        else:
+            method_catalog: dict[str, dict] = {}
+            class_catalog: dict[str, list[str]] = {}
+            fqcn_to_class_ids: dict[str, list[str]] = {}
+            class_methods: dict[str, dict[str, str]] = {}
         method_calls: dict[str, list] = {}
         method_context: dict[str, dict] = {}
-        class_catalog: dict[str, list[str]] = self._existing_class_catalog(project_id) if not full else {}
-        fqcn_to_class_ids: dict[str, list[str]] = self._existing_class_ids_by_fqcn(project_id) if not full else {}
         class_meta: dict[str, dict] = {}
-        class_methods: dict[str, dict[str, str]] = self._existing_class_methods(project_id) if not full else {}
         di_classes: list[dict] = []  # accumulates DI metadata for resolver pass
 
         # ── Parallel parse (CPU/IO) ──────────────────────────────────────────
@@ -618,6 +623,69 @@ class JavaIndexer:
             meta_cache.pop(fid, None)
 
         return to_reindex, deleted_file_ids, meta_cache
+
+    def _existing_catalogs(
+        self, project_id: str
+    ) -> tuple[
+        dict[str, dict],          # method_catalog   (method_id → meta)
+        dict[str, list[str]],     # class_catalog    (class_name → [fqcn, ...])
+        dict[str, list[str]],     # fqcn_to_class_ids (fqcn → [class_id, ...])
+        dict[str, dict[str, str]] # class_methods    (class_id → {sig → method_id})
+    ]:
+        """Load all four incremental-index catalogs in a single DB round-trip."""
+        recs = self.store.query_records(
+            """
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid
+            RETURN m.id as method_id, m.name as mname, m.signature as signature,
+                   c.fqcn as class_fqcn, c.name as cname, c.id as class_id
+            """,
+            {"pid": project_id},
+        )
+        method_catalog: dict[str, dict] = {}
+        class_catalog: dict[str, list[str]] = {}
+        fqcn_to_class_ids: dict[str, list[str]] = {}
+        class_methods: dict[str, dict[str, str]] = {}
+        seen_fqcn_cid: set[tuple[str, str]] = set()
+        seen_name_fqcn: set[tuple[str, str]] = set()
+
+        for r in recs:
+            mid = r["method_id"]
+            sig = r.get("signature") or ""
+            arg_str = sig[sig.find("(") + 1: sig.rfind(")")] if "(" in sig and ")" in sig else ""
+            param_count = 0 if not arg_str else arg_str.count(",") + 1
+            cid = r.get("class_id", "")
+            fqcn = r.get("class_fqcn", "")
+            cname = r.get("cname", "")
+
+            method_catalog[mid] = {
+                "signature": sig,
+                "name": r.get("mname", ""),
+                "param_count": param_count,
+                "class_fqcn": fqcn,
+                "class_id": cid,
+            }
+
+            if fqcn and cid:
+                key_fc = (fqcn, cid)
+                if key_fc not in seen_fqcn_cid:
+                    seen_fqcn_cid.add(key_fc)
+                    fqcn_to_class_ids.setdefault(fqcn, [])
+                    if cid not in fqcn_to_class_ids[fqcn]:
+                        fqcn_to_class_ids[fqcn].append(cid)
+
+                key_nc = (cname, fqcn)
+                if key_nc not in seen_name_fqcn:
+                    seen_name_fqcn.add(key_nc)
+                    class_catalog.setdefault(cname, [])
+                    if fqcn not in class_catalog[cname]:
+                        class_catalog[cname].append(fqcn)
+
+            if cid:
+                class_methods.setdefault(cid, {})
+                class_methods[cid][sig] = mid
+
+        return method_catalog, class_catalog, fqcn_to_class_ids, class_methods
 
     def _existing_method_catalog(self, project_id: str) -> dict[str, dict]:
         recs = self.store.query_records(

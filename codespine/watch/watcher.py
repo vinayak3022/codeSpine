@@ -304,8 +304,9 @@ def run_watch_mode(
                             except Exception:
                                 pass
                         # Snapshot once after processing all modules for this commit.
+                        # Run in background so re-index latency isn't blocked by the copy.
                         try:
-                            store.snapshot_to_read_replica()
+                            store.snapshot_to_read_replica(background=True)
                         except Exception as exc:
                             LOGGER.warning("watch: snapshot after commit failed: %s", exc)
                     else:
@@ -354,9 +355,10 @@ def run_watch_mode(
                 )
 
             # Snapshot to read replica after each file-change batch so the MCP
-            # server picks up the new data without restarting.
+            # server picks up the new data without restarting.  Run in background
+            # so rapid file saves don't block re-index latency.
             try:
-                store.snapshot_to_read_replica()
+                store.snapshot_to_read_replica(background=True)
             except Exception as exc:
                 LOGGER.warning("watch: snapshot failed: %s", exc)
     finally:

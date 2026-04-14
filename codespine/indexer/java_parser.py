@@ -10,6 +10,12 @@ from tree_sitter import Language, Parser, Query
 JAVA_LANGUAGE = Language(tsjava.language())
 PARSER = Parser(JAVA_LANGUAGE)
 
+# Pre-compiled regexes used in the hot path (_normalize_java_bytes is called
+# once per method/class body for digest computation).
+_RE_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_RE_LINE_COMMENT = re.compile(r"//.*?$", re.MULTILINE)
+_RE_WHITESPACE = re.compile(r"\s+")
+
 
 @dataclass
 class ParsedMethod:
@@ -142,9 +148,9 @@ def _hash_node(node) -> str:
 
 def _normalize_java_bytes(source: bytes) -> str:
     text = source.decode("utf-8", errors="ignore")
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = _RE_BLOCK_COMMENT.sub("", text)
+    text = _RE_LINE_COMMENT.sub("", text)
+    text = _RE_WHITESPACE.sub(" ", text).strip()
     return text
 
 
@@ -218,54 +224,53 @@ _DI_PROVIDER_ANNOTATIONS = frozenset({"Provides", "Bean"})
 
 
 def _extract_field_types(class_node) -> tuple[dict[str, str], list[ParsedField]]:
-    # Query for field_declaration nodes (not just type/name captures) so we can
-    # inspect modifiers for injection annotations.
+    """Extract field names→types and DI annotations from a class node.
+
+    Single O(N) pass: iterate field_declaration nodes directly, extract the
+    type + annotations once per declaration, then yield all variable declarators.
+    This avoids the previous O(N²) approach that scanned all field_decl_nodes
+    for each variable name to find its enclosing declaration.
+    """
     field_decl_q = Query(
         JAVA_LANGUAGE,
         "(field_declaration) @field_decl",
     )
-    name_type_q = Query(
-        JAVA_LANGUAGE,
-        """
-        (field_declaration
-          type: (_) @type
-          declarator: (variable_declarator name: (identifier) @name))
-        """,
-    )
-    # Build a map from (type, name) to the field_declaration node so we can
-    # look up annotations afterward.
-    field_decl_nodes: list = [n for n, _ in _captures(field_decl_q, class_node)]
 
     field_map: dict[str, str] = {}
     field_list: list[ParsedField] = []
-    captures = _captures(name_type_q, class_node)
-    current_type = None
-    for node, tag in captures:
-        if tag == "type":
-            current_type = _node_type_name(node)
-        elif tag == "name" and current_type:
-            name = _text(node)
-            field_map[name] = current_type
 
-            # Find the enclosing field_declaration to check annotations.
-            injection_annotation: str | None = None
-            qualifier: str | None = None
-            for fd_node in field_decl_nodes:
-                if fd_node.start_byte <= node.start_byte <= fd_node.end_byte:
-                    _, fd_annotations = _extract_modifiers_and_annotations(fd_node)
-                    for ann in fd_annotations:
-                        ann_simple = ann.split(".")[-1]
-                        if ann_simple in _DI_FIELD_ANNOTATIONS:
-                            injection_annotation = ann_simple
-                        if ann_simple in _DI_QUALIFIER_ANNOTATIONS:
-                            qualifier = ann_simple
-                    break
+    for fd_node, _ in _captures(field_decl_q, class_node):
+        # Resolve annotations once per field_declaration (shared by all declarators).
+        _, fd_annotations = _extract_modifiers_and_annotations(fd_node)
+        injection_annotation: str | None = None
+        qualifier: str | None = None
+        for ann in fd_annotations:
+            ann_simple = ann.split(".")[-1]
+            if ann_simple in _DI_FIELD_ANNOTATIONS:
+                injection_annotation = ann_simple
+            if ann_simple in _DI_QUALIFIER_ANNOTATIONS:
+                qualifier = ann_simple
 
+        # Resolve the declared type (shared across all declarators in this declaration).
+        type_node = fd_node.child_by_field_name("type")
+        type_name = _node_type_name(type_node) if type_node else None
+        if not type_name:
+            continue
+
+        # Each variable_declarator within this declaration shares the same type + annotations.
+        for child in fd_node.named_children:
+            if child.type != "variable_declarator":
+                continue
+            name_node = child.child_by_field_name("name")
+            if name_node is None:
+                continue
+            name = _text(name_node)
+            field_map[name] = type_name
             field_list.append(ParsedField(
                 name=name,
-                type_name=current_type,
-                line=node.start_point[0] + 1,
-                col=node.start_point[1] + 1,
+                type_name=type_name,
+                line=name_node.start_point[0] + 1,
+                col=name_node.start_point[1] + 1,
                 injection_annotation=injection_annotation,
                 qualifier=qualifier,
             ))

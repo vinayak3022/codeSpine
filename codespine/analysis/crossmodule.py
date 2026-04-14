@@ -90,7 +90,31 @@ def link_cross_module_calls(store, project_ids: list[str] | None = None, progres
         if len(c["name"]) > _MIN_CLASS_NAME_LEN:
             classes_per_project[c["pid"]].add(c["name"])
 
-    # ── 3. Scan methods for cross-project type references ─────────────
+    # ── 3. Pre-load all destination-class methods in ONE bulk query ───────
+    # Collect every class ID that belongs to a project OTHER than its own so
+    # we can load their methods in one round-trip instead of one per class.
+    all_cross_cids: set[str] = set()
+    for c in all_classes:
+        if len(c["name"]) > _MIN_CLASS_NAME_LEN:
+            all_cross_cids.add(c["cid"])
+
+    _ping(f"loading methods for {len(all_cross_cids)} cross-module classes")
+    dst_methods_by_cid: dict[str, list[dict]] = defaultdict(list)
+    if all_cross_cids:
+        bulk = store.query_records(
+            """
+            MATCH (m:Method)
+            WHERE m.class_id IN $cids
+            RETURN m.id as mid, m.name as name, m.signature as sig,
+                   m.modifiers as modifiers, m.is_constructor as is_ctor,
+                   m.class_id as cid
+            """,
+            {"cids": list(all_cross_cids)},
+        )
+        for dm in bulk:
+            dst_methods_by_cid[dm["cid"]].append(dm)
+
+    # ── 4. Scan methods for cross-project type references ─────────────
     new_edges = 0
     seen: set[tuple[str, str]] = set()
 
@@ -127,19 +151,13 @@ def link_cross_module_calls(store, project_ids: list[str] | None = None, progres
             if not matched_class_names:
                 continue
 
-            # For each matched class, create CALLS edges
+            # For each matched class, create CALLS edges using pre-loaded methods.
             for class_name in matched_class_names:
                 for dst_cid, dst_pid in name_to_classes.get(class_name, []):
                     if dst_pid == src_pid:
                         continue  # same project — not cross-module
 
-                    # Get methods of the destination class
-                    dst_methods = store.query_records(
-                        """MATCH (m:Method) WHERE m.class_id = $cid
-                           RETURN m.id as mid, m.name as name, m.signature as sig,
-                                  m.modifiers as modifiers, m.is_constructor as is_ctor""",
-                        {"cid": dst_cid},
-                    )
+                    dst_methods = dst_methods_by_cid.get(dst_cid)
                     if not dst_methods:
                         continue
 
