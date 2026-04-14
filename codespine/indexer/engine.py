@@ -221,7 +221,7 @@ class JavaIndexer:
         calls_resolved = 0
         type_relationships = 0
         file_batch_size = max(1, int(getattr(SETTINGS, "index_file_batch_size", 64)))
-        edge_batch_size = max(1, int(getattr(SETTINGS, "edge_write_batch_size", 2000)))
+        edge_batch_size = max(1, int(getattr(SETTINGS, "edge_write_batch_size", 5000)))
 
         if not full:
             method_catalog, class_catalog, fqcn_to_class_ids, class_methods = (
@@ -480,22 +480,36 @@ class JavaIndexer:
                 self.store._recycle_conn()
 
         self._emit(progress, "resolve_calls_start")
-        call_rows: list[dict] = []
-        for src, dst, confidence, reason in resolve_calls(method_catalog, method_calls, method_context, class_catalog):
-            call_rows.append(
-                {
-                    "source_id": src,
-                    "target_id": dst,
-                    "confidence": confidence,
-                    "reason": reason,
-                }
+        # Deduplicate (src, dst) pairs — the same pair can appear many times when
+        # a method calls another method multiple times at different call sites.
+        # Keep the highest-confidence resolution to avoid N writes per pair.
+        best_calls: dict[tuple[str, str], tuple[float, str]] = {}
+        for src, dst, confidence, reason in resolve_calls(
+            method_catalog, method_calls, method_context, class_catalog
+        ):
+            key = (src, dst)
+            if key not in best_calls or confidence > best_calls[key][0]:
+                best_calls[key] = (confidence, reason)
+
+        # Stream writes in batches — never hold the full set in RAM.
+        call_buf: list[dict] = []
+        for (src, dst), (confidence, reason) in best_calls.items():
+            call_buf.append(
+                {"source_id": src, "target_id": dst,
+                 "confidence": confidence, "reason": reason}
             )
-        for call_chunk in self._chunked(call_rows, edge_batch_size):
+            if len(call_buf) >= edge_batch_size:
+                with self.store.transaction():
+                    self.store.add_calls_batch(call_buf)
+                calls_resolved += len(call_buf)
+                self.store._recycle_conn()
+                self._emit(progress, "resolve_calls_progress", calls_resolved=calls_resolved)
+                call_buf = []
+        if call_buf:
             with self.store.transaction():
-                self.store.add_calls_batch(call_chunk)
-            calls_resolved += len(call_chunk)
+                self.store.add_calls_batch(call_buf)
+            calls_resolved += len(call_buf)
             self.store._recycle_conn()
-            self._emit(progress, "resolve_calls_progress", calls_resolved=calls_resolved)
         self._emit(progress, "resolve_calls_done", calls_resolved=calls_resolved)
 
         self._emit(progress, "resolve_types_start")

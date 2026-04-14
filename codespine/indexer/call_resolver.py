@@ -5,7 +5,7 @@ from typing import Iterator
 
 from codespine.noise.blocklist import MIN_FUZZY_NAME_LEN, NOISE_METHOD_NAMES
 
-MAX_FUZZY_TARGETS = 12
+MAX_FUZZY_TARGETS = 6  # reduced from 12 — keeps precision, halves low-confidence edge fan-out
 
 
 def _simple_type_name(type_name: str | None) -> str:

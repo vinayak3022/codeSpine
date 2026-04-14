@@ -527,15 +527,27 @@ class GraphStore:
         rows = [{"source_id": r["source_id"], "target_id": r["target_id"],
                   "confidence": float(r["confidence"]), "reason": r["reason"]}
                  for r in records]
-        op = "CREATE" if create_mode else "MERGE"
-        self.execute(
-            f"""
-            UNWIND $rows AS row
-            MATCH (src:Method {{id: row.source_id}}), (dst:Method {{id: row.target_id}})
-            {op} (src)-[:CALLS {{confidence: row.confidence, reason: row.reason}}]->(dst)
-            """,
-            {"rows": rows},
-        )
+        if create_mode:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (src:Method {id: row.source_id}), (dst:Method {id: row.target_id})
+                CREATE (src)-[:CALLS {confidence: row.confidence, reason: row.reason}]->(dst)
+                """,
+                {"rows": rows},
+            )
+        else:
+            # Properties are SET, not part of the MERGE pattern — ensures at most
+            # one CALLS edge per (src, dst) pair regardless of confidence value.
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (src:Method {id: row.source_id}), (dst:Method {id: row.target_id})
+                MERGE (src)-[r:CALLS]->(dst)
+                SET r.confidence = row.confidence, r.reason = row.reason
+                """,
+                {"rows": rows},
+            )
 
     def add_reference(self, rel: str, src_label: str, src_id: str, dst_label: str, dst_id: str, confidence: float) -> None:
         if rel not in {"REFERENCES_TYPE", "IMPLEMENTS", "OVERRIDES"}:
