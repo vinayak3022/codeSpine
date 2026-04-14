@@ -671,28 +671,30 @@ class GraphStore:
             self.clear_file(f_id)
         self._recycle_conn()
 
-        # 2–5. Write all nodes with CREATE (clear_file above guarantees absence).
+        # 2. Upsert file record
         with self.transaction():
             self.upsert_files_batch(
                 [{"id": f_id, "path": path, "project_id": project_id,
                   "is_test": is_test, "hash": digest}],
-                create_mode=True,
             )
         self._recycle_conn()
 
+        # 3. Upsert classes (typically very few per file)
         if classes:
             with self.transaction():
-                self.upsert_classes_batch(classes, create_mode=True)
+                self.upsert_classes_batch(classes)
             self._recycle_conn()
 
+        # 4. Upsert methods in sub-batches of 200
         for i in range(0, len(methods), self._FILE_METHOD_SUB_BATCH):
             with self.transaction():
-                self.upsert_methods_batch(methods[i: i + self._FILE_METHOD_SUB_BATCH], create_mode=True)
+                self.upsert_methods_batch(methods[i: i + self._FILE_METHOD_SUB_BATCH])
             self._recycle_conn()
 
+        # 5. Upsert symbols in sub-batches of 200
         for i in range(0, len(symbols), self._FILE_SYMBOL_SUB_BATCH):
             with self.transaction():
-                self.upsert_symbols_batch(symbols[i: i + self._FILE_SYMBOL_SUB_BATCH], create_mode=True)
+                self.upsert_symbols_batch(symbols[i: i + self._FILE_SYMBOL_SUB_BATCH])
             self._recycle_conn()
 
         # 6. Write call edges in sub-batches of 500 (normalise key names to match add_calls_batch)
@@ -705,14 +707,14 @@ class GraphStore:
                 for rec in batch
             ]
             with self.transaction():
-                self.add_calls_batch(normalised, create_mode=True)
+                self.add_calls_batch(normalised)
             self._recycle_conn()
 
         # 7. Write type relations (IMPLEMENTS, OVERRIDES, REFERENCES_TYPE)
         for i in range(0, len(type_rels), self._FILE_REL_SUB_BATCH):
             batch = type_rels[i: i + self._FILE_REL_SUB_BATCH]
             with self.transaction():
-                self.add_references_batch(batch, create_mode=True)
+                self.add_references_batch(batch)
             self._recycle_conn()
 
     def clear_file_by_path(self, project_id: str, project_path: str, file_path: str) -> None:

@@ -462,23 +462,21 @@ class JavaIndexer:
                     with self.store.transaction():
                         self.store.clear_files_batch(clear_sub)
                     self.store._recycle_conn()
-            # Always CREATE — full clears via clear_project, incremental clears
-            # per-file above, so nodes are guaranteed absent in both paths.
             with self.store.transaction():
-                self.store.upsert_files_batch(file_rows, create_mode=True)
+                self.store.upsert_files_batch(file_rows)
             self.store._recycle_conn()
             with self.store.transaction():
-                self.store.upsert_classes_batch(class_rows, create_mode=True)
+                self.store.upsert_classes_batch(class_rows)
             self.store._recycle_conn()
             _METHOD_SUB_BATCH = 200
             for method_sub in self._chunked(method_rows, _METHOD_SUB_BATCH):
                 with self.store.transaction():
-                    self.store.upsert_methods_batch(method_sub, create_mode=True)
+                    self.store.upsert_methods_batch(method_sub)
                 self.store._recycle_conn()
             _SYMBOL_SUB_BATCH = 200
             for symbol_sub in self._chunked(symbol_rows, _SYMBOL_SUB_BATCH):
                 with self.store.transaction():
-                    self.store.upsert_symbols_batch(symbol_sub, create_mode=True)
+                    self.store.upsert_symbols_batch(symbol_sub)
                 self.store._recycle_conn()
 
         self._emit(progress, "resolve_calls_start")
@@ -494,7 +492,7 @@ class JavaIndexer:
             )
         for call_chunk in self._chunked(call_rows, edge_batch_size):
             with self.store.transaction():
-                self.store.add_calls_batch(call_chunk, create_mode=True)
+                self.store.add_calls_batch(call_chunk)
             calls_resolved += len(call_chunk)
             self.store._recycle_conn()
             self._emit(progress, "resolve_calls_progress", calls_resolved=calls_resolved)
@@ -509,7 +507,7 @@ class JavaIndexer:
         )
         for rel_chunk in self._chunked(type_rows, edge_batch_size):
             with self.store.transaction():
-                self.store.add_references_batch(rel_chunk, create_mode=True)
+                self.store.add_references_batch(rel_chunk)
             type_relationships += len(rel_chunk)
             self.store._recycle_conn()
         self._emit(progress, "resolve_types_done", type_relationships=type_relationships)
