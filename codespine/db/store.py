@@ -147,13 +147,15 @@ class GraphStore:
 
     def clear_project(self, project_id: str) -> None:
         file_recs = self.query_records("MATCH (f:File) WHERE f.project_id = $pid RETURN f.id as id", {"pid": project_id})
-        # Small batches (10 files per tx) prevent buffer pool OOM on large projects.
-        for idx, rec in enumerate(file_recs, start=1):
-            with self.transaction():
-                self.clear_file(rec["id"])
-            if idx % 10 == 0:
+        file_ids = [r["id"] for r in file_recs]
+        # Bulk-delete in chunks of 200 to avoid WAL exhaustion on very large projects.
+        _CLEAR_CHUNK = 200
+        for i in range(0, max(1, len(file_ids)), _CLEAR_CHUNK):
+            chunk = file_ids[i: i + _CLEAR_CHUNK]
+            if chunk:
+                with self.transaction():
+                    self.clear_files_batch(chunk)
                 self._recycle_conn()
-        self._recycle_conn()
         self.execute("MATCH (p:Project) WHERE p.id = $pid DETACH DELETE p", {"pid": project_id})
         self._recycle_conn()
 
@@ -242,34 +244,32 @@ class GraphStore:
         return {r["id"]: {"path": r.get("path", ""), "hash": r.get("hash", "")} for r in recs}
 
     def clear_file(self, file_id: str) -> None:
+        self.clear_files_batch([file_id])
+
+    def clear_files_batch(self, file_ids: list[str]) -> None:
+        """Delete all graph data for a set of files in 4 bulk queries instead of 4×N."""
+        if not file_ids:
+            return
+        fids = list(file_ids)
         self.execute(
-            """
-            MATCH (s:Symbol) WHERE s.file_id = $fid
-            DETACH DELETE s
-            """,
-            {"fid": file_id},
+            "MATCH (s:Symbol) WHERE s.file_id IN $fids DETACH DELETE s",
+            {"fids": fids},
         )
         self.execute(
             """
             MATCH (m:Method), (c:Class)
-            WHERE m.class_id = c.id AND c.file_id = $fid
+            WHERE m.class_id = c.id AND c.file_id IN $fids
             DETACH DELETE m
             """,
-            {"fid": file_id},
+            {"fids": fids},
         )
         self.execute(
-            """
-            MATCH (c:Class) WHERE c.file_id = $fid
-            DETACH DELETE c
-            """,
-            {"fid": file_id},
+            "MATCH (c:Class) WHERE c.file_id IN $fids DETACH DELETE c",
+            {"fids": fids},
         )
         self.execute(
-            """
-            MATCH (f:File {id: $fid})
-            DETACH DELETE f
-            """,
-            {"fid": file_id},
+            "MATCH (f:File) WHERE f.id IN $fids DETACH DELETE f",
+            {"fids": fids},
         )
 
     def list_methods(self) -> list[dict[str, Any]]:
@@ -296,21 +296,30 @@ class GraphStore:
             },
         )
 
-    def upsert_files_batch(self, records: list[dict[str, Any]]) -> None:
+    def upsert_files_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
             return
-        self.execute(
-            """
-            UNWIND $rows AS row
-            MERGE (f:File {id: row.id})
-            SET f.path = row.path,
-                f.project_id = row.project_id,
-                f.is_test = row.is_test,
-                f.hash = row.hash
-            """,
-            {"rows": [{"id": r["id"], "path": r["path"], "project_id": r["project_id"],
-                        "is_test": bool(r["is_test"]), "hash": r["hash"]} for r in records]},
-        )
+        rows = [{"id": r["id"], "path": r["path"], "project_id": r["project_id"],
+                  "is_test": bool(r["is_test"]), "hash": r["hash"]} for r in records]
+        if create_mode:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                CREATE (f:File {id: row.id, path: row.path, project_id: row.project_id,
+                                is_test: row.is_test, hash: row.hash})
+                """,
+                {"rows": rows},
+            )
+        else:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MERGE (f:File {id: row.id})
+                SET f.path = row.path, f.project_id = row.project_id,
+                    f.is_test = row.is_test, f.hash = row.hash
+                """,
+                {"rows": rows},
+            )
 
     def upsert_class(self, class_id: str, fqcn: str, name: str, package: str, file_id: str) -> None:
         self.execute(
@@ -327,21 +336,30 @@ class GraphStore:
             },
         )
 
-    def upsert_classes_batch(self, records: list[dict[str, Any]]) -> None:
+    def upsert_classes_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
             return
-        self.execute(
-            """
-            UNWIND $rows AS row
-            MERGE (c:Class {id: row.id})
-            SET c.fqcn = row.fqcn,
-                c.name = row.name,
-                c.package = row.package,
-                c.file_id = row.file_id
-            """,
-            {"rows": [{"id": r["id"], "fqcn": r["fqcn"], "name": r["name"],
-                        "package": r["package"], "file_id": r["file_id"]} for r in records]},
-        )
+        rows = [{"id": r["id"], "fqcn": r["fqcn"], "name": r["name"],
+                  "package": r["package"], "file_id": r["file_id"]} for r in records]
+        if create_mode:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                CREATE (c:Class {id: row.id, fqcn: row.fqcn, name: row.name,
+                                  package: row.package, file_id: row.file_id})
+                """,
+                {"rows": rows},
+            )
+        else:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MERGE (c:Class {id: row.id})
+                SET c.fqcn = row.fqcn, c.name = row.name,
+                    c.package = row.package, c.file_id = row.file_id
+                """,
+                {"rows": rows},
+            )
 
     def upsert_method(
         self,
@@ -381,29 +399,42 @@ class GraphStore:
             {"cid": class_id, "mid": method_id},
         )
 
-    def upsert_methods_batch(self, records: list[dict[str, Any]]) -> None:
+    def upsert_methods_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
             return
-        # Single UNWIND: upsert node + HAS_METHOD relationship in one round-trip.
-        self.execute(
-            """
-            UNWIND $rows AS row
-            MATCH (c:Class {id: row.class_id})
-            MERGE (m:Method {id: row.id})
-            SET m.class_id = row.class_id,
-                m.name = row.name,
-                m.signature = row.signature,
-                m.return_type = row.return_type,
-                m.modifiers = row.modifiers,
-                m.is_constructor = row.is_constructor,
-                m.is_test = row.is_test
-            MERGE (c)-[:HAS_METHOD]->(m)
-            """,
-            {"rows": [{"id": r["id"], "class_id": r["class_id"], "name": r["name"],
-                        "signature": r["signature"], "return_type": r["return_type"],
-                        "modifiers": r["modifiers"], "is_constructor": bool(r["is_constructor"]),
-                        "is_test": bool(r["is_test"])} for r in records]},
-        )
+        rows = [{"id": r["id"], "class_id": r["class_id"], "name": r["name"],
+                  "signature": r["signature"], "return_type": r["return_type"],
+                  "modifiers": r["modifiers"], "is_constructor": bool(r["is_constructor"]),
+                  "is_test": bool(r["is_test"])} for r in records]
+        if create_mode:
+            # After clear_file, nodes are guaranteed absent — CREATE skips the
+            # primary-key existence check that MERGE pays on every row.
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (c:Class {id: row.class_id})
+                CREATE (m:Method {id: row.id, class_id: row.class_id, name: row.name,
+                                   signature: row.signature, return_type: row.return_type,
+                                   modifiers: row.modifiers, is_constructor: row.is_constructor,
+                                   is_test: row.is_test})
+                CREATE (c)-[:HAS_METHOD]->(m)
+                """,
+                {"rows": rows},
+            )
+        else:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (c:Class {id: row.class_id})
+                MERGE (m:Method {id: row.id})
+                SET m.class_id = row.class_id, m.name = row.name,
+                    m.signature = row.signature, m.return_type = row.return_type,
+                    m.modifiers = row.modifiers, m.is_constructor = row.is_constructor,
+                    m.is_test = row.is_test
+                MERGE (c)-[:HAS_METHOD]->(m)
+                """,
+                {"rows": rows},
+            )
 
     def upsert_symbol(
         self,
@@ -443,29 +474,38 @@ class GraphStore:
             {"fid": file_id, "sid": symbol_id},
         )
 
-    def upsert_symbols_batch(self, records: list[dict[str, Any]]) -> None:
+    def upsert_symbols_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
             return
-        # Single UNWIND: upsert node + DECLARES relationship in one round-trip.
-        self.execute(
-            """
-            UNWIND $rows AS row
-            MATCH (f:File {id: row.file_id})
-            MERGE (s:Symbol {id: row.id})
-            SET s.kind = row.kind,
-                s.name = row.name,
-                s.fqname = row.fqname,
-                s.file_id = row.file_id,
-                s.line = row.line,
-                s.col = row.col,
-                s.embedding = row.embedding
-            MERGE (f)-[:DECLARES]->(s)
-            """,
-            {"rows": [{"id": r["id"], "kind": r["kind"], "name": r["name"],
-                        "fqname": r["fqname"], "file_id": r["file_id"],
-                        "line": int(r["line"]), "col": int(r["col"]),
-                        "embedding": r.get("embedding")} for r in records]},
-        )
+        rows = [{"id": r["id"], "kind": r["kind"], "name": r["name"],
+                  "fqname": r["fqname"], "file_id": r["file_id"],
+                  "line": int(r["line"]), "col": int(r["col"]),
+                  "embedding": r.get("embedding")} for r in records]
+        if create_mode:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (f:File {id: row.file_id})
+                CREATE (s:Symbol {id: row.id, kind: row.kind, name: row.name,
+                                   fqname: row.fqname, file_id: row.file_id,
+                                   line: row.line, col: row.col, embedding: row.embedding})
+                CREATE (f)-[:DECLARES]->(s)
+                """,
+                {"rows": rows},
+            )
+        else:
+            self.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (f:File {id: row.file_id})
+                MERGE (s:Symbol {id: row.id})
+                SET s.kind = row.kind, s.name = row.name, s.fqname = row.fqname,
+                    s.file_id = row.file_id, s.line = row.line, s.col = row.col,
+                    s.embedding = row.embedding
+                MERGE (f)-[:DECLARES]->(s)
+                """,
+                {"rows": rows},
+            )
 
     def add_call(self, source_id: str, target_id: str, confidence: float, reason: str) -> None:
         self.execute(
@@ -481,18 +521,20 @@ class GraphStore:
             },
         )
 
-    def add_calls_batch(self, records: list[dict[str, Any]]) -> None:
+    def add_calls_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
             return
+        rows = [{"source_id": r["source_id"], "target_id": r["target_id"],
+                  "confidence": float(r["confidence"]), "reason": r["reason"]}
+                 for r in records]
+        op = "CREATE" if create_mode else "MERGE"
         self.execute(
-            """
+            f"""
             UNWIND $rows AS row
-            MATCH (src:Method {id: row.source_id}), (dst:Method {id: row.target_id})
-            MERGE (src)-[:CALLS {confidence: row.confidence, reason: row.reason}]->(dst)
+            MATCH (src:Method {{id: row.source_id}}), (dst:Method {{id: row.target_id}})
+            {op} (src)-[:CALLS {{confidence: row.confidence, reason: row.reason}}]->(dst)
             """,
-            {"rows": [{"source_id": r["source_id"], "target_id": r["target_id"],
-                        "confidence": float(r["confidence"]), "reason": r["reason"]}
-                       for r in records]},
+            {"rows": rows},
         )
 
     def add_reference(self, rel: str, src_label: str, src_id: str, dst_label: str, dst_id: str, confidence: float) -> None:
@@ -504,7 +546,7 @@ class GraphStore:
         )
         self.execute(query, {"src_id": src_id, "dst_id": dst_id, "confidence": confidence})
 
-    def add_references_batch(self, records: list[dict[str, Any]]) -> None:
+    def add_references_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
             return
         # Group by (rel, src_label, dst_label) so each group can use a single UNWIND.
@@ -518,11 +560,12 @@ class GraphStore:
                 {"src_id": rec["src_id"], "dst_id": rec["dst_id"],
                  "confidence": float(rec["confidence"])}
             )
+        op = "CREATE" if create_mode else "MERGE"
         for (rel, src_label, dst_label), batch in groups.items():
             self.execute(
                 f"UNWIND $rows AS row "
                 f"MATCH (s:{src_label} {{id: row.src_id}}), (d:{dst_label} {{id: row.dst_id}}) "
-                f"MERGE (s)-[:{rel} {{confidence: row.confidence}}]->(d)",
+                f"{op} (s)-[:{rel} {{confidence: row.confidence}}]->(d)",
                 {"rows": batch},
             )
 
@@ -628,29 +671,28 @@ class GraphStore:
             self.clear_file(f_id)
         self._recycle_conn()
 
-        # 2. Upsert file record
+        # 2–5. Write all nodes with CREATE (clear_file above guarantees absence).
         with self.transaction():
-            self.upsert_file(f_id, path, project_id, is_test, digest)
+            self.upsert_files_batch(
+                [{"id": f_id, "path": path, "project_id": project_id,
+                  "is_test": is_test, "hash": digest}],
+                create_mode=True,
+            )
         self._recycle_conn()
 
-        # 3. Upsert classes (typically very few per file)
         if classes:
             with self.transaction():
-                self.upsert_classes_batch(classes)
+                self.upsert_classes_batch(classes, create_mode=True)
             self._recycle_conn()
 
-        # 4. Upsert methods in sub-batches of 200
         for i in range(0, len(methods), self._FILE_METHOD_SUB_BATCH):
-            batch = methods[i: i + self._FILE_METHOD_SUB_BATCH]
             with self.transaction():
-                self.upsert_methods_batch(batch)
+                self.upsert_methods_batch(methods[i: i + self._FILE_METHOD_SUB_BATCH], create_mode=True)
             self._recycle_conn()
 
-        # 5. Upsert symbols in sub-batches of 200
         for i in range(0, len(symbols), self._FILE_SYMBOL_SUB_BATCH):
-            batch = symbols[i: i + self._FILE_SYMBOL_SUB_BATCH]
             with self.transaction():
-                self.upsert_symbols_batch(batch)
+                self.upsert_symbols_batch(symbols[i: i + self._FILE_SYMBOL_SUB_BATCH], create_mode=True)
             self._recycle_conn()
 
         # 6. Write call edges in sub-batches of 500 (normalise key names to match add_calls_batch)
@@ -663,14 +705,14 @@ class GraphStore:
                 for rec in batch
             ]
             with self.transaction():
-                self.add_calls_batch(normalised)
+                self.add_calls_batch(normalised, create_mode=True)
             self._recycle_conn()
 
         # 7. Write type relations (IMPLEMENTS, OVERRIDES, REFERENCES_TYPE)
         for i in range(0, len(type_rels), self._FILE_REL_SUB_BATCH):
             batch = type_rels[i: i + self._FILE_REL_SUB_BATCH]
             with self.transaction():
-                self.add_references_batch(batch)
+                self.add_references_batch(batch, create_mode=True)
             self._recycle_conn()
 
     def clear_file_by_path(self, project_id: str, project_path: str, file_path: str) -> None:
