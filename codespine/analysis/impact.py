@@ -115,6 +115,41 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
             """
         )
 
+    # Augment with DI injection edges: for each target method's class, find all
+    # classes that @Inject it (or bind it via @Component/@Service) and add their
+    # methods as implicit callers at depth+1 with edge_type "DI_INJECT".
+    try:
+        di_edges = store.query_records(
+            """
+            MATCH (a:Method), (ca:Class), (b:Method), (cb:Class),
+                  (ca)-[r:INJECTS]->(cb)
+            WHERE a.class_id = ca.id AND b.class_id = cb.id
+            RETURN a.id as src, b.id as dst, 'DI_INJECT' as edge_type,
+                   coalesce(r.confidence, 0.8) as confidence,
+                   coalesce(r.binding_type, 'field_inject') as reason
+            """
+        )
+        edges = list(edges) + di_edges
+    except Exception:
+        pass  # INJECTS table may not exist on old DBs
+
+    # Also follow BINDS_INTERFACE — any class implementing the target's interface
+    # counts as an indirect caller.
+    try:
+        bi_edges = store.query_records(
+            """
+            MATCH (a:Method), (ca:Class), (b:Method), (cb:Class),
+                  (ca)-[r:BINDS_INTERFACE]->(cb)
+            WHERE a.class_id = ca.id AND b.class_id = cb.id
+            RETURN a.id as src, b.id as dst, 'INTERFACE_BINDING' as edge_type,
+                   coalesce(r.confidence, 0.9) as confidence,
+                   coalesce(r.reason, 'implements') as reason
+            """
+        )
+        edges = list(edges) + bi_edges
+    except Exception:
+        pass
+
     reverse_adj: dict[str, list[dict]] = defaultdict(list)
     for edge in edges:
         reverse_adj[edge["dst"]].append(edge)
@@ -184,13 +219,31 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
         for mid in target_method_ids
     ]
 
+    # FR-06: Separate "self_callers" (same class as target, depth=1) from
+    # impacted_callers so the output is unambiguous.
+    target_class_fqcns = {
+        target_meta.get(mid, {}).get("class_fqcn")
+        for mid in target_method_ids
+        if target_meta.get(mid, {}).get("class_fqcn")
+    }
+    self_callers: list[dict] = []
+    impacted_depth1: list[dict] = []
+    for item in depth_groups["1"]:
+        if item.get("class_fqcn") and item["class_fqcn"] in target_class_fqcns:
+            self_callers.append(item)
+        else:
+            impacted_depth1.append(item)
+    depth_groups["1"] = impacted_depth1
+
     return {
         "target": symbol_query,
-        "targets_resolved": resolved_targets,
-        "depth_groups": depth_groups,
+        "resolved_to": resolved_targets,
+        "self_callers": self_callers,
+        "impacted_callers": depth_groups,
         "summary": {
             "direct": len(depth_groups["1"]),
             "indirect": len(depth_groups["2"]),
             "transitive": len(depth_groups["3+"]),
+            "self_callers": len(self_callers),
         },
     }

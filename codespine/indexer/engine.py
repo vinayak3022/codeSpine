@@ -230,6 +230,7 @@ class JavaIndexer:
         fqcn_to_class_ids: dict[str, list[str]] = self._existing_class_ids_by_fqcn(project_id) if not full else {}
         class_meta: dict[str, dict] = {}
         class_methods: dict[str, dict[str, str]] = self._existing_class_methods(project_id) if not full else {}
+        di_classes: list[dict] = []  # accumulates DI metadata for resolver pass
 
         # ── Parallel parse (CPU/IO) ──────────────────────────────────────────
         # tree-sitter releases the GIL so ThreadPoolExecutor gives real speedup.
@@ -326,11 +327,13 @@ class JavaIndexer:
                     if c_id not in fqcn_to_class_ids[cls.fqcn]:
                         fqcn_to_class_ids[cls.fqcn].append(c_id)
                     class_meta[c_id] = {
+                        "id": c_id,
                         "fqcn": cls.fqcn,
                         "package": parsed.package,
                         "imports": parsed.imports,
                         "extends": cls.extends,
                         "interfaces": cls.interfaces,
+                        "annotations": cls.annotations,
                         "scope": scope,
                     }
                     class_methods.setdefault(c_id, {})
@@ -349,6 +352,38 @@ class JavaIndexer:
                         }
                     )
                     classes_indexed += 1
+
+                    # Collect DI metadata for the resolver pass.
+                    di_cls_entry: dict = {
+                        "id": c_id,
+                        "fqcn": cls.fqcn,
+                        "name": cls.name,
+                        "package": cls.package,
+                        "annotations": cls.annotations,
+                        "injected_fields": [
+                            {
+                                "name": f.name,
+                                "type_name": f.type_name,
+                                "injection_annotation": f.injection_annotation,
+                                "qualifier": f.qualifier,
+                            }
+                            for f in cls.fields
+                            if f.injection_annotation
+                        ],
+                        "methods_with_provides": [
+                            {
+                                "name": m.name,
+                                "provides_type": m.provides_type,
+                                "provides_annotation": next(
+                                    (a for a in m.annotations if a.split(".")[-1] in {"Provides", "Bean"}),
+                                    "Provides",
+                                ),
+                            }
+                            for m in cls.methods
+                            if m.provides_type
+                        ],
+                    }
+                    di_classes.append(di_cls_entry)
 
                     for fld in cls.fields:
                         fqfield = f"{cls.fqcn}#{fld.name}"
@@ -472,6 +507,42 @@ class JavaIndexer:
             type_relationships += len(rel_chunk)
             self.store._recycle_conn()
         self._emit(progress, "resolve_types_done", type_relationships=type_relationships)
+
+        # ── DI binding resolution ─────────────────────────────────────────────
+        # Resolve @Inject/@Autowired/@Provides/@Bean bindings into INJECTS and
+        # BINDS_INTERFACE graph edges.  This runs after all classes/methods are
+        # written so the full cross-project catalog is available for type lookup.
+        di_inject_rows: list[dict] = []
+        di_bind_rows: list[dict] = []
+        try:
+            from codespine.indexer.di_resolver import resolve_di_bindings
+            for tup in resolve_di_bindings(class_catalog, class_meta, di_classes, fqcn_to_class_ids):
+                src, dst, fw_or_conf, bt_or_reason, conf, edge_type = tup
+                if edge_type == "INJECTS":
+                    di_inject_rows.append({
+                        "src": src, "dst": dst,
+                        "framework": fw_or_conf, "binding_type": bt_or_reason,
+                        "confidence": conf,
+                    })
+                else:
+                    di_bind_rows.append({
+                        "src": src, "dst": dst,
+                        "confidence": float(fw_or_conf), "reason": bt_or_reason,
+                    })
+        except Exception as exc:
+            LOGGER.warning("DI resolver failed (non-fatal): %s", exc)
+
+        _DI_BATCH = 500
+        for chunk in self._chunked(di_inject_rows, _DI_BATCH):
+            with self.store.transaction():
+                self.store.add_injections_batch(chunk)
+            self.store._recycle_conn()
+        for chunk in self._chunked(di_bind_rows, _DI_BATCH):
+            with self.store.transaction():
+                self.store.add_interface_bindings_batch(chunk)
+            self.store._recycle_conn()
+        self._emit(progress, "di_done",
+                   injections=len(di_inject_rows), interface_bindings=len(di_bind_rows))
 
         self._prune_meta_cache(meta_cache, current_file_ids)
         self._save_file_meta_cache(project_id, meta_cache)

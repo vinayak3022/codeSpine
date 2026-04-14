@@ -51,6 +51,16 @@ REL_TABLES: Iterable[tuple[str, str]] = [
         "CO_CHANGED_WITH",
         "CREATE REL TABLE CO_CHANGED_WITH(FROM File TO File, strength DOUBLE, cochanges INT64, days INT64)",
     ),
+    # v5: Dependency-injection edges — tracks @Inject/@Autowired/@Provides/@Bean bindings
+    (
+        "INJECTS",
+        "CREATE REL TABLE INJECTS(FROM Class TO Class, framework STRING, binding_type STRING, confidence DOUBLE)",
+    ),
+    # v5: Interface-to-implementation bindings discovered via @Component/@Service annotations
+    (
+        "BINDS_INTERFACE",
+        "CREATE REL TABLE BINDS_INTERFACE(FROM Class TO Class, confidence DOUBLE, reason STRING)",
+    ),
 ]
 
 
@@ -81,7 +91,7 @@ def ensure_schema(conn) -> None:
 
     _safe_execute(
         conn,
-        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '4'",
+        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '5'",
     )
 
     _safe_execute(conn, "ALTER TABLE Project ADD indexed_commit STRING DEFAULT ''")

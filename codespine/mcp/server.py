@@ -38,8 +38,26 @@ def _json(data: dict) -> str:
     FastMCP double-serialises dict return values on many transports (SSE,
     stdio) producing duplicate JSON payloads that waste ~50 K tokens/session.
     Returning a pre-serialised string guarantees a single TextContent block.
+
+    Strips None values and empty containers to keep payloads compact.
     """
-    return _json_mod.dumps(data, separators=(",", ":"))
+    cleaned = {k: v for k, v in data.items() if v is not None and v != [] and v != {}}
+    return _json_mod.dumps(cleaned, separators=(",", ":"))
+
+
+def _safe_tool_response(fn_name: str, exc: Exception) -> str:
+    """Return a structured JSON error string — never a raw stack trace."""
+    msg = str(exc)
+    # Detect OOM / buffer pool exhaustion.
+    is_oom = isinstance(exc, MemoryError) or any(
+        m in msg.lower() for m in ("buffer pool", "out of memory", "oom", "cannot allocate")
+    )
+    return _json({
+        "available": False,
+        "error": "Analysis truncated due to memory limits." if is_oom else f"Tool error: {msg[:300]}",
+        "truncated": is_oom,
+        "tool": fn_name,
+    })
 
 
 def _git_available(path: str) -> bool:
@@ -108,12 +126,21 @@ def _staleness_meta(
     project: str | None = None,
     overlay_store=None,
     deep_scope: bool = False,
+    compact: bool = True,
 ) -> str:
     """Inject index staleness metadata into every tool response and serialise.
 
-    Adds ``index_age_seconds`` and ``stale_warning`` when the index is old.
+    In compact mode (the default) only fields that carry actionable information
+    are included — stale_warning when the index is > 1 h old, and overlay
+    status only when files are actually dirty.  This saves ~200-400 tokens per
+    call compared to always emitting all metadata fields.
+
+    Stale warnings are placed FIRST in the response dict so they are seen
+    immediately by LLM consumers.
+
     Returns a JSON string (not a dict) to avoid FastMCP double-serialisation.
     """
+    prefix: dict = {}
     try:
         if project:
             recs = store.query_records(
@@ -128,20 +155,31 @@ def _staleness_meta(
             ts = _parse_indexed_at(recs[0].get("ts"))
             if ts:
                 age = int(time.time()) - ts
-                response["index_age_seconds"] = age
-                response["indexed_at_epoch"] = ts
                 if age > 3600:
-                    response["stale_warning"] = (
+                    # Stale warning goes FIRST so LLMs see it immediately.
+                    prefix["stale_warning"] = (
                         f"Index is {age // 3600}h {(age % 3600) // 60}m old. "
                         "Run analyse_project() or start_watch() to refresh."
                     )
+                if not compact:
+                    response["index_age_seconds"] = age
+                    response["indexed_at_epoch"] = ts
     except Exception:
         pass
+
     if overlay_store is not None:
         try:
             summary = overlay_summary(overlay_store, project=project)
-            response.update(summary)
-            if project:
+            if compact:
+                # Only surface overlay info when there are actually dirty files.
+                if summary.get("overlay_present"):
+                    response["overlay_dirty_projects"] = summary.get("dirty_projects", [])
+                    response["overlay_dirty_files"] = summary.get("dirty_file_count", 0)
+                    if summary.get("deleted_file_count"):
+                        response["overlay_deleted_files"] = summary["deleted_file_count"]
+            else:
+                response.update(summary)
+            if project and not compact:
                 meta = store.get_project_metadata(project) or {}
                 response["base_indexed_commit"] = meta.get("indexed_commit", "")
                 response["working_head_commit"] = current_head(meta.get("path") or response.get("path") or "")
@@ -150,7 +188,10 @@ def _staleness_meta(
                 response["note"] = "Results reflect committed index only; uncommitted overlay changes are excluded."
         except Exception:
             pass
-    return _json(response)
+
+    # Merge prefix (stale warning first) with the rest of the response.
+    final = {**prefix, **response}
+    return _json(final)
 
 
 class _StoreProxy:
@@ -473,16 +514,28 @@ def build_mcp_server(store, repo_path_provider):
     def get_impact(symbol: str, max_depth: int = 4, project: str | None = None):
         """
         Caller-tree impact analysis for a symbol.
+
+        Returns two sections:
+          resolved_to     — the symbol(s) matched by name
+          impacted_callers — BFS caller groups by depth (1 = direct, 2 = indirect, 3+ = transitive)
+          self_callers    — methods in the same class that call the target (separated for clarity)
+
+        Includes DI edges (@Inject/@Autowired/@Provides/@Bean) when the index has been
+        built with a DI-aware version of CodeSpine.
+
         project scopes the target symbol lookup; cross-project callers are always included.
         """
-        normalized = _normalize_symbol_input(symbol)
-        result = analyze_impact(store, normalized, max_depth=max_depth, project=project)
-        if not result.get("targets_resolved"):
-            # Retry with the raw input in case the ID matched exactly.
-            result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
-        if not result.get("targets_resolved"):
-            return {"available": False, "note": f"Symbol '{symbol}' not found in the index."}
-        return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
+        try:
+            normalized = _normalize_symbol_input(symbol)
+            result = analyze_impact(store, normalized, max_depth=max_depth, project=project)
+            if not result.get("resolved_to"):
+                # Retry with the raw input in case the ID matched exactly.
+                result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
+            if not result.get("resolved_to"):
+                return {"available": False, "note": f"Symbol '{symbol}' not found in the index."}
+            return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("get_impact", exc)
 
     @mcp.tool()
     def detect_dead_code(limit: int = 200, project: str | None = None, strict: bool = False):
@@ -571,6 +624,107 @@ def build_mcp_server(store, repo_path_provider):
                 "note": "No coupling data. Run 'codespine analyse --deep' with a git repository.",
             }
         return _staleness_meta(store, {"available": True, "coupling": result}, overlay_store=overlay_store, deep_scope=True)
+
+    @mcp.tool()
+    def find_injections(symbol: str, project: str | None = None):
+        """
+        Find all dependency-injection bindings for a class symbol.
+
+        Returns:
+          injected_by   — classes that @Inject / @Autowired this class (consumers)
+          provides_for  — @Provides / @Bean methods that return this type
+          binds_to      — interface bindings (BINDS_INTERFACE edges) where this class
+                          is the implementation or the interface
+
+        Requires the index to have been built with DI-aware indexing (v0.9+).
+        If empty, try re-indexing with 'codespine analyse'.
+        """
+        try:
+            name_lower = symbol.lower()
+            # Resolve symbol → class IDs.
+            class_recs = store.query_records(
+                """
+                MATCH (c:Class)
+                WHERE lower(c.name) = $namel OR lower(c.fqcn) CONTAINS $namel
+                RETURN c.id as id, c.name as name, c.fqcn as fqcn
+                LIMIT 10
+                """,
+                {"namel": name_lower},
+            )
+            if not class_recs:
+                return {"available": False, "note": f"Class '{symbol}' not found in the index."}
+
+            all_injected_by: list[dict] = []
+            all_provides_for: list[dict] = []
+            all_binds_to: list[dict] = []
+
+            for cls_rec in class_recs:
+                cid = cls_rec["id"]
+                proj_clause = "AND f.project_id = $proj" if project else ""
+                proj_params: dict = {"cid": cid}
+                if project:
+                    proj_params["proj"] = project
+
+                # Who injects this class?
+                try:
+                    inj = store.query_records(
+                        f"""
+                        MATCH (a:Class)-[r:INJECTS]->(b:Class {{id: $cid}}), (f:File)
+                        WHERE a.file_id = f.id {proj_clause}
+                        RETURN a.fqcn as injector, r.framework as framework,
+                               r.binding_type as binding_type, r.confidence as confidence
+                        """,
+                        proj_params,
+                    )
+                    all_injected_by.extend(inj)
+                except Exception:
+                    pass
+
+                # What does this class provide?
+                try:
+                    prov = store.query_records(
+                        f"""
+                        MATCH (a:Class {{id: $cid}})-[r:INJECTS]->(b:Class), (f:File)
+                        WHERE a.file_id = f.id {proj_clause}
+                        RETURN b.fqcn as provided_type, r.framework as framework,
+                               r.binding_type as binding_type, r.confidence as confidence
+                        """,
+                        proj_params,
+                    )
+                    all_provides_for.extend(prov)
+                except Exception:
+                    pass
+
+                # Interface bindings.
+                try:
+                    binds = store.query_records(
+                        """
+                        MATCH (a:Class)-[r:BINDS_INTERFACE]->(b:Class)
+                        WHERE a.id = $cid OR b.id = $cid
+                        RETURN a.fqcn as impl_class, b.fqcn as interface_class,
+                               r.confidence as confidence, r.reason as reason
+                        """,
+                        {"cid": cid},
+                    )
+                    all_binds_to.extend(binds)
+                except Exception:
+                    pass
+
+            return _staleness_meta(store, {
+                "available": True,
+                "symbol": symbol,
+                "matched_classes": [{"name": r["name"], "fqcn": r["fqcn"]} for r in class_recs],
+                "injected_by": all_injected_by,
+                "provides_for": all_provides_for,
+                "binds_to": all_binds_to,
+                "note": (
+                    "Empty results mean either no DI bindings exist or the index was built "
+                    "before DI-aware indexing (v0.9+). Re-run 'codespine analyse' to update."
+                    if not (all_injected_by or all_provides_for or all_binds_to) else None
+                ),
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("find_injections", exc)
 
     @mcp.tool()
     def get_symbol_context(query: str, max_depth: int = 3, project: str | None = None):
@@ -775,6 +929,16 @@ def build_mcp_server(store, repo_path_provider):
                 "available": False,
                 "note": f"No symbols found matching '{name}'. Try a shorter prefix or use search_hybrid for fuzzy matching.",
             }
+
+        # FR-05: Smart disambiguation — when the query exactly matches a class name,
+        # mark it as primary_match and sort: class > constructor > other methods > fields.
+        exact_class_names = {c["name"].lower() for c in classes if c.get("name") and c["name"].lower() == name_lower}
+        if exact_class_names:
+            for c in classes:
+                if c.get("name", "").lower() == name_lower:
+                    c["primary_match"] = True
+            # Sort methods so constructors (same name as class) come first.
+            methods.sort(key=lambda m: (0 if m.get("name", "").lower() in exact_class_names else 1, m.get("name", "")))
 
         # Group by project_id so agents can see the landscape at a glance
         by_project: dict[str, dict] = {}
@@ -999,16 +1163,25 @@ def build_mcp_server(store, repo_path_provider):
         global_interval: int = 30,
         overlay_debounce_ms: int = 1500,
         promote_on_commit: bool = True,
+        install_hook: bool = False,
     ):
         """
-        Start watching a project directory for Java file changes and update the dirty overlay.
+        Start watching a project directory for Java file changes.
 
-        Watch mode monitors .java files for changes, debounces saves, and updates
-        the dirty overlay instead of mutating the committed base index immediately.
-        When local HEAD changes, dirty overlay state is promoted into the base index.
+        Watch mode monitors .java files for changes and writes them DIRECTLY to the
+        graph database (no intermediate overlay JSON).  Changes are immediately
+        queryable after each file save.  When HEAD changes (on git commit), only the
+        files that changed between commits are re-indexed — typically <1 second.
 
-        Fast tools (search/context/impact) read merged base+overlay state. Deep
-        analyses stay on the committed base index until promotion.
+        Parameters:
+          path               – Project directory to watch.
+          global_interval    – Fallback poll interval in seconds (default 30; commit
+                               detection uses a faster 5 s cycle regardless).
+          overlay_debounce_ms – Debounce delay for file-save events (default 1500 ms).
+          promote_on_commit  – Re-index changed files on each git commit (default True).
+          install_hook       – If True, also install a git post-commit hook in the
+                               project's .git/hooks/ so commits trigger re-indexing
+                               even when watch mode is not running (opt-in).
 
         Returns the PID of the background watch process and the path being watched.
         Use get_watch_status() to check if it's still running.
@@ -1029,6 +1202,16 @@ def build_mcp_server(store, repo_path_provider):
         abs_path = os.path.abspath(path)
         if not os.path.isdir(abs_path):
             return {"available": False, "note": f"Path does not exist or is not a directory: {abs_path}"}
+
+        # Optionally install the git post-commit hook.
+        hook_status: dict = {}
+        if install_hook:
+            try:
+                from codespine.watch.git_hook import install_post_commit_hook
+                hook_file = install_post_commit_hook(abs_path)
+                hook_status = {"hook_installed": True, "hook_path": hook_file}
+            except Exception as exc:
+                hook_status = {"hook_installed": False, "hook_error": str(exc)}
 
         import tempfile as _tempfile
         watch_err_file = _tempfile.NamedTemporaryFile(
@@ -1082,9 +1265,10 @@ def build_mcp_server(store, repo_path_provider):
             "global_interval_s": global_interval,
             "overlay_debounce_ms": overlay_debounce_ms,
             "promote_on_commit": promote_on_commit,
+            **hook_status,
             "note": (
-                "Watch mode started. CodeSpine will update the dirty overlay after Java file changes "
-                "and promote it into the committed index when local HEAD changes."
+                "Watch mode started. File saves are written directly to the graph index and "
+                "are immediately queryable. Commits trigger targeted re-indexing of changed files."
             ),
         }
 
@@ -1674,6 +1858,815 @@ def build_mcp_server(store, repo_path_provider):
             "changed": result.get("changed", 0),
             "note": f"Re-indexed {abs_fp} via overlay in {elapsed}s.",
         }
+
+    # ------------------------------------------------------------------
+    # LLM-native interface tools (Phase 3-5)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def ask(question: str, project: str | None = None):
+        """
+        Natural language dispatcher. Ask anything about the codebase in plain English.
+
+        Interprets the question and routes to the most appropriate underlying tool.
+        Returns the tool's result plus dispatched_to and interpreted_as fields.
+
+        Examples:
+          "who calls PaymentService?"              → get_impact
+          "what breaks if I change UserRepository?" → what_breaks
+          "explain AuthController"                 → explain
+          "find methods named processOrder"        → find_symbol
+          "what injects OrderService?"             → find_injections
+          "dead code in billing module"            → detect_dead_code
+        """
+        q = question.lower().strip()
+        dispatched_to = "search_hybrid"
+        interpreted_as = f"semantic search for: {question}"
+
+        # Route by keyword patterns.
+        _IMPACT_PATTERNS = ("who calls", "callers of", "what calls", "depends on")
+        _BREAKS_PATTERNS = ("what breaks", "impact of", "what would break", "blast radius", "what changes if")
+        _EXPLAIN_PATTERNS = ("what does", "what is", "explain", "describe", "tell me about")
+        _INJECT_PATTERNS = ("what injects", "who injects", "di for", "injection", "autowired", "@inject")
+        _DEAD_PATTERNS = ("dead code", "unused", "unreachable", "not called")
+        _TEST_PATTERNS = ("test for", "tests for", "coverage for", "what tests")
+        _FIND_PATTERNS = ("find method", "find class", "find field", "where is", "locate")
+
+        def _extract_symbol(text: str, *prefixes: str) -> str:
+            for prefix in prefixes:
+                idx = text.find(prefix)
+                if idx >= 0:
+                    return question[idx + len(prefix):].strip().strip("'\"?")
+            return question
+
+        try:
+            if any(p in q for p in _BREAKS_PATTERNS):
+                sym = _extract_symbol(q, *_BREAKS_PATTERNS)
+                dispatched_to = "what_breaks"
+                interpreted_as = f"blast radius of changing: {sym}"
+                return what_breaks(sym, project=project)
+            elif any(p in q for p in _INJECT_PATTERNS):
+                sym = _extract_symbol(q, *_INJECT_PATTERNS)
+                dispatched_to = "find_injections"
+                interpreted_as = f"DI consumers of: {sym}"
+                return find_injections(sym, project=project)
+            elif any(p in q for p in _DEAD_PATTERNS):
+                dispatched_to = "detect_dead_code"
+                interpreted_as = "dead code detection"
+                return detect_dead_code(project=project)
+            elif any(p in q for p in _EXPLAIN_PATTERNS):
+                sym = _extract_symbol(q, *_EXPLAIN_PATTERNS)
+                dispatched_to = "explain"
+                interpreted_as = f"explain symbol: {sym}"
+                return explain(sym, project=project)
+            elif any(p in q for p in _IMPACT_PATTERNS):
+                sym = _extract_symbol(q, *_IMPACT_PATTERNS)
+                dispatched_to = "get_impact"
+                interpreted_as = f"callers of: {sym}"
+                return get_impact(sym, project=project)
+            elif any(p in q for p in _TEST_PATTERNS):
+                sym = _extract_symbol(q, *_TEST_PATTERNS)
+                dispatched_to = "test_coverage"
+                interpreted_as = f"test coverage for: {sym}"
+                return test_coverage(sym, project=project)
+            elif any(p in q for p in _FIND_PATTERNS):
+                sym = _extract_symbol(q, *_FIND_PATTERNS)
+                dispatched_to = "find_symbol"
+                interpreted_as = f"find symbol: {sym}"
+                return find_symbol(sym, project=project)
+            else:
+                dispatched_to = "search_hybrid"
+                interpreted_as = f"semantic search for: {question}"
+                result = search_hybrid(question, project=project)
+                # Attach routing info to the result string.
+                import json as _j
+                try:
+                    data = _j.loads(result)
+                    data["dispatched_to"] = dispatched_to
+                    data["interpreted_as"] = interpreted_as
+                    return _json(data)
+                except Exception:
+                    return result
+        except Exception as exc:
+            return _safe_tool_response("ask", exc)
+
+    @mcp.tool()
+    def what_breaks(symbol: str, project: str | None = None):
+        """
+        What would break if this symbol changed?
+
+        Intent-named wrapper around get_impact that also includes DI consumers.
+        Returns a flat summary with risk_level to help prioritise refactoring.
+
+        risk_level: "low" (<5 callers), "medium" (5–20), "high" (>20).
+        """
+        try:
+            normalized = _normalize_symbol_input(symbol)
+            result = analyze_impact(store, normalized, max_depth=4, project=project)
+            if not result.get("resolved_to"):
+                result = analyze_impact(store, symbol, max_depth=4, project=project)
+            if not result.get("resolved_to"):
+                return {"available": False, "note": f"Symbol '{symbol}' not found."}
+            callers = result.get("impacted_callers", {})
+            total = sum(len(v) for v in callers.values())
+            risk = "low" if total < 5 else ("medium" if total < 20 else "high")
+            return _staleness_meta(store, {
+                "available": True,
+                "symbol": symbol,
+                "resolved_to": result.get("resolved_to", []),
+                "risk_level": risk,
+                "total_callers": total,
+                "impacted_callers": callers,
+                "self_callers": result.get("self_callers", []),
+                "summary": result.get("summary", {}),
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("what_breaks", exc)
+
+    @mcp.tool()
+    def explain(symbol: str, project: str | None = None):
+        """
+        Compound understanding tool — chains symbol lookup + neighborhood + community.
+
+        Returns a structured summary without needing multiple tool calls:
+          matched    — what the symbol is (type, fqname, file_path, line)
+          neighbors  — direct callers and callees
+          community  — architectural cluster membership
+        """
+        try:
+            normalized = _normalize_symbol_input(symbol)
+            # 1. Find the symbol.
+            sym_recs = store.query_records(
+                """
+                MATCH (s:Symbol)
+                WHERE lower(s.name) = $namel OR lower(s.fqname) CONTAINS $namel
+                RETURN s.id as id, s.kind as kind, s.name as name,
+                       s.fqname as fqname, s.file_id as file_id, s.line as line
+                LIMIT 5
+                """,
+                {"namel": normalized.lower()},
+            )
+            if not sym_recs:
+                return {"available": False, "note": f"Symbol '{symbol}' not found."}
+
+            # 2. Community membership for top match.
+            top = sym_recs[0]
+            community_info = store.query_records(
+                """
+                MATCH (s:Symbol {id: $sid})-[:IN_COMMUNITY]->(c:Community)
+                RETURN c.id as id, c.label as label, c.cohesion as cohesion
+                LIMIT 1
+                """,
+                {"sid": top["id"]},
+            )
+
+            # 3. Direct callers/callees (first-degree neighborhood via Method).
+            callers = store.query_records(
+                """
+                MATCH (caller:Method)-[:CALLS]->(m:Method), (s:Symbol)
+                WHERE s.id = $sid AND s.fqname CONTAINS m.signature
+                RETURN caller.name as name, caller.id as id
+                LIMIT 10
+                """,
+                {"sid": top["id"]},
+            )
+            callees = store.query_records(
+                """
+                MATCH (m:Method)-[:CALLS]->(callee:Method), (s:Symbol)
+                WHERE s.id = $sid AND s.fqname CONTAINS m.signature
+                RETURN callee.name as name, callee.id as id
+                LIMIT 10
+                """,
+                {"sid": top["id"]},
+            )
+
+            return _staleness_meta(store, {
+                "available": True,
+                "symbol": symbol,
+                "matched": sym_recs,
+                "community": community_info[0] if community_info else None,
+                "callers": callers,
+                "callees": callees,
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("explain", exc)
+
+    @mcp.tool()
+    def read_symbols(file_path: str, symbols: list[str] | None = None):
+        """
+        Read source code for specific symbols from a file — 60-70% fewer tokens than
+        reading the whole file.
+
+        Parameters:
+          file_path – Absolute or relative path to the Java file.
+          symbols   – List of method/class names to extract. If None, returns all.
+
+        Returns each matched symbol's source lines as a separate entry.
+        """
+        try:
+            abs_fp = os.path.abspath(file_path)
+            if not os.path.isfile(abs_fp):
+                return {"available": False, "note": f"File not found: {abs_fp}"}
+            with open(abs_fp, "rb") as fh:
+                source = fh.read()
+            from codespine.indexer.java_parser import parse_java_source
+            parsed = parse_java_source(source)
+            lines = source.decode("utf-8", errors="replace").splitlines()
+            results: list[dict] = []
+            symbols_lower = {s.lower() for s in symbols} if symbols else None
+            for cls in parsed.classes:
+                if symbols_lower is None or cls.name.lower() in symbols_lower:
+                    results.append({
+                        "kind": "class",
+                        "name": cls.name,
+                        "fqcn": cls.fqcn,
+                        "line_start": cls.line,
+                    })
+                for method in cls.methods:
+                    if symbols_lower is None or method.name.lower() in symbols_lower:
+                        # Extract source lines for just this method.
+                        start = method.line - 1
+                        end = min(len(lines), start + 60)  # cap at 60 lines per method
+                        results.append({
+                            "kind": "method",
+                            "name": method.name,
+                            "class": cls.fqcn,
+                            "signature": method.signature,
+                            "line_start": method.line,
+                            "source": "\n".join(lines[start:end]),
+                        })
+            return {"available": True, "file": abs_fp, "symbols": results}
+        except Exception as exc:
+            return _safe_tool_response("read_symbols", exc)
+
+    @mcp.tool()
+    def semantic_summary(symbol: str, project: str | None = None):
+        """
+        Condensed view of a class or method — signatures and metadata only, no body.
+        ~80 tokens vs ~800 for reading the full source. Ideal for understanding
+        an API surface before making changes.
+        """
+        try:
+            name_lower = symbol.lower()
+            # Try class first.
+            cls_recs = store.query_records(
+                """
+                MATCH (c:Class), (f:File)
+                WHERE c.file_id = f.id AND (lower(c.name) = $namel OR lower(c.fqcn) CONTAINS $namel)
+                RETURN c.id as id, c.name as name, c.fqcn as fqcn, c.package as package,
+                       f.project_id as project_id, f.path as file_path
+                LIMIT 3
+                """,
+                {"namel": name_lower},
+            )
+            if cls_recs:
+                cls = cls_recs[0]
+                methods = store.query_records(
+                    """
+                    MATCH (m:Method) WHERE m.class_id = $cid
+                    RETURN m.name as name, m.signature as signature,
+                           m.return_type as return_type, m.modifiers as modifiers,
+                           m.is_constructor as is_constructor
+                    """,
+                    {"cid": cls["id"]},
+                )
+                public_methods = [m for m in methods if "public" in (m.get("modifiers") or [])]
+                return _staleness_meta(store, {
+                    "available": True,
+                    "kind": "class",
+                    "name": cls["name"],
+                    "fqcn": cls["fqcn"],
+                    "package": cls["package"],
+                    "project_id": cls["project_id"],
+                    "file_path": cls["file_path"],
+                    "method_count": len(methods),
+                    "public_method_count": len(public_methods),
+                    "public_methods": [
+                        {"name": m["name"], "signature": m["signature"], "return_type": m["return_type"]}
+                        for m in public_methods[:20]
+                    ],
+                }, project, overlay_store=overlay_store)
+            # Fall back to method.
+            method_recs = store.query_records(
+                """
+                MATCH (m:Method), (c:Class)
+                WHERE m.class_id = c.id AND lower(m.name) = $namel
+                RETURN m.name as name, m.signature as signature, m.return_type as return_type,
+                       m.modifiers as modifiers, c.fqcn as class_fqcn
+                LIMIT 5
+                """,
+                {"namel": name_lower},
+            )
+            if method_recs:
+                return _staleness_meta(store, {
+                    "available": True,
+                    "kind": "method",
+                    "matches": method_recs,
+                }, project, overlay_store=overlay_store)
+            return {"available": False, "note": f"Symbol '{symbol}' not found."}
+        except Exception as exc:
+            return _safe_tool_response("semantic_summary", exc)
+
+    @mcp.tool()
+    def get_api_surface(class_name: str, project: str | None = None):
+        """
+        Return only the public interface of a class — public methods and fields.
+        Excludes private/protected members. Ideal for understanding how to use
+        a class without reading its full implementation.
+        """
+        try:
+            name_lower = class_name.lower()
+            proj_clause = "AND f.project_id = $proj" if project else ""
+            params: dict = {"namel": name_lower}
+            if project:
+                params["proj"] = project
+            cls_recs = store.query_records(
+                f"""
+                MATCH (c:Class), (f:File)
+                WHERE c.file_id = f.id AND (lower(c.name) = $namel OR lower(c.fqcn) CONTAINS $namel)
+                {proj_clause}
+                RETURN c.id as id, c.name as name, c.fqcn as fqcn
+                LIMIT 3
+                """,
+                params,
+            )
+            if not cls_recs:
+                return {"available": False, "note": f"Class '{class_name}' not found."}
+            cls = cls_recs[0]
+            methods = store.query_records(
+                """
+                MATCH (m:Method) WHERE m.class_id = $cid AND 'public' IN m.modifiers
+                RETURN m.name as name, m.signature as signature, m.return_type as return_type,
+                       m.is_constructor as is_constructor
+                """,
+                {"cid": cls["id"]},
+            )
+            fields = store.query_records(
+                """
+                MATCH (s:Symbol), (c:Class)
+                WHERE s.file_id = c.file_id AND c.id = $cid AND s.kind = 'field'
+                  AND lower(s.fqname) STARTS WITH lower($fqcn)
+                RETURN s.name as name, s.fqname as fqname, s.line as line
+                LIMIT 20
+                """,
+                {"cid": cls["id"], "fqcn": cls["fqcn"]},
+            )
+            return _staleness_meta(store, {
+                "available": True,
+                "class": cls["fqcn"],
+                "public_methods": methods,
+                "public_fields": fields,
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("get_api_surface", exc)
+
+    @mcp.tool()
+    def file_context(file_path: str, project: str | None = None):
+        """
+        Auto-inject graph context for a file before editing it.
+
+        Returns:
+          symbols      — all classes and methods declared in the file
+          callers      — external methods that call into this file
+          community    — architectural cluster this file belongs to
+          coupling     — files that frequently change alongside this one
+          overlay_dirty — whether this file has uncommitted overlay changes
+        """
+        try:
+            abs_fp = os.path.abspath(file_path)
+            # Resolve file_id.
+            file_recs = store.query_records(
+                "MATCH (f:File) WHERE f.path = $path RETURN f.id as id, f.project_id as pid LIMIT 1",
+                {"path": abs_fp},
+            )
+            if not file_recs:
+                return {"available": False, "note": f"File '{abs_fp}' not indexed. Run analyse_project() first."}
+            f_id = file_recs[0]["id"]
+            pid = file_recs[0]["pid"]
+            if project is None:
+                project = pid
+
+            symbols = store.query_records(
+                "MATCH (s:Symbol) WHERE s.file_id = $fid RETURN s.kind as kind, s.name as name, s.line as line",
+                {"fid": f_id},
+            )
+            callers = store.query_records(
+                """
+                MATCH (caller:Method)-[:CALLS]->(m:Method), (cm:Class), (cf:File)
+                WHERE m.class_id = cm.id AND cm.file_id = $fid
+                  AND caller.class_id <> cm.id
+                WITH DISTINCT caller
+                MATCH (cc:Class) WHERE caller.class_id = cc.id
+                RETURN caller.name as name, cc.fqcn as class_fqcn
+                LIMIT 20
+                """,
+                {"fid": f_id},
+            )
+            community = store.query_records(
+                """
+                MATCH (s:Symbol)-[:IN_COMMUNITY]->(c:Community)
+                WHERE s.file_id = $fid
+                RETURN c.label as label, count(s) as symbol_count
+                LIMIT 3
+                """,
+                {"fid": f_id},
+            )
+            coupling = store.query_records(
+                """
+                MATCH (f:File {id: $fid})-[r:CO_CHANGED_WITH]->(g:File)
+                RETURN g.path as coupled_file, r.strength as strength, r.cochanges as cochanges
+                ORDER BY r.strength DESC LIMIT 10
+                """,
+                {"fid": f_id},
+            )
+            # Check overlay dirty state.
+            overlay_dirty = False
+            if overlay_store is not None:
+                try:
+                    from codespine.overlay.merge import _load_overlay_docs, suppressed_file_ids
+                    docs = _load_overlay_docs(overlay_store, project)
+                    overlay_dirty = f_id in suppressed_file_ids(docs)
+                except Exception:
+                    pass
+
+            return _staleness_meta(store, {
+                "available": True,
+                "file": abs_fp,
+                "project": project,
+                "symbols": symbols,
+                "external_callers": callers,
+                "community": community,
+                "coupling": coupling,
+                "overlay_dirty": overlay_dirty,
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("file_context", exc)
+
+    @mcp.tool()
+    def pre_flight_check(
+        file_path: str,
+        symbols: list[str] | None = None,
+        change_type: str = "modify",
+        project: str | None = None,
+    ):
+        """
+        Blast radius analysis before making changes — call this BEFORE editing.
+
+        Parameters:
+          file_path   – The file you plan to modify.
+          symbols     – Specific method/class names you plan to change. If None,
+                        analyses all symbols in the file.
+          change_type – "modify" | "delete" | "rename" (informational only).
+
+        Returns:
+          affected_methods  — total methods impacted across all depths
+          affected_projects — unique projects containing affected code
+          risk_level        — "low" | "medium" | "high"
+          per_symbol        — per-symbol blast radius breakdown
+        """
+        try:
+            abs_fp = os.path.abspath(file_path)
+            file_recs = store.query_records(
+                "MATCH (f:File) WHERE f.path = $path RETURN f.id as id, f.project_id as pid LIMIT 1",
+                {"path": abs_fp},
+            )
+            if not file_recs:
+                return {"available": False, "note": f"File '{abs_fp}' not indexed."}
+            f_id = file_recs[0]["id"]
+            if project is None:
+                project = file_recs[0]["pid"]
+
+            # Find symbols to analyse.
+            if symbols:
+                sym_query_list = symbols
+            else:
+                method_recs = store.query_records(
+                    """
+                    MATCH (m:Method), (c:Class)
+                    WHERE m.class_id = c.id AND c.file_id = $fid
+                    RETURN m.name as name
+                    LIMIT 20
+                    """,
+                    {"fid": f_id},
+                )
+                sym_query_list = [r["name"] for r in method_recs]
+
+            per_symbol: list[dict] = []
+            total_affected: set[str] = set()
+            total_projects: set[str] = set()
+            for sym in sym_query_list[:10]:  # cap at 10 symbols to prevent timeout
+                result = analyze_impact(store, sym, max_depth=3, project=project)
+                callers = result.get("impacted_callers", {})
+                all_c = [item for items in callers.values() for item in items]
+                for item in all_c:
+                    total_affected.add(item.get("symbol", ""))
+                    if item.get("project_id"):
+                        total_projects.add(item["project_id"])
+                per_symbol.append({
+                    "symbol": sym,
+                    "direct_callers": len(callers.get("1", [])),
+                    "total_callers": len(all_c),
+                })
+
+            total = len(total_affected)
+            risk = "low" if total < 5 else ("medium" if total < 20 else "high")
+            return _staleness_meta(store, {
+                "available": True,
+                "file": abs_fp,
+                "change_type": change_type,
+                "risk_level": risk,
+                "affected_methods": total,
+                "affected_projects": list(total_projects),
+                "per_symbol": per_symbol,
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("pre_flight_check", exc)
+
+    @mcp.tool()
+    def related(symbol: str, limit: int = 5, project: str | None = None):
+        """
+        Find symbols tightly coupled to a given symbol.
+
+        Combines multiple coupling signals:
+          - co-change coupling (git history)
+          - shared community membership
+          - direct call relationship
+          - same-class siblings
+
+        Returns ranked list of related symbols with coupling reason.
+        """
+        try:
+            normalized = _normalize_symbol_input(symbol)
+            sym_recs = store.query_records(
+                """
+                MATCH (s:Symbol)
+                WHERE lower(s.name) = $namel OR lower(s.fqname) CONTAINS $namel
+                RETURN s.id as id, s.name as name, s.fqname as fqname, s.file_id as file_id
+                LIMIT 3
+                """,
+                {"namel": normalized.lower()},
+            )
+            if not sym_recs:
+                return {"available": False, "note": f"Symbol '{symbol}' not found."}
+
+            top = sym_recs[0]
+            seen: dict[str, dict] = {}
+
+            # Co-change coupling — files that changed together.
+            try:
+                coupling = store.query_records(
+                    """
+                    MATCH (f:File {id: $fid})-[r:CO_CHANGED_WITH]->(g:File)
+                    MATCH (s:Symbol) WHERE s.file_id = g.id
+                    RETURN s.id as id, s.name as name, r.strength as score, 'co_change' as reason
+                    ORDER BY r.strength DESC LIMIT $lim
+                    """,
+                    {"fid": top["file_id"], "lim": limit * 2},
+                )
+                for r in coupling:
+                    if r["id"] != top["id"]:
+                        seen.setdefault(r["id"], {"symbol": r["id"], "name": r["name"], "score": 0.0, "reasons": []})
+                        seen[r["id"]]["score"] = max(seen[r["id"]]["score"], float(r.get("score") or 0))
+                        seen[r["id"]]["reasons"].append("co_change")
+            except Exception:
+                pass
+
+            # Same community.
+            try:
+                community = store.query_records(
+                    """
+                    MATCH (s:Symbol {id: $sid})-[:IN_COMMUNITY]->(c:Community)<-[:IN_COMMUNITY]-(t:Symbol)
+                    WHERE t.id <> $sid
+                    RETURN t.id as id, t.name as name, 0.6 as score, 'community' as reason
+                    LIMIT $lim
+                    """,
+                    {"sid": top["id"], "lim": limit * 2},
+                )
+                for r in community:
+                    seen.setdefault(r["id"], {"symbol": r["id"], "name": r["name"], "score": 0.0, "reasons": []})
+                    seen[r["id"]]["score"] = max(seen[r["id"]]["score"], 0.6)
+                    if "community" not in seen[r["id"]]["reasons"]:
+                        seen[r["id"]]["reasons"].append("community")
+            except Exception:
+                pass
+
+            ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)[:limit]
+            return _staleness_meta(store, {
+                "available": True,
+                "symbol": symbol,
+                "related": ranked,
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("related", exc)
+
+    @mcp.tool()
+    def test_coverage(symbol: str, project: str | None = None):
+        """
+        Find tests that cover a given symbol (directly or transitively, depth ≤ 2).
+
+        Returns:
+          covered_by_tests — test methods that call the symbol (direct or indirect)
+          coverage_status  — "direct" | "indirect" | "uncovered"
+        """
+        try:
+            normalized = _normalize_symbol_input(symbol)
+            sym_recs = store.query_records(
+                """
+                MATCH (s:Symbol)
+                WHERE lower(s.name) = $namel OR lower(s.fqname) CONTAINS $namel
+                RETURN s.id as id, s.name as name, s.fqname as fqname
+                LIMIT 5
+                """,
+                {"namel": normalized.lower()},
+            )
+            if not sym_recs:
+                return {"available": False, "note": f"Symbol '{symbol}' not found."}
+
+            top_ids = [r["id"] for r in sym_recs]
+            # Resolve symbol IDs to method IDs.
+            method_recs = store.query_records(
+                """
+                MATCH (m:Method), (s:Symbol)
+                WHERE s.id IN $sids AND s.fqname CONTAINS m.signature
+                RETURN m.id as mid, m.name as mname
+                """,
+                {"sids": top_ids},
+            )
+            if not method_recs:
+                return {"available": False, "note": f"No method found for '{symbol}'."}
+
+            mid = method_recs[0]["mid"]
+            # Direct test callers.
+            direct = store.query_records(
+                """
+                MATCH (t:Method)-[:CALLS]->(m:Method {id: $mid})
+                WHERE t.is_test = true
+                MATCH (tc:Class) WHERE t.class_id = tc.id
+                RETURN t.id as id, t.name as name, tc.fqcn as test_class, 1 as depth
+                LIMIT 20
+                """,
+                {"mid": mid},
+            )
+            # Indirect (depth 2).
+            indirect = store.query_records(
+                """
+                MATCH (t:Method)-[:CALLS]->(x:Method)-[:CALLS]->(m:Method {id: $mid})
+                WHERE t.is_test = true
+                MATCH (tc:Class) WHERE t.class_id = tc.id
+                RETURN t.id as id, t.name as name, tc.fqcn as test_class, 2 as depth
+                LIMIT 20
+                """,
+                {"mid": mid},
+            )
+            covered_by = direct + [r for r in indirect if r["id"] not in {d["id"] for d in direct}]
+            status = "uncovered" if not covered_by else ("direct" if direct else "indirect")
+            return _staleness_meta(store, {
+                "available": True,
+                "symbol": symbol,
+                "coverage_status": status,
+                "covered_by_tests": covered_by,
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("test_coverage", exc)
+
+    @mcp.tool()
+    def diff_impact(git_ref: str = "HEAD~1", project: str | None = None):
+        """
+        Graph-level impact analysis for uncommitted changes or a git ref.
+
+        Finds Java files changed since git_ref, then runs blast-radius analysis
+        on each changed symbol to produce a PR-level summary.
+
+        Parameters:
+          git_ref – Git reference to diff against (default: HEAD~1 = last commit).
+                    Also accepts branch names, commit SHAs, or "HEAD" (working tree diff).
+        """
+        try:
+            repo = _resolve_repo_path(store, project, repo_path_provider)
+            if not _git_available(repo):
+                return {"available": False, "note": "Not a git repository."}
+
+            # Find changed Java files.
+            diff_cmd = ["git", "diff", "--name-only", git_ref]
+            r = subprocess.run(diff_cmd, cwd=repo, capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                return {"available": False, "note": f"git diff failed: {r.stderr.strip()[:200]}"}
+            changed_files = [
+                os.path.join(repo, line.strip())
+                for line in r.stdout.splitlines()
+                if line.strip().endswith(".java")
+            ]
+            if not changed_files:
+                return {"available": True, "changed_java_files": 0, "note": "No Java files changed."}
+
+            # Find symbols in changed files.
+            abs_paths = [os.path.abspath(f) for f in changed_files]
+            file_recs = store.query_records(
+                "MATCH (f:File) WHERE f.path IN $paths RETURN f.id as fid, f.path as path, f.project_id as pid",
+                {"paths": abs_paths},
+            )
+            if not file_recs:
+                return {"available": True, "note": "Changed files are not indexed. Run analyse_project() first."}
+
+            all_affected: set[str] = set()
+            all_projects: set[str] = set()
+            per_file: list[dict] = []
+            for fr in file_recs[:10]:  # cap to avoid timeout
+                method_recs = store.query_records(
+                    """
+                    MATCH (m:Method), (c:Class) WHERE m.class_id = c.id AND c.file_id = $fid
+                    RETURN m.name as name LIMIT 10
+                    """,
+                    {"fid": fr["fid"]},
+                )
+                file_callers: set[str] = set()
+                for mr in method_recs[:5]:
+                    impact = analyze_impact(store, mr["name"], max_depth=2, project=fr["pid"])
+                    callers = impact.get("impacted_callers", {})
+                    for items in callers.values():
+                        for item in items:
+                            file_callers.add(item.get("symbol", ""))
+                            if item.get("project_id"):
+                                all_projects.add(item["project_id"])
+                all_affected.update(file_callers)
+                per_file.append({"file": fr["path"], "affected_callers": len(file_callers)})
+
+            total = len(all_affected)
+            risk = "low" if total < 5 else ("medium" if total < 20 else "high")
+            return _staleness_meta(store, {
+                "available": True,
+                "git_ref": git_ref,
+                "changed_java_files": len(changed_files),
+                "risk_level": risk,
+                "total_affected_methods": total,
+                "affected_projects": list(all_projects),
+                "per_file": per_file,
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("diff_impact", exc)
+
+    @mcp.tool()
+    def find_pattern(description: str, project: str | None = None):
+        """
+        Find structural code patterns by name or description.
+
+        Recognises common Java design patterns by name and finds matching classes:
+          "singleton", "factory", "builder", "observer", "repository",
+          "service", "controller", "entity"
+
+        Falls back to semantic search for other descriptions.
+        """
+        try:
+            desc_lower = description.lower().strip()
+            pattern_clauses: dict[str, str] = {
+                "singleton": "lower(c.name) CONTAINS 'singleton' OR 'getInstance' IN [m.name | m IN methods]",
+                "factory": "lower(c.name) ENDS WITH 'factory' OR lower(c.name) ENDS WITH 'factoryimpl'",
+                "builder": "lower(c.name) ENDS WITH 'builder'",
+                "observer": "lower(c.name) ENDS WITH 'observer' OR lower(c.name) ENDS WITH 'listener'",
+                "repository": "lower(c.name) CONTAINS 'repository'",
+                "service": "lower(c.name) ENDS WITH 'service' OR lower(c.name) ENDS WITH 'serviceimpl'",
+                "controller": "lower(c.name) ENDS WITH 'controller'",
+                "entity": "lower(c.name) ENDS WITH 'entity' OR lower(c.name) ENDS WITH 'model'",
+            }
+            matched_pattern: str | None = None
+            for pattern_name in pattern_clauses:
+                if pattern_name in desc_lower:
+                    matched_pattern = pattern_name
+                    break
+
+            if matched_pattern:
+                proj_clause = "AND f.project_id = $proj" if project else ""
+                params: dict = {"namel": matched_pattern}
+                if project:
+                    params["proj"] = project
+                classes = store.query_records(
+                    f"""
+                    MATCH (c:Class), (f:File)
+                    WHERE c.file_id = f.id AND lower(c.name) CONTAINS $namel {proj_clause}
+                    RETURN c.name as name, c.fqcn as fqcn, f.path as file_path,
+                           f.project_id as project_id
+                    LIMIT 20
+                    """,
+                    params,
+                )
+                return _staleness_meta(store, {
+                    "available": True,
+                    "pattern": matched_pattern,
+                    "matches": classes,
+                }, project, overlay_store=overlay_store)
+            else:
+                # Semantic fallback.
+                results = search_hybrid(description, project=project)
+                import json as _j
+                try:
+                    data = _j.loads(results)
+                    data["pattern"] = None
+                    data["note"] = f"No structural pattern matched '{description}'; showing semantic results."
+                    return _json(data)
+                except Exception:
+                    return results
+        except Exception as exc:
+            return _safe_tool_response("find_pattern", exc)
 
     # ------------------------------------------------------------------
     # Advanced / raw access

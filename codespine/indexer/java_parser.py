@@ -24,6 +24,8 @@ class ParsedMethod:
     body_hash: str
     calls: list["ParsedCall"] = field(default_factory=list)
     local_types: dict[str, str] = field(default_factory=dict)
+    # DI metadata — set for @Provides/@Bean methods.
+    provides_type: str | None = None  # return type when the method is a DI provider
 
 
 @dataclass
@@ -41,6 +43,9 @@ class ParsedField:
     type_name: str
     line: int
     col: int
+    # DI metadata — set when the field has an injection annotation.
+    injection_annotation: str | None = None  # e.g. "Inject", "Autowired"
+    qualifier: str | None = None             # value of @Named/@Qualifier if present
 
 
 @dataclass
@@ -202,8 +207,24 @@ def _extract_local_types(method_node) -> dict[str, str]:
     return locals_map
 
 
+_DI_FIELD_ANNOTATIONS = frozenset({
+    "Inject", "Autowired", "Resource", "Value", "Qualifier", "Named",
+    "javax.inject.Inject", "jakarta.inject.Inject",
+})
+
+_DI_QUALIFIER_ANNOTATIONS = frozenset({"Named", "Qualifier", "javax.inject.Named", "jakarta.inject.Named"})
+
+_DI_PROVIDER_ANNOTATIONS = frozenset({"Provides", "Bean"})
+
+
 def _extract_field_types(class_node) -> tuple[dict[str, str], list[ParsedField]]:
-    q = Query(
+    # Query for field_declaration nodes (not just type/name captures) so we can
+    # inspect modifiers for injection annotations.
+    field_decl_q = Query(
+        JAVA_LANGUAGE,
+        "(field_declaration) @field_decl",
+    )
+    name_type_q = Query(
         JAVA_LANGUAGE,
         """
         (field_declaration
@@ -211,9 +232,13 @@ def _extract_field_types(class_node) -> tuple[dict[str, str], list[ParsedField]]
           declarator: (variable_declarator name: (identifier) @name))
         """,
     )
-    captures = _captures(q, class_node)
+    # Build a map from (type, name) to the field_declaration node so we can
+    # look up annotations afterward.
+    field_decl_nodes: list = [n for n, _ in _captures(field_decl_q, class_node)]
+
     field_map: dict[str, str] = {}
     field_list: list[ParsedField] = []
+    captures = _captures(name_type_q, class_node)
     current_type = None
     for node, tag in captures:
         if tag == "type":
@@ -221,11 +246,28 @@ def _extract_field_types(class_node) -> tuple[dict[str, str], list[ParsedField]]
         elif tag == "name" and current_type:
             name = _text(node)
             field_map[name] = current_type
+
+            # Find the enclosing field_declaration to check annotations.
+            injection_annotation: str | None = None
+            qualifier: str | None = None
+            for fd_node in field_decl_nodes:
+                if fd_node.start_byte <= node.start_byte <= fd_node.end_byte:
+                    _, fd_annotations = _extract_modifiers_and_annotations(fd_node)
+                    for ann in fd_annotations:
+                        ann_simple = ann.split(".")[-1]
+                        if ann_simple in _DI_FIELD_ANNOTATIONS:
+                            injection_annotation = ann_simple
+                        if ann_simple in _DI_QUALIFIER_ANNOTATIONS:
+                            qualifier = ann_simple
+                    break
+
             field_list.append(ParsedField(
                 name=name,
                 type_name=current_type,
                 line=node.start_point[0] + 1,
                 col=node.start_point[1] + 1,
+                injection_annotation=injection_annotation,
+                qualifier=qualifier,
             ))
     return field_map, field_list
 
@@ -386,6 +428,13 @@ def parse_java_source(source: bytes) -> ParsedFile:
             param_types = _extract_parameter_types(m_params_node)
             signature = f"{method_name}({','.join(param_types)})"
             modifiers, annotations = _extract_modifiers_and_annotations(m_node)
+            # Mark DI provider methods so di_resolver can link them to consumers.
+            provides_type: str | None = None
+            for ann in annotations:
+                ann_simple = ann.split(".")[-1]
+                if ann_simple in _DI_PROVIDER_ANNOTATIONS and return_type and return_type not in {"void", "Void"}:
+                    provides_type = return_type
+                    break
             parsed_method = ParsedMethod(
                 name=method_name,
                 signature=signature,
@@ -397,6 +446,7 @@ def parse_java_source(source: bytes) -> ParsedFile:
                 col=m_node.start_point[1] + 1,
                 body_hash=_hash_node(m_node),
                 local_types=_extract_local_types(m_node),
+                provides_type=provides_type,
             )
 
             body_node = m_node.child_by_field_name("body")

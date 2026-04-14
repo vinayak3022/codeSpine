@@ -179,8 +179,9 @@ def test_overlay_impact_includes_dirty_call_edges(isolated_settings, tmp_path: P
     store.set_project_overlay_dirty(project_id, True)
 
     impact = analyze_impact(store, "b", project=project_id)
-    direct = impact["depth_groups"]["1"]
-    assert any(item.get("name") == "a" for item in direct)
+    # FR-06: same-class callers are now in self_callers; cross-class callers in impacted_callers["1"]
+    all_direct = impact["impacted_callers"]["1"] + impact.get("self_callers", [])
+    assert any(item.get("name") == "a" for item in all_direct)
 
 
 def test_overlay_status_reports_promotion_pending(isolated_settings, tmp_path: Path):

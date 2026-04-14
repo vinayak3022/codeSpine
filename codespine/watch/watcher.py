@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import threading
 import time
 import traceback
@@ -16,6 +17,9 @@ from codespine.overlay.git_state import current_head, git_repo_root
 from codespine.overlay.store import OverlayStore, build_overlay_file_entry
 
 LOGGER = logging.getLogger(__name__)
+
+# Reduced from 30 s → 5 s so commits are picked up quickly.
+_HEAD_POLL_INTERVAL_S = 5
 
 
 def _project_modules(root_path: str) -> tuple[dict[str, str], list[str], bool]:
@@ -118,21 +122,18 @@ def promote_overlay(store, project: str | None = None, require_head_change: bool
     return promoted
 
 
-def _update_overlay_for_files(store, project_path: str, project_id: str, file_paths: list[str]) -> dict:
-    overlay_store: OverlayStore = store.overlay_store
+def _update_files_in_graph(store, project_path: str, project_id: str, file_paths: list[str]) -> dict:
+    """Write changed Java files directly to the graph DB (no overlay JSON).
+
+    This replaces the old overlay-on-save path.  Changes are immediately
+    visible to the MCP server after snapshot_to_read_replica() is called.
+
+    For deleted files the file's nodes/edges are removed from the graph.
+    For changed/new files the full entry is re-parsed and upserted atomically.
+    """
     indexer = JavaIndexer(store)
-    repo_root = git_repo_root(project_path)
-    head = current_head(project_path)
 
-    # DB reads can fail if the write DB is busy; fall back to empty catalogs
-    # so the overlay still captures the file changes from tree-sitter alone.
-    try:
-        metadata = store.get_project_metadata(project_id) or {}
-    except Exception as exc:
-        LOGGER.warning("watch: DB read failed for project metadata (%s), using empty", exc)
-        metadata = {}
-    indexed_commit = str(metadata.get("indexed_commit") or "")
-
+    # Load catalogs once so call-resolution works across files in this batch.
     try:
         base_method_catalog = indexer._existing_method_catalog(project_id)
         base_class_catalog = indexer._existing_class_catalog(project_id)
@@ -150,7 +151,22 @@ def _update_overlay_for_files(store, project_path: str, project_id: str, file_pa
     except Exception:
         embed = False
 
-    existing_doc = overlay_store.load_project(project_id)
+    # Ensure the project node exists so upsert_file_from_entry can reference it.
+    try:
+        meta = store.get_project_metadata(project_id)
+        if not meta:
+            store.upsert_project(project_id, project_path)
+    except Exception as exc:
+        LOGGER.warning("watch: could not ensure project node (%s)", exc)
+
+    # Build a running overlay-like catalog so that inter-file call resolution
+    # works when multiple files are changed in the same batch.
+    running_overlay_doc: dict = {
+        "project_id": project_id,
+        "project_path": project_path,
+        "dirty_files": {},
+        "deleted_files": [],
+    }
 
     changed = deleted = errors = 0
     for file_path in sorted(set(os.path.abspath(p) for p in file_paths)):
@@ -171,48 +187,51 @@ def _update_overlay_for_files(store, project_path: str, project_id: str, file_pa
                     base_class_catalog=base_class_catalog,
                     base_class_ids_by_fqcn=base_class_ids,
                     base_class_methods=base_class_methods,
-                    existing_overlay_doc=existing_doc,
+                    existing_overlay_doc=running_overlay_doc,
                 )
-                overlay_store.upsert_file(
-                    project_id=project_id,
-                    project_path=project_path,
-                    repo_root=repo_root,
-                    base_commit=indexed_commit,
-                    current_head=head,
-                    file_path=file_path,
-                    entry=entry,
-                )
-                existing_doc = overlay_store.load_project(project_id)
+                # Write directly to graph DB — no overlay JSON.
+                store.upsert_file_from_entry(entry, project_path)
+                # Update running catalog for subsequent files in same batch.
+                running_overlay_doc["dirty_files"][os.path.abspath(file_path)] = entry
                 changed += 1
             else:
-                overlay_store.mark_deleted(
-                    project_id=project_id,
-                    project_path=project_path,
-                    repo_root=repo_root,
-                    base_commit=indexed_commit,
-                    current_head=head,
-                    file_path=file_path,
-                )
-                existing_doc = overlay_store.load_project(project_id)
+                # File deleted: remove its nodes/edges from the graph.
+                store.clear_file_by_path(project_id, project_path, file_path)
                 deleted += 1
         except Exception as exc:
             LOGGER.warning("watch: failed to process %s: %s", file_path, exc)
             errors += 1
 
-    if changed or deleted:
-        # Try to mark dirty in the DB; if the DB is busy (write contention),
-        # the overlay JSON on disk is still correct and will be picked up on
-        # next read.  Don't let a DB write failure discard overlay work.
-        try:
-            if metadata:
-                store.set_project_overlay_dirty(project_id, True)
-            else:
-                store.upsert_project(project_id, project_path)
-                store.set_project_indexed_commit(project_id, indexed_commit)
-                store.set_project_overlay_dirty(project_id, True)
-        except Exception as exc:
-            LOGGER.warning("watch: DB write failed for overlay_dirty flag (%s); overlay is still on disk", exc)
     return {"project_id": project_id, "changed": changed, "deleted": deleted, "errors": errors}
+
+
+def _git_changed_files(repo_root: str, old_head: str, new_head: str) -> list[str]:
+    """Return absolute paths of Java files changed between two commits."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", old_head, new_head],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        files = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.endswith(".java"):
+                abs_path = os.path.join(repo_root, line)
+                files.append(abs_path)
+        return files
+    except Exception as exc:
+        LOGGER.warning("watch: git diff failed: %s", exc)
+        return []
+
+
+# Keep the old name as a shim so existing call-sites (e.g. tests) don't break.
+def _update_overlay_for_files(store, project_path: str, project_id: str, file_paths: list[str]) -> dict:
+    return _update_files_in_graph(store, project_path, project_id, file_paths)
 
 
 def run_watch_mode(
@@ -241,18 +260,68 @@ def run_watch_mode(
     head_state = {"value": current_head(abs_path)}
     stop_event = threading.Event()
 
+    # Use _HEAD_POLL_INTERVAL_S (5 s) rather than global_interval (30 s) so
+    # commits are detected quickly.  global_interval is kept for compatibility
+    # but is no longer the commit-poll cadence.
+    _poll_interval = min(_HEAD_POLL_INTERVAL_S, max(1, global_interval))
+
     def _head_monitor() -> None:
-        while not stop_event.wait(max(1, global_interval)):
-            head = current_head(abs_path)
-            if not head:
-                continue
-            if head_state["value"] and head != head_state["value"] and promote_on_commit:
-                promoted = promote_overlay(store, require_head_change=True)
-                for item in promoted:
-                    print(
-                        f"[{time.strftime('%H:%M:%S')}] {item['project_id']}: promoted overlay at {item.get('head') or 'unknown'}"
-                    )
-            head_state["value"] = head
+        while not stop_event.wait(_poll_interval):
+            try:
+                head = current_head(abs_path)
+                if not head:
+                    continue
+                old_head = head_state["value"]
+                if old_head and head != old_head:
+                    head_state["value"] = head
+                    if not promote_on_commit:
+                        continue
+                    # Find exactly which files changed between commits and
+                    # re-index only those — much faster than a full re-index.
+                    changed_files = _git_changed_files(repo_root, old_head, head)
+                    if changed_files:
+                        grouped: dict[str, list[str]] = {}
+                        for fp in changed_files:
+                            module_path = _module_for_file(fp, sorted_modules, abs_path)
+                            grouped.setdefault(module_path, []).append(fp)
+                        for module_path, files in sorted(grouped.items()):
+                            project_id = module_map.get(module_path, os.path.basename(module_path))
+                            start = time.time()
+                            try:
+                                result = _update_files_in_graph(store, module_path, project_id, files)
+                            except Exception as exc:
+                                LOGGER.error("watch: commit re-index failed for %s: %s", project_id, exc)
+                                print(f"[{time.strftime('%H:%M:%S')}] {project_id}: ERROR on commit re-index — {exc}")
+                                continue
+                            elapsed = time.time() - start
+                            print(
+                                f"[{time.strftime('%H:%M:%S')}] {project_id}: commit re-index "
+                                f"({result['changed']} changed, {result['deleted']} deleted) "
+                                f"@ {head[:8]} in {elapsed:.1f}s"
+                            )
+                            try:
+                                store.set_project_indexed_commit(project_id, head)
+                            except Exception:
+                                pass
+                        # Snapshot once after processing all modules for this commit.
+                        try:
+                            store.snapshot_to_read_replica()
+                        except Exception as exc:
+                            LOGGER.warning("watch: snapshot after commit failed: %s", exc)
+                    else:
+                        # No Java files changed — just update the indexed commit.
+                        for module_path, project_id in module_map.items():
+                            try:
+                                store.set_project_indexed_commit(project_id, head)
+                            except Exception:
+                                pass
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] commit {head[:8]}: no Java changes"
+                        )
+                else:
+                    head_state["value"] = head
+            except Exception as exc:
+                LOGGER.warning("watch: head monitor error: %s", exc)
 
     monitor = threading.Thread(target=_head_monitor, daemon=True)
     monitor.start()
@@ -272,30 +341,27 @@ def run_watch_mode(
                 project_id = module_map.get(module_path, os.path.basename(module_path))
                 start = time.time()
                 try:
-                    result = _update_overlay_for_files(store, module_path, project_id, files)
+                    result = _update_files_in_graph(store, module_path, project_id, files)
                 except Exception as exc:
-                    LOGGER.error("watch: overlay update failed for %s: %s\n%s", project_id, exc, traceback.format_exc())
-                    print(f"[{time.strftime('%H:%M:%S')}] {project_id}: ERROR updating overlay — {exc}")
+                    LOGGER.error("watch: re-index failed for %s: %s\n%s", project_id, exc, traceback.format_exc())
+                    print(f"[{time.strftime('%H:%M:%S')}] {project_id}: ERROR re-indexing — {exc}")
                     continue
                 elapsed = time.time() - start
                 err_note = f", {result.get('errors', 0)} errors" if result.get("errors") else ""
                 print(
-                    f"[{time.strftime('%H:%M:%S')}] {project_id}: overlay updated "
+                    f"[{time.strftime('%H:%M:%S')}] {project_id}: re-indexed "
                     f"({result['changed']} changed, {result['deleted']} deleted{err_note}) in {elapsed:.1f}s"
                 )
 
-            if promote_on_commit:
-                head = current_head(repo_root)
-                if head and head_state["value"] and head != head_state["value"]:
-                    promoted = promote_overlay(store, require_head_change=True)
-                    for item in promoted:
-                        print(
-                            f"[{time.strftime('%H:%M:%S')}] {item['project_id']}: promoted overlay at {item.get('head') or 'unknown'}"
-                        )
-                    head_state["value"] = head
+            # Snapshot to read replica after each file-change batch so the MCP
+            # server picks up the new data without restarting.
+            try:
+                store.snapshot_to_read_replica()
+            except Exception as exc:
+                LOGGER.warning("watch: snapshot failed: %s", exc)
     finally:
         stop_event.set()
-        monitor.join(timeout=1)
+        monitor.join(timeout=2)
 
 
 def run_deep_refresh(store, root_path: str, project_id: str) -> dict:

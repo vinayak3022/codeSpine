@@ -476,6 +476,163 @@ class GraphStore:
                 confidence=float(record["confidence"]),
             )
 
+    def add_injection(
+        self,
+        src_class_id: str,
+        dst_class_id: str,
+        framework: str,
+        binding_type: str,
+        confidence: float,
+    ) -> None:
+        """Write an INJECTS edge between two Class nodes."""
+        try:
+            self.execute(
+                """
+                MATCH (a:Class {id: $src}), (b:Class {id: $dst})
+                MERGE (a)-[:INJECTS {framework: $fw, binding_type: $bt, confidence: $conf}]->(b)
+                """,
+                {
+                    "src": src_class_id,
+                    "dst": dst_class_id,
+                    "fw": framework,
+                    "bt": binding_type,
+                    "conf": float(confidence),
+                },
+            )
+        except Exception as exc:
+            LOGGER.debug("add_injection: skipping edge %s→%s: %s", src_class_id, dst_class_id, exc)
+
+    def add_injections_batch(self, records: list[dict[str, Any]]) -> None:
+        for rec in records:
+            self.add_injection(
+                src_class_id=rec["src"],
+                dst_class_id=rec["dst"],
+                framework=rec.get("framework", "unknown"),
+                binding_type=rec.get("binding_type", "unknown"),
+                confidence=float(rec.get("confidence", 0.8)),
+            )
+
+    def add_interface_binding(
+        self,
+        src_class_id: str,
+        dst_class_id: str,
+        confidence: float,
+        reason: str,
+    ) -> None:
+        """Write a BINDS_INTERFACE edge between two Class nodes."""
+        try:
+            self.execute(
+                """
+                MATCH (a:Class {id: $src}), (b:Class {id: $dst})
+                MERGE (a)-[:BINDS_INTERFACE {confidence: $conf, reason: $reason}]->(b)
+                """,
+                {
+                    "src": src_class_id,
+                    "dst": dst_class_id,
+                    "conf": float(confidence),
+                    "reason": reason,
+                },
+            )
+        except Exception as exc:
+            LOGGER.debug("add_interface_binding: skipping edge %s→%s: %s", src_class_id, dst_class_id, exc)
+
+    def add_interface_bindings_batch(self, records: list[dict[str, Any]]) -> None:
+        for rec in records:
+            self.add_interface_binding(
+                src_class_id=rec["src"],
+                dst_class_id=rec["dst"],
+                confidence=float(rec.get("confidence", 0.9)),
+                reason=rec.get("reason", "implements"),
+            )
+
+    # Sub-batch sizes for direct-to-graph file writes (same policy as engine.py)
+    _FILE_METHOD_SUB_BATCH = 200
+    _FILE_SYMBOL_SUB_BATCH = 200
+    _FILE_CALL_SUB_BATCH = 500
+    _FILE_REL_SUB_BATCH = 500
+
+    def upsert_file_from_entry(self, entry: dict, project_path: str) -> None:
+        """Atomically replace one file's graph data from a build_overlay_file_entry() dict.
+
+        Clears all existing nodes/edges for the file first, then writes the
+        full parsed content (file, classes, methods, symbols, calls, type rels)
+        in sub-batched transactions to prevent Kuzu buffer pool OOM.
+
+        This is the primary path for watch-mode incremental writes — it
+        bypasses the overlay JSON store and writes directly to the write DB
+        so changes are immediately visible after snapshot_to_read_replica().
+        """
+        f_id = entry["file_id"]
+        path = entry["file_path"]
+        project_id = entry["project_id"]
+        is_test = bool(entry.get("is_test", False))
+        digest = entry.get("file_hash", "")
+        classes = entry.get("classes") or []
+        methods = entry.get("methods") or []
+        symbols = entry.get("symbols") or []
+        calls = entry.get("calls") or []
+        type_rels = entry.get("types") or []
+
+        # 1. Clear stale data for this file
+        with self.transaction():
+            self.clear_file(f_id)
+        self._recycle_conn()
+
+        # 2. Upsert file record
+        with self.transaction():
+            self.upsert_file(f_id, path, project_id, is_test, digest)
+        self._recycle_conn()
+
+        # 3. Upsert classes (typically very few per file)
+        if classes:
+            with self.transaction():
+                self.upsert_classes_batch(classes)
+            self._recycle_conn()
+
+        # 4. Upsert methods in sub-batches of 200
+        for i in range(0, len(methods), self._FILE_METHOD_SUB_BATCH):
+            batch = methods[i: i + self._FILE_METHOD_SUB_BATCH]
+            with self.transaction():
+                self.upsert_methods_batch(batch)
+            self._recycle_conn()
+
+        # 5. Upsert symbols in sub-batches of 200
+        for i in range(0, len(symbols), self._FILE_SYMBOL_SUB_BATCH):
+            batch = symbols[i: i + self._FILE_SYMBOL_SUB_BATCH]
+            with self.transaction():
+                self.upsert_symbols_batch(batch)
+            self._recycle_conn()
+
+        # 6. Write call edges in sub-batches of 500
+        for i in range(0, len(calls), self._FILE_CALL_SUB_BATCH):
+            batch = calls[i: i + self._FILE_CALL_SUB_BATCH]
+            with self.transaction():
+                for rec in batch:
+                    self.add_call(
+                        source_id=rec["src"],
+                        target_id=rec["dst"],
+                        confidence=float(rec.get("confidence", 0.5)),
+                        reason=rec.get("reason", "unknown"),
+                    )
+            self._recycle_conn()
+
+        # 7. Write type relations (IMPLEMENTS, OVERRIDES, REFERENCES_TYPE)
+        for i in range(0, len(type_rels), self._FILE_REL_SUB_BATCH):
+            batch = type_rels[i: i + self._FILE_REL_SUB_BATCH]
+            with self.transaction():
+                self.add_references_batch(batch)
+            self._recycle_conn()
+
+    def clear_file_by_path(self, project_id: str, project_path: str, file_path: str) -> None:
+        """Delete all graph data for a file identified by its filesystem path."""
+        from codespine.indexer.symbol_builder import file_id as _fid
+        import os as _os
+        rel_path = _os.path.relpath(os.path.abspath(file_path), os.path.abspath(project_path))
+        f_id = _fid(project_id, rel_path)
+        with self.transaction():
+            self.clear_file(f_id)
+        self._recycle_conn()
+
     def _recycle_conn(self) -> None:
         """Drop and recreate the per-thread connection to release buffer pages."""
         try:

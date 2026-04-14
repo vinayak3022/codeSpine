@@ -127,16 +127,31 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
             if snippet:
                 item["snippet"] = snippet
 
-    # Warn when all scores are near zero — the results are likely noise.
-    # The threshold 0.05 is calibrated for embedding mode.  Without sentence-
-    # transformers the hash-fallback vector and BM25/fuzzy signals produce lower
-    # RRF scores, so the warning fires on nearly every query.  Make the note
-    # context-aware so the agent understands whether this is a calibration issue
-    # or a genuine low-relevance result.
-    if top_k and top_k[0]["score"] < _LOW_CONFIDENCE_THRESHOLD:
+    # FR-10: Calibrate confidence labels based on name matching, not just score.
+    # Exact name match → "high"; partial match → "medium"; no match → "low".
+    # This prevents exact-match results being incorrectly labelled "low_confidence"
+    # when the embedding model is not installed.
+    has_exact_match = False
+    for item in top_k:
+        if not isinstance(item, dict) or "score" not in item:
+            continue
+        item_name = (item.get("name") or "").lower()
+        item_fqname = (item.get("fqname") or "").lower()
+        if item_name == query_lower or item_fqname == query_lower:
+            item["confidence"] = "high"
+            has_exact_match = True
+        elif query_lower in item_name or query_lower in item_fqname:
+            item["confidence"] = "medium"
+        else:
+            item["confidence"] = "low"
+
+    # Only add low-confidence warning when there are no exact matches AND all
+    # RRF scores are below the noise threshold.
+    if not has_exact_match and top_k and isinstance(top_k[0], dict) and top_k[0].get("score", 1.0) < _LOW_CONFIDENCE_THRESHOLD:
         has_model = _load_model() is not None
         for item in top_k:
-            item["low_confidence"] = True
+            if isinstance(item, dict) and "score" in item:
+                item["low_confidence"] = True
         if has_model:
             note = (
                 "Low confidence results — all scores below threshold. "
