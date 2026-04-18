@@ -495,35 +495,77 @@ class GraphStore:
     def upsert_symbols_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
             return
-        rows = [{"id": r["id"], "kind": r["kind"], "name": r["name"],
-                  "fqname": r["fqname"], "file_id": r["file_id"],
-                  "line": int(r["line"]), "col": int(r["col"]),
-                  "embedding": r.get("embedding")} for r in records]
-        if create_mode:
-            self.execute(
-                """
-                UNWIND $rows AS row
-                MATCH (f:File {id: row.file_id})
-                CREATE (s:Symbol {id: row.id, kind: row.kind, name: row.name,
-                                   fqname: row.fqname, file_id: row.file_id,
-                                   line: row.line, col: row.col, embedding: row.embedding})
-                CREATE (f)-[:DECLARES]->(s)
-                """,
-                {"rows": rows},
-            )
-        else:
-            self.execute(
-                """
-                UNWIND $rows AS row
-                MATCH (f:File {id: row.file_id})
-                MERGE (s:Symbol {id: row.id})
-                SET s.kind = row.kind, s.name = row.name, s.fqname = row.fqname,
-                    s.file_id = row.file_id, s.line = row.line, s.col = row.col,
-                    s.embedding = row.embedding
-                MERGE (f)-[:DECLARES]->(s)
-                """,
-                {"rows": rows},
-            )
+        # Split into rows with and without embeddings.
+        # Kuzu's UNWIND parameter type inference treats None as STRING, which
+        # conflicts with the FLOAT[384] column type.  Keeping the two groups
+        # separate avoids the type-mismatch error on fresh DBs.
+        rows_emb: list[dict] = []
+        rows_no_emb: list[dict] = []
+        for r in records:
+            emb = r.get("embedding")
+            base = {"id": r["id"], "kind": r["kind"], "name": r["name"],
+                    "fqname": r["fqname"], "file_id": r["file_id"],
+                    "line": int(r["line"]), "col": int(r["col"])}
+            if emb is not None:
+                rows_emb.append({**base, "embedding": emb})
+            else:
+                rows_no_emb.append(base)
+
+        op = "CREATE" if create_mode else "MERGE"
+        edge_op = "CREATE" if create_mode else "MERGE"
+
+        if rows_no_emb:
+            if create_mode:
+                self.execute(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (f:File {id: row.file_id})
+                    CREATE (s:Symbol {id: row.id, kind: row.kind, name: row.name,
+                                       fqname: row.fqname, file_id: row.file_id,
+                                       line: row.line, col: row.col})
+                    CREATE (f)-[:DECLARES]->(s)
+                    """,
+                    {"rows": rows_no_emb},
+                )
+            else:
+                self.execute(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (f:File {id: row.file_id})
+                    MERGE (s:Symbol {id: row.id})
+                    SET s.kind = row.kind, s.name = row.name, s.fqname = row.fqname,
+                        s.file_id = row.file_id, s.line = row.line, s.col = row.col
+                    MERGE (f)-[:DECLARES]->(s)
+                    """,
+                    {"rows": rows_no_emb},
+                )
+
+        if rows_emb:
+            if create_mode:
+                self.execute(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (f:File {id: row.file_id})
+                    CREATE (s:Symbol {id: row.id, kind: row.kind, name: row.name,
+                                       fqname: row.fqname, file_id: row.file_id,
+                                       line: row.line, col: row.col, embedding: row.embedding})
+                    CREATE (f)-[:DECLARES]->(s)
+                    """,
+                    {"rows": rows_emb},
+                )
+            else:
+                self.execute(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (f:File {id: row.file_id})
+                    MERGE (s:Symbol {id: row.id})
+                    SET s.kind = row.kind, s.name = row.name, s.fqname = row.fqname,
+                        s.file_id = row.file_id, s.line = row.line, s.col = row.col,
+                        s.embedding = row.embedding
+                    MERGE (f)-[:DECLARES]->(s)
+                    """,
+                    {"rows": rows_emb},
+                )
 
     def add_call(self, source_id: str, target_id: str, confidence: float, reason: str) -> None:
         self.execute(

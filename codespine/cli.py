@@ -6,7 +6,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
 import psutil
@@ -89,6 +92,149 @@ def _bar(done: int, total: int, width: int = 20) -> str:
 
 def _spinner_char() -> str:
     return "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.perf_counter() * 8) % 10]
+
+
+def _index_shard_group(
+    shard_idx: int,
+    modules: list[tuple[str, str]],
+    sg,
+    full: bool,
+    embed: bool,
+    output_lock: threading.Lock,
+    parallel: bool,
+) -> tuple[int, list, int]:
+    """Index one group of modules that share a shard.
+
+    Modules within the group are always indexed sequentially (same KùzuDB).
+    Multiple groups can run concurrently in different threads when they own
+    different shards.
+
+    Returns (total_files_found, all_results, shard_idx).
+    """
+    results = []
+    total_files = 0
+
+    def _locked_echo(*args, **kwargs) -> None:
+        """Thread-safe click.echo."""
+        with output_lock:
+            click.echo(*args, **kwargs)
+
+    def _locked_secho(*args, **kwargs) -> None:
+        with output_lock:
+            click.secho(*args, **kwargs)
+
+    prefix = f"[S{shard_idx}] " if parallel else ""
+
+    for mod_path, project_id in modules:
+        # Per-module progress state (local — no shared mutation).
+        parse_state: dict = {"shown": False, "indexed": 0, "total": 0,
+                              "last_ts": 0.0, "printed_zero": False}
+        call_state: dict = {"shown": False, "count": 0, "last_ts": 0.0,
+                             "started_at": 0.0}
+
+        def _progress(event: str, payload: dict) -> None:
+            now = time.perf_counter()
+            if event == "scan_done":
+                with output_lock:
+                    _phase(f"{prefix}Walking files...", f"{int(payload.get('files_found', 0))} files found")
+                return
+            if event == "plan_done":
+                to_index = int(payload.get("files_to_index", 0))
+                deleted = int(payload.get("deleted_files", 0))
+                mode = str(payload.get("mode", "incremental"))
+                parse_state["total"] = to_index
+                with output_lock:
+                    _phase(f"{prefix}Index mode...", f"{mode} ({to_index} files, {deleted} deleted)")
+                if to_index == 0:
+                    with output_lock:
+                        _phase(f"{prefix}Parsing code...", "0/0")
+                    parse_state["printed_zero"] = True
+                return
+            if event == "parse_progress":
+                indexed = int(payload.get("indexed", 0))
+                total = int(payload.get("total", 0))
+                parse_state["indexed"] = indexed
+                parse_state["total"] = total
+                if total == 0:
+                    return
+                if indexed == total or (now - parse_state["last_ts"]) >= 0.2:
+                    if not parallel:
+                        # In-place progress bar only makes sense in serial mode.
+                        click.echo(
+                            f"\r{prefix}Parsing code...   {_bar(indexed, total)} {indexed}/{total}  ",
+                            nl=False,
+                        )
+                    else:
+                        with output_lock:
+                            click.echo(
+                                f"\r{prefix}Parsing {indexed}/{total}  ",
+                                nl=False,
+                            )
+                    parse_state["shown"] = True
+                    parse_state["last_ts"] = now
+                return
+            if event in ("resolve_calls_start",):
+                if parse_state["shown"]:
+                    with output_lock:
+                        click.echo()
+                    parse_state["shown"] = False
+                call_state["started_at"] = now
+                with output_lock:
+                    _phase(f"{prefix}Tracing calls...", "starting...")
+                return
+            if event == "resolve_calls_progress":
+                call_state["count"] = int(payload.get("calls_resolved", 0))
+                if (now - call_state["last_ts"]) >= 0.25:
+                    elapsed_s = now - call_state["started_at"]
+                    if not parallel:
+                        click.echo(
+                            f"\r{_spinner_char()} {prefix}Tracing calls...   "
+                            f"{call_state['count']:>6} resolved  {elapsed_s:.1f}s  ",
+                            nl=False,
+                        )
+                    else:
+                        with output_lock:
+                            click.echo(
+                                f"\r{prefix}Calls: {call_state['count']} ({elapsed_s:.0f}s)  ",
+                                nl=False,
+                            )
+                    call_state["shown"] = True
+                    call_state["last_ts"] = now
+                return
+            if event == "resolve_calls_done":
+                if call_state["shown"]:
+                    with output_lock:
+                        click.echo()
+                call_state["shown"] = False
+                elapsed_s = (now - call_state["started_at"]) if call_state["started_at"] else 0.0
+                n = int(payload.get("calls_resolved", 0))
+                with output_lock:
+                    _phase(f"{prefix}Tracing calls...", f"{n} calls resolved  ({elapsed_s:.1f}s)")
+                return
+            if event == "resolve_types_start":
+                with output_lock:
+                    _phase(f"{prefix}Analyzing types...", "running")
+                return
+            if event == "resolve_types_done":
+                n = int(payload.get("type_relationships", 0))
+                with output_lock:
+                    _phase(f"{prefix}Analyzing types...", f"{n} type relationships")
+                return
+
+        shard_store = sg.shard(project_id)
+        indexer = JavaIndexer(shard_store)
+        result = indexer.index_project(
+            mod_path, full=full, progress=_progress, project_id=project_id, embed=embed
+        )
+        results.append(result)
+        total_files += result.files_found
+
+        # Flush any dangling progress line.
+        if parse_state["shown"]:
+            with output_lock:
+                click.echo()
+
+    return shard_idx, results, total_files
 
 
 def _show_shard_topology(as_json: bool) -> None:
@@ -217,103 +363,69 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
 
     root_basename = os.path.basename(abs_path)
 
-    # Shared progress state (reset per module)
-    parse_state = {"shown": False, "indexed": 0, "total": 0, "last_ts": 0.0, "printed_zero": False}
-    call_state = {"shown": False, "count": 0, "last_ts": 0.0, "started_at": 0.0}
+    # ── Group modules by target shard ─────────────────────────────────
+    # Modules that hash to different shards own separate KùzuDBs and can
+    # be indexed in parallel.  Modules in the same shard (same project
+    # root for multi-module projects) are always indexed sequentially.
+    shard_groups: dict[int, list[tuple[str, str]]] = defaultdict(list)
+    for mod_path, pid in modules_with_ids:
+        shard_groups[sg.router.shard_for(pid)].append((mod_path, pid))
 
-    def _reset_state() -> None:
-        for k in list(parse_state):
-            parse_state[k] = False if isinstance(parse_state[k], bool) else (0.0 if isinstance(parse_state[k], float) else 0)
-        parse_state["last_ts"] = 0.0
-
-    def _progress(event: str, payload: dict) -> None:
-        now = time.perf_counter()
-        if event == "scan_done":
-            _phase("Walking files...", f"{int(payload.get('files_found', 0))} files found")
-            return
-        if event == "plan_done":
-            to_index = int(payload.get("files_to_index", 0))
-            deleted = int(payload.get("deleted_files", 0))
-            mode = str(payload.get("mode", "incremental"))
-            parse_state["total"] = to_index
-            _phase("Index mode...", f"{mode} ({to_index} files to index, {deleted} deleted)")
-            if to_index == 0:
-                _phase("Parsing code...", "0/0")
-                parse_state["printed_zero"] = True
-            return
-        if event == "parse_progress":
-            indexed = int(payload.get("indexed", 0))
-            total = int(payload.get("total", 0))
-            parse_state["indexed"] = indexed
-            parse_state["total"] = total
-            if total == 0:
-                return
-            if indexed == total or (now - parse_state["last_ts"]) >= 0.2:
-                click.echo(f"\rParsing code...   {_bar(indexed, total)} {indexed}/{total}  ", nl=False)
-                parse_state["shown"] = True
-                parse_state["last_ts"] = now
-            return
-        if event == "resolve_calls_start" and parse_state["shown"]:
-            click.echo()
-            parse_state["shown"] = False
-            call_state["started_at"] = now
-            _phase("Tracing calls...", "starting...")
-            return
-        if event == "resolve_calls_start":
-            call_state["started_at"] = now
-            _phase("Tracing calls...", "starting...")
-            return
-        if event == "resolve_calls_progress":
-            call_state["count"] = int(payload.get("calls_resolved", 0))
-            if (now - call_state["last_ts"]) >= 0.25:
-                elapsed_s = now - call_state["started_at"]
-                click.echo(
-                    f"\r{_spinner_char()} Tracing calls...   {call_state['count']:>6} resolved  {elapsed_s:.1f}s  ",
-                    nl=False,
-                )
-                call_state["shown"] = True
-                call_state["last_ts"] = now
-            return
-        if event == "resolve_calls_done":
-            if call_state["shown"]:
-                click.echo()
-            call_state["shown"] = False
-            elapsed_s = (now - call_state["started_at"]) if call_state["started_at"] else 0.0
-            _phase("Tracing calls...", f"{int(payload.get('calls_resolved', 0))} calls resolved  ({elapsed_s:.1f}s)")
-            return
-        if event == "resolve_types_start":
-            _phase("Analyzing types...", "running")
-            return
-        if event == "resolve_types_done":
-            _phase("Analyzing types...", f"{int(payload.get('type_relationships', 0))} type relationships")
-            return
-
-    # --- Index each module ---
     is_multi = len(modules_with_ids) > 1
-    total_files_found = 0
-    last_result = None
-    for idx, (module_path, project_id) in enumerate(modules_with_ids):
-        if is_multi:
-            shard_idx = sg.router.shard_for(project_id)
-            click.echo()
-            click.secho(
-                f"[{idx + 1}/{len(modules_with_ids)}] Indexing: {project_id}  (shard {shard_idx})",
-                fg="cyan",
-            )
-        _reset_state()
-        # Use the shard store for this project so data lands in the right DB.
-        shard_store = sg.shard(project_id)
-        indexer = JavaIndexer(shard_store)
-        last_result = indexer.index_project(
-            module_path, full=full, progress=_progress, project_id=project_id, embed=embed
+    parallel_mode = len(shard_groups) > 1  # ≥2 shards → true parallelism
+    output_lock = threading.Lock()
+
+    if parallel_mode:
+        click.secho(
+            f"Parallel mode: {len(shard_groups)} shards will be indexed concurrently.",
+            fg="cyan",
         )
-        total_files_found += last_result.files_found
-        if parse_state["shown"]:
-            click.echo()
-        if parse_state["total"] == 0 and not parse_state["printed_zero"]:
-            _phase("Parsing code...", "0/0")
-        elif parse_state["indexed"] < parse_state["total"]:
-            _phase("Parsing code...", f"{parse_state['indexed']}/{parse_state['total']}")
+
+    # Print which shard each module lands on (multi-module only).
+    if is_multi:
+        for s_idx, group in sorted(shard_groups.items()):
+            for _, pid in group:
+                click.secho(f"  {pid:<40} → shard {s_idx}", fg="cyan")
+
+    # ── Dispatch to shards ────────────────────────────────────────────
+    total_files_found = 0
+    all_results: list = []
+    last_result = None
+
+    if parallel_mode:
+        max_workers = min(len(shard_groups), 4)
+        click.echo()
+        futures_map = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="codespine-shard") as ex:
+            for s_idx, group in shard_groups.items():
+                f = ex.submit(
+                    _index_shard_group,
+                    s_idx, group, sg, full, embed, output_lock, True,
+                )
+                futures_map[f] = s_idx
+
+            for future in as_completed(futures_map):
+                s_idx = futures_map[future]
+                try:
+                    ret_idx, results, n_files = future.result()
+                    all_results.extend(results)
+                    total_files_found += n_files
+                    if results:
+                        last_result = results[-1]
+                    with output_lock:
+                        click.secho(f"  Shard {ret_idx} done ({n_files} files)", fg="green")
+                except Exception as exc:  # noqa: BLE001
+                    with output_lock:
+                        click.secho(f"  Shard {s_idx} FAILED: {exc}", fg="red")
+    else:
+        # Serial path — single shard (or single module).  Full progress UX.
+        only_shard_idx = next(iter(shard_groups))
+        only_group = shard_groups[only_shard_idx]
+        _, all_results, total_files_found = _index_shard_group(
+            only_shard_idx, only_group, sg, full, embed, output_lock, False,
+        )
+        if all_results:
+            last_result = all_results[-1]
 
     # ── Helper for in-place progress updates ────────────────────────────
     def _live_phase(label: str, status: str) -> None:
