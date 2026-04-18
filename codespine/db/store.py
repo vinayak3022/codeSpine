@@ -8,7 +8,7 @@ import shutil
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import Any
 
 import kuzu
@@ -39,8 +39,26 @@ _RECOVERABLE_DB_ERROR_MARKERS = (
 @dataclass
 class GraphStore:
     read_only: bool = False
+    # Optional path overrides — when provided, the store uses these paths
+    # instead of the global SETTINGS values.  The ShardedGraphStore uses
+    # this to give each shard its own isolated KùzuDB directory.
+    db_path_override: InitVar[str | None] = None
+    snapshot_path_override: InitVar[str | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        db_path_override: str | None,
+        snapshot_path_override: str | None,
+    ) -> None:
+        # Resolve effective paths — per-shard overrides win over global SETTINGS.
+        self._db_path: str = db_path_override or SETTINGS.db_path
+        self._snapshot_path: str = snapshot_path_override or SETTINGS.db_snapshot_path
+
+        # Per-instance snapshot synchronisation (not class-level) so that
+        # multiple shards can snapshot concurrently without a shared bottleneck.
+        self._inst_snapshot_lock: threading.Lock = threading.Lock()
+        self._inst_snapshot_pending: threading.Event = threading.Event()
+
         self._tls: threading.local = threading.local()
         from codespine.overlay.store import OverlayStore
 
@@ -48,10 +66,10 @@ class GraphStore:
 
         # Read-only callers (MCP, CLI reads) use the read replica when available.
         # This isolates them from the write process's buffer pool and WAL churn.
-        if self.read_only and os.path.exists(SETTINGS.db_snapshot_path):
-            db_path = SETTINGS.db_snapshot_path
+        if self.read_only and os.path.exists(self._snapshot_path):
+            db_path = self._snapshot_path
         else:
-            db_path = SETTINGS.db_path
+            db_path = self._db_path
 
         try:
             self.db = self._open_with_recovery(db_path)
@@ -97,7 +115,7 @@ class GraphStore:
         try:
             ensure_schema(self._conn())
         except Exception as exc:
-            path = getattr(self.db, "database_path", SETTINGS.db_path)
+            path = getattr(self.db, "database_path", self._db_path)
             if not self._is_recoverable_db_error(exc):
                 raise
             LOGGER.warning("Rebuilding corrupted or incompatible Kuzu DB at %s during schema init: %s", path, exc)
@@ -768,8 +786,7 @@ class GraphStore:
         self.clear_flows()
         self.clear_coupling()
 
-    @staticmethod
-    def force_delete_all_data() -> list[str]:
+    def force_delete_all_data(self) -> list[str]:
         """Delete all CodeSpine data files without touching the Kuzu engine.
 
         This is the nuclear option for OOM recovery: when the buffer pool is
@@ -779,12 +796,14 @@ class GraphStore:
 
         Returns the list of paths that were removed.
         """
+        db_path = self._db_path
+        snapshot_path = self._snapshot_path
         removed: list[str] = []
         for path in [
-            SETTINGS.db_path,
-            SETTINGS.db_snapshot_path,
-            SETTINGS.db_snapshot_path + ".updated",
-            SETTINGS.db_snapshot_path + ".tmp",
+            db_path,
+            snapshot_path,
+            snapshot_path + ".updated",
+            snapshot_path + ".tmp",
             SETTINGS.embedding_cache_path,
             SETTINGS.overlay_dir,
             SETTINGS.index_meta_dir,
@@ -801,7 +820,7 @@ class GraphStore:
                 pass
         # Also remove any stale WAL files next to the DB
         for suffix in (".wal", ".lock"):
-            wal_path = SETTINGS.db_path + suffix
+            wal_path = db_path + suffix
             if os.path.exists(wal_path):
                 try:
                     os.remove(wal_path)
@@ -812,7 +831,7 @@ class GraphStore:
 
     def rebuild_empty_db(self) -> None:
         self._recycle_conn()
-        path = SETTINGS.db_path
+        path = self._db_path
         # Remove the DB directory AND any stale WAL / lock files
         self._remove_db_path(path)
         for suffix in (".wal", ".lock"):
@@ -825,11 +844,8 @@ class GraphStore:
 
         # Also remove the read replica so that read-only callers (stats, MCP)
         # don't continue to see stale data from before the wipe.
-        for stale in [
-            SETTINGS.db_snapshot_path,
-            SETTINGS.db_snapshot_path + ".tmp",
-            SETTINGS.db_snapshot_path + ".updated",
-        ]:
+        snap = self._snapshot_path
+        for stale in [snap, snap + ".tmp", snap + ".updated"]:
             self._remove_db_path(stale)
 
         # Kuzu may retain stale internal state from a previous failed open of
@@ -926,17 +942,14 @@ class GraphStore:
             },
         )
 
-    # Lock and flag for background snapshot coalescing.
-    # Only one snapshot runs at a time; a pending request supersedes queued ones.
-    _snapshot_lock: threading.Lock = threading.Lock()
-    _snapshot_pending: threading.Event = threading.Event()
-
-    @staticmethod
-    def snapshot_to_read_replica(background: bool = False) -> bool:
+    def snapshot_to_read_replica(self, background: bool = False) -> bool:
         """Atomically copy the write DB to the read-replica path.
 
         The read replica is used by the MCP daemon and all read-only CLI
         commands so they never contend with the write process's buffer pool.
+
+        Each GraphStore instance has its own snapshot lock so that multiple
+        shards can snapshot concurrently without serialising on a class lock.
 
         Parameters
         ----------
@@ -950,36 +963,38 @@ class GraphStore:
         Returns True on success (or when dispatched to background), False if
         the source DB does not exist.
         """
-        src = SETTINGS.db_path
+        src = self._db_path
         if not os.path.exists(src):
             return False
 
         if background:
             # Signal that a snapshot is wanted, then ensure a worker is running.
-            GraphStore._snapshot_pending.set()
+            self._inst_snapshot_pending.set()
+            inst = self  # capture for closure
 
             def _worker() -> None:
-                while GraphStore._snapshot_pending.is_set():
-                    GraphStore._snapshot_pending.clear()
-                    with GraphStore._snapshot_lock:
-                        GraphStore._do_snapshot()
+                while inst._inst_snapshot_pending.is_set():
+                    inst._inst_snapshot_pending.clear()
+                    with inst._inst_snapshot_lock:
+                        inst._do_snapshot()
 
-            if not GraphStore._snapshot_lock.locked():
+            if not self._inst_snapshot_lock.locked():
                 t = threading.Thread(target=_worker, daemon=True, name="codespine-snapshot")
                 t.start()
             return True
 
         # Foreground (blocking) path — used by CLI analyse and tests.
-        with GraphStore._snapshot_lock:
-            return GraphStore._do_snapshot()
+        with self._inst_snapshot_lock:
+            return self._do_snapshot()
 
-    @staticmethod
-    def _do_snapshot() -> bool:
-        """Perform the actual copy.  Must be called with _snapshot_lock held."""
-        src = SETTINGS.db_path
-        dst = SETTINGS.db_snapshot_path
+    def _do_snapshot(self) -> bool:
+        """Perform the actual copy.  Must be called with the instance snapshot lock held."""
+        src = self._db_path
+        dst = self._snapshot_path
         if not os.path.exists(src):
             return False
+        # Ensure the parent directory for the replica exists (shards layout).
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         tmp = dst + ".tmp"
         try:
             if os.path.exists(tmp):
@@ -987,7 +1002,6 @@ class GraphStore:
             if os.path.isdir(src):
                 shutil.copytree(src, tmp)
             else:
-                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
                 shutil.copy2(src, tmp)
             if os.path.exists(dst):
                 shutil.rmtree(dst, ignore_errors=True)

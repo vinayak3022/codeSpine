@@ -20,6 +20,7 @@ from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
 from codespine.config import SETTINGS
 from codespine.db.store import GraphStore
+from codespine.sharding import ShardedGraphStore, ShardRouter
 from codespine.diff.branch_diff import compare_branches
 from codespine.indexer.engine import JavaIndexer
 from codespine.mcp.server import build_mcp_server
@@ -90,6 +91,54 @@ def _spinner_char() -> str:
     return "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.perf_counter() * 8) % 10]
 
 
+def _show_shard_topology(as_json: bool) -> None:
+    """Display the current shard routing topology and imbalance metrics."""
+    router = ShardRouter()
+    sg = ShardedGraphStore(read_only=True)
+    topology = sg.describe()
+
+    # Gather project → shard mapping from all shards.
+    shard_project_counts: dict[int, list[str]] = {i: [] for i in range(router.num_shards)}
+    for p in sg.list_project_metadata():
+        pid = p.get("id", "")
+        idx = router.shard_for(pid)
+        shard_project_counts[idx].append(pid)
+
+    counts = [len(v) for v in shard_project_counts.values()]
+    total = sum(counts)
+    median = sorted(counts)[len(counts) // 2] if counts else 0
+    max_count = max(counts) if counts else 0
+    imbalance = (max_count / median) if median else 1.0
+
+    if as_json:
+        _echo_json({
+            "topology": topology,
+            "project_distribution": {str(k): v for k, v in shard_project_counts.items()},
+            "imbalance_ratio": round(imbalance, 2),
+        }, as_json=True)
+        return
+
+    click.secho(f"Shard topology ({router.num_shards} shards)", fg="cyan")
+    click.echo(f"  Directory : {router.shards_dir}")
+    click.echo(f"  Ring size : {len(router._ring)} virtual nodes ({router.num_shards} × {150})")
+    click.echo(f"  Projects  : {total} total, imbalance ratio {imbalance:.2f}x")
+    click.echo()
+    header = f"{'Shard':>6}  {'Projects':>9}  {'DB exists':>10}  Path"
+    click.secho(header, fg="cyan")
+    click.echo("-" * 60)
+    for i, info in enumerate(topology.get("shards", [])):
+        plist = shard_project_counts.get(i, [])
+        exists_str = "yes" if info.get("exists") else "no"
+        click.echo(f"{i:>6}  {len(plist):>9}  {exists_str:>10}  {info.get('db_path', '')}")
+        for pid in plist:
+            click.echo(f"{'':>6}  {'':>9}  {'':>10}    {pid}")
+    if imbalance > 2.0:
+        click.secho(
+            f"\nWarning: imbalance ratio {imbalance:.1f}x. Consider re-indexing to redistribute projects.",
+            fg="yellow",
+        )
+
+
 @click.group()
 def main() -> None:
     """CodeSpine CLI."""
@@ -130,8 +179,12 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
                 fg="yellow",
             )
 
-    store = GraphStore(read_only=False)
-    indexer = JavaIndexer(store)
+    # ShardedGraphStore routes each project to its dedicated DB shard.
+    # For single-project analysis this is transparent — shard() always
+    # returns a GraphStore pointing to the correct shard path.
+    sg = ShardedGraphStore(read_only=False)
+    # The indexer is initialised per-module below with the right shard store.
+    # We keep a single ShardedGraphStore to fan-out cross-module linking later.
 
     # --- Workspace → project → module detection ---
     # Level 1: workspace (e.g. ~/IdeaProjects/) may contain independent projects.
@@ -241,9 +294,16 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
     last_result = None
     for idx, (module_path, project_id) in enumerate(modules_with_ids):
         if is_multi:
+            shard_idx = sg.router.shard_for(project_id)
             click.echo()
-            click.secho(f"[{idx + 1}/{len(modules_with_ids)}] Indexing: {project_id}", fg="cyan")
+            click.secho(
+                f"[{idx + 1}/{len(modules_with_ids)}] Indexing: {project_id}  (shard {shard_idx})",
+                fg="cyan",
+            )
         _reset_state()
+        # Use the shard store for this project so data lands in the right DB.
+        shard_store = sg.shard(project_id)
+        indexer = JavaIndexer(shard_store)
         last_result = indexer.index_project(
             module_path, full=full, progress=_progress, project_id=project_id, embed=embed
         )
@@ -264,13 +324,18 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         """Finalise an in-place phase line and move to the next line."""
         click.echo(f"\r✓ {label:<28} {result:<48}")
 
+    # For cross-module operations (cross-module linking, deep analysis, stats)
+    # we use the shard store for the root project (all modules share one shard).
+    root_project_id = last_result.project_id if last_result else root_basename
+    root_shard_store = sg.shard(root_project_id)
+
     # ── Cross-module call linking ──────────────────────────────────────
     if is_multi and len(modules_with_ids) > 1:
         xmod_label = "Cross-module linking..."
         _live_phase(xmod_label, "running")
         xmod_pids = [pid for _, pid in modules_with_ids]
         xmod_edges = link_cross_module_calls(
-            store, project_ids=xmod_pids,
+            root_shard_store, project_ids=xmod_pids,
             progress=lambda s: _live_phase(xmod_label, s),
         )
         _finish_phase(xmod_label, f"{xmod_edges} cross-module call edges")
@@ -287,7 +352,7 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         comm_label = "Detecting communities..."
         _live_phase(comm_label, "running")
         communities = detect_communities(
-            store,
+            root_shard_store,
             progress=lambda s: _live_phase(comm_label, s),
         )
         _finish_phase(comm_label, f"{len(communities)} clusters found")
@@ -295,23 +360,23 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         flow_label = "Detecting execution flows..."
         _live_phase(flow_label, "running")
         flows = trace_execution_flows(
-            store,
+            root_shard_store,
             progress=lambda s: _live_phase(flow_label, s),
         )
         _finish_phase(flow_label, f"{len(flows)} processes found")
 
         dead_label = "Finding dead code..."
         _live_phase(dead_label, "running")
-        dead = detect_dead_code(store, limit=500)
+        dead = detect_dead_code(root_shard_store, limit=500)
         _finish_phase(dead_label, f"{_dead_result_count(dead)} unreachable symbols")
 
         coup_label = "Analyzing git history..."
         _live_phase(coup_label, "running")
-        store.clear_coupling()
+        root_shard_store.clear_coupling()
         coupling_root = abs_path
         coupling_project = root_basename if is_multi else (last_result.project_id if last_result else root_basename)
         coupling_pairs = compute_coupling(
-            store,
+            root_shard_store,
             coupling_root,
             coupling_project,
             days=SETTINGS.default_coupling_days,
@@ -329,7 +394,7 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         flow_label = "Detecting execution flows..."
         _live_phase(flow_label, "running (lightweight)")
         try:
-            flows = trace_execution_flows(store, max_depth=3)
+            flows = trace_execution_flows(root_shard_store, max_depth=3)
         except Exception:
             flows = []
         _finish_phase(flow_label, f"{len(flows)} flows (lightweight; rerun with --deep for full)")
@@ -337,14 +402,14 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
         dead_label = "Finding dead code..."
         _live_phase(dead_label, "running (lightweight)")
         try:
-            dead = detect_dead_code(store, limit=100)
+            dead = detect_dead_code(root_shard_store, limit=100)
         except Exception:
             dead = []
         _finish_phase(dead_label, f"{_dead_result_count(dead)} candidates (lightweight; rerun with --deep for full)")
 
         _phase("Analyzing git history...", "skipped (large repo; rerun with --deep)")
 
-    vector_count = store.query_records(
+    vector_count = root_shard_store.query_records(
         """
         MATCH (s:Symbol)
         WHERE s.embedding IS NOT NULL
@@ -355,8 +420,8 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
     vectors_stored = int(vector_count[0]["count"]) if vector_count else embeddings_generated
     _phase("Generating embeddings...", f"{vectors_stored} vectors stored")
 
-    symbol_count = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
-    edge_count = store.query_records("MATCH ()-[r]->() RETURN count(r) as count")
+    symbol_count = root_shard_store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
+    edge_count = root_shard_store.query_records("MATCH ()-[r]->() RETURN count(r) as count")
     symbols = int(symbol_count[0]["count"]) if symbol_count else 0
     edges = int(edge_count[0]["count"]) if edge_count else 0
     elapsed = time.perf_counter() - started
@@ -376,7 +441,7 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
 
     # Detect unresolved imports → hint about unindexed sibling projects
     try:
-        unresolved = JavaIndexer.detect_unresolved_imports(store)
+        unresolved = JavaIndexer.detect_unresolved_imports(root_shard_store)
         if unresolved:
             click.echo()
             click.secho("⚠  Unresolved imports — consider indexing these projects:", fg="yellow")
@@ -387,13 +452,12 @@ def analyse(path: str, full: bool, deep: bool, embed: bool, allow_running: bool)
 
     # Publish a read replica so MCP and read-only CLI commands (search, stats…)
     # run against an isolated snapshot rather than competing with the write
-    # process's buffer pool.  The MCP daemon detects the sentinel file and
-    # hot-reloads without restarting.
+    # process's buffer pool.  Snapshot all open shards concurrently.
     snap_label = "Publishing read replica..."
     _live_phase(snap_label, "copying")
-    store._recycle_conn()
-    snapped = GraphStore.snapshot_to_read_replica()
-    _finish_phase(snap_label, "MCP will reload automatically" if snapped else "skipped (source DB not found)")
+    root_shard_store._recycle_conn()
+    sg.snapshot_all(background=False)
+    _finish_phase(snap_label, "MCP will reload automatically")
 
 
 @main.command()
@@ -523,10 +587,21 @@ def diff(range_spec: str, as_json: bool) -> None:
 
 @main.command()
 @click.option("--json", "as_json", is_flag=True)
-def stats(as_json: bool) -> None:
+@click.option("--shards", "show_shards", is_flag=True, help="Show shard topology and load distribution.")
+def stats(as_json: bool, show_shards: bool) -> None:
     """Show per-project and aggregate graph statistics."""
-    store = GraphStore(read_only=True)
-    projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path ORDER BY p.id")
+    if show_shards:
+        _show_shard_topology(as_json)
+        return
+
+    # Fan-out across all shards so stats covers every project in the cluster.
+    sg = ShardedGraphStore(read_only=True)
+    all_projects_meta = sg.list_project_metadata()
+
+    # For detailed stats we need the per-project shard store.
+    def _project_store(pid: str):
+        return sg.shard(pid)
+
     if not projects:
         click.secho("No projects indexed yet. Run 'codespine analyse <path>'.", fg="yellow")
         return
@@ -534,10 +609,12 @@ def stats(as_json: bool) -> None:
     rows = []
     for p in projects:
         pid = p["id"]
-        files = store.query_records(
+        # Route each query to the project's owning shard.
+        ps = _project_store(pid)
+        files = ps.query_records(
             "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n", {"pid": pid}
         )
-        classes = store.query_records(
+        classes = ps.query_records(
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -546,7 +623,7 @@ def stats(as_json: bool) -> None:
             """,
             {"pid": pid},
         )
-        methods = store.query_records(
+        methods = ps.query_records(
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -557,7 +634,7 @@ def stats(as_json: bool) -> None:
             """,
             {"pid": pid},
         )
-        calls = store.query_records(
+        calls = ps.query_records(
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -568,7 +645,7 @@ def stats(as_json: bool) -> None:
             """,
             {"pid": pid},
         )
-        emb = store.query_records(
+        emb = ps.query_records(
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -580,6 +657,7 @@ def stats(as_json: bool) -> None:
         rows.append({
             "project": pid,
             "path": p["path"],
+            "shard": sg.router.shard_for(pid),
             "files": files[0]["n"] if files else 0,
             "classes": classes[0]["n"] if classes else 0,
             "methods": methods[0]["n"] if methods else 0,
@@ -592,13 +670,13 @@ def stats(as_json: bool) -> None:
         return
 
     col_w = max(len(r["project"]) for r in rows)
-    header = f"{'Project':<{col_w}}  {'Files':>6}  {'Classes':>8}  {'Methods':>8}  {'Calls':>7}  {'Emb':>6}  Path"
+    header = f"{'Project':<{col_w}}  {'Shard':>5}  {'Files':>6}  {'Classes':>8}  {'Methods':>8}  {'Calls':>7}  {'Emb':>6}  Path"
     click.secho(header, fg="cyan")
     click.echo("-" * len(header))
     total_files = total_classes = total_methods = total_calls = total_emb = 0
     for r in rows:
         click.echo(
-            f"{r['project']:<{col_w}}  {r['files']:>6}  {r['classes']:>8}  {r['methods']:>8}  {r['calls_out']:>7}  {r['embeddings']:>6}  {r['path']}"
+            f"{r['project']:<{col_w}}  {r.get('shard', 0):>5}  {r['files']:>6}  {r['classes']:>8}  {r['methods']:>8}  {r['calls_out']:>7}  {r['embeddings']:>6}  {r['path']}"
         )
         total_files += r["files"]
         total_classes += r["classes"]
@@ -608,7 +686,7 @@ def stats(as_json: bool) -> None:
     if len(rows) > 1:
         click.echo("-" * len(header))
         click.secho(
-            f"{'TOTAL':<{col_w}}  {total_files:>6}  {total_classes:>8}  {total_methods:>8}  {total_calls:>7}  {total_emb:>6}",
+            f"{'TOTAL':<{col_w}}  {'':>5}  {total_files:>6}  {total_classes:>8}  {total_methods:>8}  {total_calls:>7}  {total_emb:>6}",
             fg="green",
         )
 
