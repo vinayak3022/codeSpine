@@ -17,7 +17,7 @@ class Settings:
 
     # Storage backend: "kuzu" (default, property-graph) or "duckdb" (relational).
     # Override at runtime via CODESPINE_BACKEND env var before starting the process.
-    backend: str = field(default_factory=lambda: os.environ.get("CODESPINE_BACKEND", "kuzu"))
+    backend: str = field(default_factory=lambda: os.environ.get("CODESPINE_BACKEND", "duckdb"))
 
     pid_file: str = os.path.expanduser("~/.codespine.pid")
     log_file: str = os.path.expanduser("~/.codespine.log")

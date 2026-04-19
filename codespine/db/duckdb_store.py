@@ -240,10 +240,33 @@ class DuckDBStore:
             self._conn.execute(sql)
 
     def query_records(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """Execute a SQL query and return rows as a list of dicts."""
+        """Execute a SQL (or Cypher) query and return rows as a list of dicts.
+
+        When *query* looks like Cypher (starts with MATCH), it is transparently
+        translated to DuckDB SQL via ``_cypher_compat.translate`` before execution.
+        After translation the SQL uses ``$name`` named placeholders which DuckDB
+        accepts when the params dict is passed directly.
+
+        For callers that pass raw SQL with positional ``?`` placeholders (e.g.,
+        tests and internal helpers), a dict is safely converted to a value list
+        so the existing call-sites never need to change.
+        """
+        from codespine.db._cypher_compat import is_cypher, translate  # lazy import
+
+        use_named_params = False
+        if is_cypher(query):
+            query, params = translate(query, params)
+            # translate() preserves/returns a dict; SQL uses $name placeholders.
+            use_named_params = True
+
         if params:
-            param_vals = list(params.values()) if isinstance(params, dict) else params
-            rel = self._conn.execute(query, param_vals)
+            if use_named_params and isinstance(params, dict):
+                # Named $param style — DuckDB accepts dict directly
+                rel = self._conn.execute(query, params)
+            else:
+                # Positional ? style — DuckDB requires a list
+                param_vals = list(params.values()) if isinstance(params, dict) else list(params)
+                rel = self._conn.execute(query, param_vals)
         else:
             rel = self._conn.execute(query)
         cols = [d[0] for d in rel.description or []]

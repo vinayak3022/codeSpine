@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codespine"
-version = "0.9.9"
+version = "1.0.0"
 description = "Local Java code intelligence indexer backed by a graph database"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ classifiers = [
 ]
 dependencies = [
   "click",
+  "duckdb>=0.10.0",
   "kuzu",
   "tree-sitter",
   "tree-sitter-java",
@@ -44,15 +45,11 @@ community = [
   "igraph",
   "leidenalg"
 ]
-duckdb = [
-  "duckdb>=0.10.0"
-]
 full = [
   "sentence-transformers",
   "numpy",
   "igraph",
-  "leidenalg",
-  "duckdb>=0.10.0"
+  "leidenalg"
 ]
 
 [project.urls]

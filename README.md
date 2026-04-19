@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v0.9.9** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.0.0** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 
@@ -36,13 +36,7 @@ Optional semantic search (sentence-transformers):
 pip install "codespine[ml]"
 ```
 
-Optional DuckDB storage backend (faster bulk writes for large repos):
-
-```bash
-pip install "codespine[duckdb]"
-```
-
-Everything at once:
+Everything at once (ml + community detection):
 
 ```bash
 pip install "codespine[full]"
@@ -428,29 +422,27 @@ projects = sg.list_project_metadata()    # fan-out across all shards
 
 ---
 
-## DuckDB Backend (Experimental)
+## Storage Backends
 
-For repos that index > 20 k–40 k LOC or need faster bulk write throughput, CodeSpine can use DuckDB instead of KùzuDB as the storage layer.
+CodeSpine ships two storage backends.  **DuckDB is the default** starting with v1.0.0.  KùzuDB is retained as the alternate for users who need its property-graph Cypher interface.
 
-**DuckDB advantages:**
-- 10–50× faster batch writes (`executemany` with flat relational tables vs. Kuzu's property-graph MERGE/UNWIND).
+### DuckDB (default)
+
+- 10–50× faster batch writes (`executemany` on flat relational tables vs. Kuzu's property-graph MERGE/UNWIND).
 - Single-file database — snapshots are a plain file copy after `CHECKPOINT`.
-- Standard SQL for direct inspection with any DuckDB client.
+- Standard SQL for direct inspection with any DuckDB client or notebook.
+- Transparent Cypher→SQL translation: all analysis modules continue to issue Cypher queries internally; the DuckDB adapter translates them automatically.
+- Bundled in `codespine`'s core dependencies — no extra install step.
 
-**DuckDB trade-offs:**
-- Uses SQL instead of Cypher. The `run_cypher` MCP tool does not work with the DuckDB backend.
-- No property-graph traversal syntax; analysis uses pre-compiled SQL helpers.
-- Experimental — the API surface is stable but production validation is ongoing.
+### KùzuDB (alternate)
 
-**Enable:**
+Native property-graph with Cypher.  Prefer this when you need the `run_cypher` MCP tool for ad-hoc traversals or when integrating with other Kuzu tooling.
+
+**Switch to KùzuDB:**
 
 ```bash
-# Install dependency
-pip install "codespine[duckdb]"
-
-# Set backend for this process
-CODESPINE_BACKEND=duckdb codespine analyse /path/to/project
-CODESPINE_BACKEND=duckdb codespine mcp
+CODESPINE_BACKEND=kuzu codespine analyse /path/to/project
+CODESPINE_BACKEND=kuzu codespine mcp
 ```
 
 **Per-instance:**
@@ -458,10 +450,11 @@ CODESPINE_BACKEND=duckdb codespine mcp
 ```python
 from codespine.sharding.store import ShardedGraphStore
 
-sg = ShardedGraphStore(backend="duckdb", num_shards=4)
+sg = ShardedGraphStore(backend="kuzu", num_shards=4)    # KùzuDB
+sg = ShardedGraphStore(backend="duckdb", num_shards=4)  # DuckDB (default)
 ```
 
-The backend is selected per-process. All tools and analysis modules work unchanged — the DuckDB store exposes the same write/read API as the Kuzu store.
+> **Note:** keep `CODESPINE_BACKEND` consistent between the indexer and MCP server for the same shard path — mixing backends on the same path will produce errors.
 
 ---
 
