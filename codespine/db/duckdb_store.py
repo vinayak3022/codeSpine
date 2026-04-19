@@ -201,7 +201,39 @@ class DuckDBStore:
         from codespine.overlay.store import OverlayStore
         self.overlay_store = OverlayStore()
 
-        db_file = self._snapshot_path if read_only and os.path.exists(self._snapshot_path) else self._db_path
+        # Prefer snapshot for read-only access; fall back to write path.
+        snap_exists = os.path.exists(self._snapshot_path)
+        db_file = self._snapshot_path if read_only and snap_exists else self._db_path
+
+        # ----------------------------------------------------------------
+        # Legacy KùzuDB migration guard
+        # KùzuDB stores its database as a *directory*; DuckDB uses a single
+        # file.  When CODESPINE_BACKEND is changed to "duckdb" an existing
+        # KùzuDB shard directory sits at the same path and DuckDB refuses to
+        # open it.  Detect this case, wipe the directory, and start fresh.
+        # ----------------------------------------------------------------
+        for legacy_path in (self._db_path, self._snapshot_path):
+            if os.path.isdir(legacy_path):
+                LOGGER.info(
+                    "Removing legacy KùzuDB directory at %s — "
+                    "re-index with 'codespine analyse' to rebuild.",
+                    legacy_path,
+                )
+                shutil.rmtree(legacy_path)
+
+        # Re-evaluate db_file after possible cleanup.
+        snap_exists = os.path.exists(self._snapshot_path)
+        db_file = self._snapshot_path if read_only and snap_exists else self._db_path
+
+        # When opening read-only and no snapshot exists yet, open the write
+        # DB in read-only mode so callers get an empty-but-valid store rather
+        # than an error.
+        if read_only and not snap_exists and not os.path.exists(self._db_path):
+            # No data at all — open an in-memory DB so queries return [] cleanly.
+            self._conn = duckdb.connect(":memory:")
+            self._ensure_schema()
+            return
+
         os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
         self._conn: duckdb.DuckDBPyConnection = duckdb.connect(db_file, read_only=read_only)
         if not read_only:
