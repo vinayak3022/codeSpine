@@ -399,3 +399,50 @@ def test_sharded_duckdb_multi_project_isolation(tmp_path: Path):
     all_ids = {p["id"] for p in sg.list_project_metadata()}
     assert pid_a in all_ids
     assert pid_b in all_ids
+
+
+# ---------------------------------------------------------------------------
+# Legacy KùzuDB artifact recovery
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_kuzu_directory_at_db_path_is_removed(tmp_path: Path):
+    """DuckDBStore auto-removes a KùzuDB directory left at the DB path."""
+    db_path = str(tmp_path / "db")
+    snap_path = str(tmp_path / "db_read")
+
+    # Simulate a KùzuDB directory at the write path
+    os.makedirs(db_path)
+    (Path(db_path) / "nodes.index").write_bytes(b"\x00" * 16)
+
+    store = DuckDBStore(db_path_override=db_path, snapshot_path_override=snap_path)
+    rows = store.query_records("SELECT * FROM projects")
+    assert rows == []  # fresh empty DB, no crash
+
+
+def test_legacy_kuzu_file_at_snapshot_path_is_removed(tmp_path: Path):
+    """DuckDBStore auto-removes a non-DuckDB file left at the snapshot path."""
+    db_path = str(tmp_path / "db")
+    snap_path = str(tmp_path / "db_read")
+
+    # Write a KùzuDB-style snapshot *directory* at the snap path
+    os.makedirs(snap_path)
+    (Path(snap_path) / "catalog.json").write_bytes(b"{}")
+
+    # Open read-only — should clear the bad snapshot and open fresh
+    store = DuckDBStore(read_only=True, db_path_override=db_path, snapshot_path_override=snap_path)
+    rows = store.query_records("SELECT * FROM projects")
+    assert rows == []
+
+
+def test_corrupt_file_at_db_path_is_replaced(tmp_path: Path):
+    """DuckDBStore replaces a corrupt (non-DuckDB) regular file at the DB path."""
+    db_path = str(tmp_path / "db")
+    snap_path = str(tmp_path / "db_read")
+
+    # Write garbage that DuckDB cannot open
+    Path(db_path).write_bytes(b"NOT A DUCKDB FILE\x00\x01\x02")
+
+    store = DuckDBStore(db_path_override=db_path, snapshot_path_override=snap_path)
+    rows = store.query_records("SELECT * FROM projects")
+    assert rows == []

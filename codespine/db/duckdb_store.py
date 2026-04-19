@@ -41,6 +41,17 @@ LOGGER = logging.getLogger(__name__)
 _VECTOR_DIM = SETTINGS.vector_dim  # 384
 
 
+def _remove_path(path: str) -> None:
+    """Remove *path* whether it is a file, symlink, or directory tree."""
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path) or os.path.islink(path):
+            os.remove(path)
+    except OSError as exc:
+        LOGGER.warning("Could not remove %s: %s", path, exc)
+
+
 # ---------------------------------------------------------------------------
 # Schema DDL
 # ---------------------------------------------------------------------------
@@ -206,36 +217,41 @@ class DuckDBStore:
         db_file = self._snapshot_path if read_only and snap_exists else self._db_path
 
         # ----------------------------------------------------------------
-        # Legacy KùzuDB migration guard
-        # KùzuDB stores its database as a *directory*; DuckDB uses a single
-        # file.  When CODESPINE_BACKEND is changed to "duckdb" an existing
-        # KùzuDB shard directory sits at the same path and DuckDB refuses to
-        # open it.  Detect this case, wipe the directory, and start fresh.
+        # Robust open: handle legacy KùzuDB artifacts at the target path.
+        # KùzuDB may leave a directory, a partial file, or a 0-byte sentinel
+        # at the same path DuckDB expects.  Rather than guessing the type,
+        # we attempt to connect and on any IOException we wipe whatever is
+        # there and retry once with a clean slate.
         # ----------------------------------------------------------------
-        for legacy_path in (self._db_path, self._snapshot_path):
-            if os.path.isdir(legacy_path):
-                LOGGER.info(
-                    "Removing legacy KùzuDB directory at %s — "
-                    "re-index with 'codespine analyse' to rebuild.",
-                    legacy_path,
-                )
-                shutil.rmtree(legacy_path)
-
-        # Re-evaluate db_file after possible cleanup.
-        snap_exists = os.path.exists(self._snapshot_path)
-        db_file = self._snapshot_path if read_only and snap_exists else self._db_path
-
-        # When opening read-only and no snapshot exists yet, open the write
-        # DB in read-only mode so callers get an empty-but-valid store rather
-        # than an error.
-        if read_only and not snap_exists and not os.path.exists(self._db_path):
-            # No data at all — open an in-memory DB so queries return [] cleanly.
-            self._conn = duckdb.connect(":memory:")
-            self._ensure_schema()
-            return
-
         os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
-        self._conn: duckdb.DuckDBPyConnection = duckdb.connect(db_file, read_only=read_only)
+        for attempt in range(2):
+            # If read-only and the target file doesn't exist, we have nothing
+            # to read — use an in-memory DB so callers get [] instead of crash.
+            if read_only and not os.path.exists(db_file):
+                self._conn = duckdb.connect(":memory:")
+                self._ensure_schema()
+                return
+
+            try:
+                self._conn: duckdb.DuckDBPyConnection = duckdb.connect(
+                    db_file, read_only=read_only
+                )
+                break
+            except duckdb.IOException as exc:
+                if attempt > 0:
+                    raise  # second attempt also failed — give up
+                LOGGER.info(
+                    "Cannot open DB at %s (%s) — removing stale artifact "
+                    "and starting fresh. Re-index with 'codespine analyse'.",
+                    db_file,
+                    exc,
+                )
+                _remove_path(db_file)
+                # If the bad path was the snapshot, fall back to the write DB.
+                if db_file == self._snapshot_path:
+                    db_file = self._db_path
+                    os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
+
         if not read_only:
             self._ensure_schema()
 
