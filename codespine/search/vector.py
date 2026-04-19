@@ -11,13 +11,30 @@ from codespine.config import SETTINGS
 
 
 def _hash_vector(text: str, dim: int) -> list[float]:
-    """Deterministic fallback embedding when sentence-transformers is unavailable."""
+    """Deterministic fallback embedding when sentence-transformers is unavailable.
+
+    Uses character n-grams (bi-, tri-, and quad-grams) plus full word tokens for
+    significantly better score calibration compared to word-only hashing.  Similar
+    identifiers (e.g. ``getUserById`` vs ``getUserByName``) now land closer in
+    vector space than they would with whole-word tokens alone.
+    """
     vec = [0.0] * dim
     if not text:
         return vec
-    tokens = text.lower().split()
-    for token in tokens:
-        digest = hashlib.sha1(token.encode("utf-8")).digest()
+    normalized = text.lower()
+
+    features: list[str] = []
+    # Include whole words (split on camelCase boundaries too)
+    import re as _re
+    words = _re.sub(r"([a-z])([A-Z])", r"\1 \2", text).lower().split()
+    features.extend(words)
+    # Character n-grams (bigrams, trigrams, quadgrams) over normalized text
+    for n in (2, 3, 4):
+        for i in range(len(normalized) - n + 1):
+            features.append(normalized[i : i + n])
+
+    for feat in features:
+        digest = hashlib.sha1(feat.encode("utf-8")).digest()
         idx = int.from_bytes(digest[:2], "big") % dim
         sign = 1.0 if digest[2] % 2 == 0 else -1.0
         vec[idx] += sign

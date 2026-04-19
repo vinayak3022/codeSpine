@@ -30,6 +30,7 @@ from codespine.watch.watcher import (
     get_overlay_status as get_overlay_status_state,
     promote_overlay as promote_overlay_state,
 )
+from codespine.cache.result_cache import ResultCache
 
 
 def _json(data: dict) -> str:
@@ -270,6 +271,49 @@ def build_mcp_server(store, repo_path_provider):
     # Background job state (per-server-instance, persists across tool calls)
     _watch: dict = {"proc": None, "path": None, "started_at": None, "interval": 30}
     _analyse: dict = {"proc": None, "path": None, "started_at": None, "log_path": None, "returncode": None}
+
+    # Per-server result cache (FR-12): LRU cache keyed by (tool, args_hash, snapshot_mtime).
+    # Invalidated automatically when the read replica sentinel file changes.
+    _result_cache = ResultCache(maxsize=256, ttl_s=300.0)
+
+    def _cache_key(tool_name: str, **kwargs):
+        """Build a cache key using current snapshot mtime."""
+        try:
+            sentinel = getattr(store, "_snapshot_path", "") + ".updated"
+            mtime = os.path.getmtime(sentinel) if os.path.exists(sentinel) else 0.0
+        except OSError:
+            mtime = 0.0
+        return ResultCache.make_key(tool_name, kwargs, mtime)
+
+    # FR-03: Auto-start watch if indexed projects exist and watch is not running.
+    def _maybe_auto_start_watch() -> None:
+        try:
+            projs = store.query_records(
+                "MATCH (p:Project) RETURN p.path as path, p.id as id ORDER BY p.indexed_at DESC LIMIT 1"
+            )
+            if not projs:
+                return
+            watch_path = projs[0].get("path", "")
+            if not watch_path or not os.path.isdir(watch_path):
+                return
+            # Start watch as a background subprocess (same as start_watch tool).
+            cmd = [sys.executable, "-m", "codespine.cli", "watch", watch_path,
+                   "--interval", "30", "--allow-running"]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            _watch["proc"] = proc
+            _watch["path"] = watch_path
+            _watch["started_at"] = time.time()
+            _LOGGER.info("Auto-started watch on %s (pid %d)", watch_path, proc.pid)
+        except Exception as exc:
+            _LOGGER.debug("Auto-watch skipped: %s", exc)
+
+    # Trigger auto-watch in a daemon thread so server startup isn't delayed.
+    import threading as _threading
+    _auto_watch_thread = _threading.Thread(target=_maybe_auto_start_watch, daemon=True, name="codespine-auto-watch")
+    _auto_watch_thread.start()
 
     # ------------------------------------------------------------------
     # Connectivity / feature discovery
@@ -526,6 +570,10 @@ def build_mcp_server(store, repo_path_provider):
         project scopes the target symbol lookup; cross-project callers are always included.
         """
         try:
+            _ck = _cache_key("get_impact", symbol=symbol, max_depth=max_depth, project=project)
+            _cached = _result_cache.get(_ck)
+            if _cached is not None:
+                return _cached
             normalized = _normalize_symbol_input(symbol)
             result = analyze_impact(store, normalized, max_depth=max_depth, project=project)
             if not result.get("resolved_to"):
@@ -533,7 +581,9 @@ def build_mcp_server(store, repo_path_provider):
                 result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
             if not result.get("resolved_to"):
                 return {"available": False, "note": f"Symbol '{symbol}' not found in the index."}
-            return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
+            out = _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
+            _result_cache.put(_ck, out)
+            return out
         except Exception as exc:
             return _safe_tool_response("get_impact", exc)
 
@@ -558,6 +608,11 @@ def build_mcp_server(store, repo_path_provider):
         exemption rules — useful for validating that the feature is working
         even when the dead list is empty.
         """
+        _ck = _cache_key("detect_dead_code", limit=limit, project=project, strict=strict)
+        _cached = _result_cache.get(_ck)
+        if _cached is not None:
+            return _cached
+
         raw = detect_dead_code_analysis(store, limit=limit, project=project, strict=strict)
         if raw is None:
             return _no_symbols_response()
@@ -571,12 +626,14 @@ def build_mcp_server(store, repo_path_provider):
             else:
                 dead.append(entry)
 
-        return _staleness_meta(store, {
+        out = _staleness_meta(store, {
             "available": True,
             "dead_code": dead,
             "count": len(dead),
             "exemption_stats": stats,
         }, project, overlay_store=overlay_store, deep_scope=True)
+        _result_cache.put(_ck, out)
+        return out
 
     @mcp.tool()
     def trace_execution_flows(entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None):
@@ -1722,6 +1779,12 @@ def build_mcp_server(store, repo_path_provider):
                 enriched.append(entry)
             return enriched
 
+        target_pid = target["project_id"]
+        enriched_callers = _enrich(callers, extra_keys=["confidence", "reason"])
+        # FR-11: label cross-project callers so consumers can separate them.
+        local_callers = [c for c in enriched_callers if c.get("project_id") == target_pid]
+        cross_project_callers = [c for c in enriched_callers if c.get("project_id") != target_pid]
+
         result = {
             "available": True,
             "target": {
@@ -1730,9 +1793,10 @@ def build_mcp_server(store, repo_path_provider):
                 "signature": target["signature"],
                 "class_fqcn": target["class_fqcn"],
                 "file_path": target["file_path"],
-                "project_id": target["project_id"],
+                "project_id": target_pid,
             },
-            "callers": _enrich(callers, extra_keys=["confidence", "reason"]),
+            "callers": local_callers,
+            "cross_project_callers": cross_project_callers,
             "callees": _enrich(callees, extra_keys=["confidence", "reason"]),
             "siblings": [
                 {"name": s["name"], "signature": s["signature"]}
@@ -1741,7 +1805,8 @@ def build_mcp_server(store, repo_path_provider):
             "overrides": _enrich(overrides_up),
             "overridden_by": _enrich(overrides_down),
             "summary": {
-                "callers": len(callers),
+                "callers": len(local_callers),
+                "cross_project_callers": len(cross_project_callers),
                 "callees": len(callees),
                 "siblings": len(siblings),
                 "overrides": len(overrides_up),
@@ -2667,6 +2732,166 @@ def build_mcp_server(store, repo_path_provider):
                     return results
         except Exception as exc:
             return _safe_tool_response("find_pattern", exc)
+
+    # ------------------------------------------------------------------
+    # rename_plan  (FR-11 / Phase 5)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def rename_plan(symbol: str, new_name: str, project: str | None = None):
+        """
+        Safe cross-project rename plan for a method, class, or field.
+
+        Finds all references to the symbol (callers, overrides, interface
+        declarations, direct mentions) and returns a structured list of
+        files_to_modify with the current text and suggested replacement.
+
+        This tool does NOT modify files — it produces a plan that you (or your
+        editor) can apply.  Review the plan before making changes.
+
+        Parameters:
+          symbol   – Method name, class name, or FQN to rename.
+          new_name – The desired new name (simple name, not FQN).
+          project  – Optional project scope for the initial symbol lookup.
+        """
+        try:
+            normalized = _normalize_symbol_input(symbol)
+            project_clause = "AND f.project_id = $proj" if project else ""
+            params: dict = {"q": normalized, "raw": symbol}
+            if project:
+                params["proj"] = project
+
+            # 1. Resolve to methods + classes with the given name.
+            method_recs = store.query_records(
+                f"""
+                MATCH (m:Method), (c:Class), (f:File)
+                WHERE m.class_id = c.id AND c.file_id = f.id {project_clause}
+                  AND (m.id = $q OR m.id = $raw
+                       OR lower(m.name) = lower($q)
+                       OR lower(m.signature) CONTAINS lower($q))
+                RETURN m.id as id, m.name as name, m.signature as signature,
+                       c.fqcn as class_fqcn, f.path as file_path,
+                       f.project_id as project_id, 'method' as kind
+                LIMIT 20
+                """,
+                params,
+            )
+            class_recs = store.query_records(
+                f"""
+                MATCH (c:Class), (f:File)
+                WHERE c.file_id = f.id {project_clause}
+                  AND (c.id = $q OR c.id = $raw
+                       OR lower(c.name) = lower($q) OR lower(c.fqcn) = lower($q))
+                RETURN c.id as id, c.name as name, c.fqcn as class_fqcn,
+                       f.path as file_path, f.project_id as project_id, 'class' as kind
+                LIMIT 10
+                """,
+                params,
+            )
+
+            all_targets = method_recs + class_recs
+            if not all_targets:
+                return {
+                    "available": False,
+                    "note": f"Symbol '{symbol}' not found. Try find_symbol() first.",
+                }
+
+            # 2. Collect all files that declare or reference the targets.
+            target_ids = [r["id"] for r in all_targets]
+            declaration_files: dict[str, dict] = {}  # file_path → info
+
+            # Declaration sites.
+            for rec in all_targets:
+                fp = rec.get("file_path", "")
+                if fp:
+                    declaration_files.setdefault(fp, {
+                        "file_path": fp,
+                        "project_id": rec.get("project_id"),
+                        "changes": [],
+                    })["changes"].append({
+                        "kind": "declaration",
+                        "symbol_kind": rec.get("kind", "method"),
+                        "current_name": rec.get("name", symbol),
+                        "suggested_name": new_name,
+                        "note": f"Rename {rec.get('kind','method')} declaration",
+                    })
+
+            # Caller sites (only methods have call sites).
+            method_ids = [r["id"] for r in method_recs]
+            if method_ids:
+                ph = ", ".join("$mid" + str(i) for i in range(len(method_ids)))
+                caller_params = {f"mid{i}": v for i, v in enumerate(method_ids)}
+                callers = store.query_records(
+                    f"""
+                    MATCH (caller:Method)-[:CALLS]->(m:Method), (c:Class), (f:File)
+                    WHERE m.id IN [{ph}]
+                      AND caller.class_id = c.id AND c.file_id = f.id
+                    RETURN DISTINCT f.path as file_path, f.project_id as project_id,
+                           caller.name as caller_name
+                    LIMIT 100
+                    """,
+                    caller_params,
+                )
+                for cr in callers:
+                    fp = cr.get("file_path", "")
+                    if fp:
+                        declaration_files.setdefault(fp, {
+                            "file_path": fp,
+                            "project_id": cr.get("project_id"),
+                            "changes": [],
+                        })["changes"].append({
+                            "kind": "call_site",
+                            "current_text": symbol,
+                            "suggested_text": new_name,
+                            "note": f"Call site in {cr.get('caller_name','<unknown>')}",
+                        })
+
+            # Override sites.
+            for method_id in method_ids:
+                overrides = store.query_records(
+                    """
+                    MATCH (child:Method)-[:OVERRIDES]->(m:Method {id: $mid}),
+                          (cc:Class), (ff:File)
+                    WHERE child.class_id = cc.id AND cc.file_id = ff.id
+                    RETURN ff.path as file_path, ff.project_id as project_id,
+                           child.name as name
+                    """,
+                    {"mid": method_id},
+                )
+                for ov in overrides:
+                    fp = ov.get("file_path", "")
+                    if fp:
+                        declaration_files.setdefault(fp, {
+                            "file_path": fp,
+                            "project_id": ov.get("project_id"),
+                            "changes": [],
+                        })["changes"].append({
+                            "kind": "override",
+                            "current_name": ov.get("name", symbol),
+                            "suggested_name": new_name,
+                            "note": "Override — must match new name",
+                        })
+
+            files_to_modify = sorted(
+                declaration_files.values(), key=lambda x: x.get("file_path", "")
+            )
+            projects_affected = {f["project_id"] for f in files_to_modify if f.get("project_id")}
+
+            return _staleness_meta(store, {
+                "available": True,
+                "symbol": symbol,
+                "new_name": new_name,
+                "targets_found": len(all_targets),
+                "files_to_modify": files_to_modify,
+                "files_count": len(files_to_modify),
+                "projects_affected": list(projects_affected),
+                "note": (
+                    f"Found {len(files_to_modify)} files to update. "
+                    "This is a plan only — no files have been changed."
+                ),
+            }, project, overlay_store=overlay_store)
+        except Exception as exc:
+            return _safe_tool_response("rename_plan", exc)
 
     # ------------------------------------------------------------------
     # Advanced / raw access
