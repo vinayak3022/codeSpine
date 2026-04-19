@@ -38,6 +38,7 @@ _RECOVERABLE_DB_ERROR_MARKERS = (
 
 @dataclass
 class GraphStore:
+    backend: str = "kuzu"
     read_only: bool = False
     # Optional path overrides — when provided, the store uses these paths
     # instead of the global SETTINGS values.  The ShardedGraphStore uses

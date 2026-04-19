@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,10 @@ class Settings:
     # ShardRouter reads CODESPINE_SHARDS directly; this field is the compiled default.
     num_shards: int = 4
     shards_dir: str = os.path.expanduser("~/.codespine/shards")
+
+    # Storage backend: "kuzu" (default, property-graph) or "duckdb" (relational).
+    # Override at runtime via CODESPINE_BACKEND env var before starting the process.
+    backend: str = field(default_factory=lambda: os.environ.get("CODESPINE_BACKEND", "kuzu"))
 
     pid_file: str = os.path.expanduser("~/.codespine.pid")
     log_file: str = os.path.expanduser("~/.codespine.log")

@@ -28,11 +28,14 @@ import logging
 import os
 import shutil
 import threading
-from typing import Any
+from typing import Any, Union
 
 from codespine.config import SETTINGS
 from codespine.db.store import GraphStore
 from codespine.sharding.router import ShardRouter
+
+# Imported lazily in _get_shard to avoid hard-dep on duckdb when not in use.
+_AnyStore = Any  # GraphStore | DuckDBStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -55,13 +58,15 @@ class ShardedGraphStore:
         read_only: bool = False,
         num_shards: int | None = None,
         shards_dir: str | None = None,
+        backend: str | None = None,
     ) -> None:
         self.read_only = read_only
+        self.backend: str = backend or SETTINGS.backend
         self.router = ShardRouter(
             num_shards=num_shards or SETTINGS.num_shards,
             shards_dir=shards_dir or SETTINGS.shards_dir,
         )
-        self._pool: dict[int, GraphStore] = {}
+        self._pool: dict[int, _AnyStore] = {}
         self._lock = threading.Lock()
         self._migrated = False
 
@@ -69,8 +74,8 @@ class ShardedGraphStore:
     # Core routing
     # ------------------------------------------------------------------
 
-    def shard(self, project_id: str) -> GraphStore:
-        """Return (or open) the GraphStore for this project's shard.
+    def shard(self, project_id: str) -> _AnyStore:
+        """Return (or open) the store for this project's shard.
 
         In write mode this always returns a valid store (creating the DB if
         needed).  In read-only mode, if the shard DB has never been written to,
@@ -80,24 +85,37 @@ class ShardedGraphStore:
         idx = self.router.shard_for(project_id)
         store = self._get_shard(idx)
         if store is None:
-            # Fallback: open read-only against an empty path so callers get an
-            # empty result set rather than a crash.  This happens when the
-            # shard DB doesn't exist yet.
+            # Fallback: create an empty writable DB so callers never crash.
             with self._lock:
                 if idx not in self._pool:
                     db_path = self.router.db_path(idx)
                     snap_path = self.router.snapshot_path(idx)
                     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-                    self._pool[idx] = GraphStore(
+                    self._pool[idx] = self._open_store(
                         read_only=False,  # create empty DB
-                        db_path_override=db_path,
-                        snapshot_path_override=snap_path,
+                        db_path=db_path,
+                        snap_path=snap_path,
                     )
                 store = self._pool[idx]
         return store
 
-    def _get_shard(self, idx: int) -> GraphStore | None:
-        """Return the GraphStore for shard *idx*, or None if it doesn't exist
+    def _open_store(self, *, read_only: bool, db_path: str, snap_path: str) -> _AnyStore:
+        """Instantiate the correct store class based on ``self.backend``."""
+        if self.backend == "duckdb":
+            from codespine.db.duckdb_store import DuckDBStore  # lazy import
+            return DuckDBStore(
+                read_only=read_only,
+                db_path_override=db_path,
+                snapshot_path_override=snap_path,
+            )
+        return GraphStore(
+            read_only=read_only,
+            db_path_override=db_path,
+            snapshot_path_override=snap_path,
+        )
+
+    def _get_shard(self, idx: int) -> _AnyStore | None:
+        """Return the store for shard *idx*, or None if it doesn't exist
         yet and we're in read-only mode (nothing to read there)."""
         with self._lock:
             if idx not in self._pool:
@@ -110,12 +128,12 @@ class ShardedGraphStore:
                 if self.read_only and not os.path.exists(db_path) and not os.path.exists(snap_path):
                     return None
 
-                # Ensure parent directory exists before Kuzu opens it.
+                # Ensure parent directory exists before opening the DB.
                 os.makedirs(os.path.dirname(db_path), exist_ok=True)
-                self._pool[idx] = GraphStore(
+                self._pool[idx] = self._open_store(
                     read_only=self.read_only,
-                    db_path_override=db_path,
-                    snapshot_path_override=snap_path,
+                    db_path=db_path,
+                    snap_path=snap_path,
                 )
             return self._pool[idx]
 
@@ -309,4 +327,6 @@ class ShardedGraphStore:
     @staticmethod
     def stable_id(*parts: str) -> str:
         """Stable SHA1-based identifier (shard-independent)."""
-        return GraphStore.stable_id(*parts)
+        import hashlib
+        raw = "::".join(parts)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
