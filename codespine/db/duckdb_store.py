@@ -52,6 +52,49 @@ def _remove_path(path: str) -> None:
         LOGGER.warning("Could not remove %s: %s", path, exc)
 
 
+def _sanitize_db_path(path: str) -> None:
+    """Ensure *path* is either absent or a valid DuckDB database file.
+
+    KùzuDB leaves directory-trees at the same paths DuckDB expects as files,
+    and half-written snapshots can leave zero-byte or corrupt files.  We
+    cheaply probe each path with a read-only DuckDB connect; if that raises
+    any ``IOException``, whatever is there isn't a valid DuckDB database and
+    we delete it so the subsequent real open starts from a clean slate.
+    """
+    if not os.path.exists(path) and not os.path.islink(path):
+        return  # nothing there — nothing to do
+
+    # Any directory is by definition not a DuckDB database file.
+    if os.path.isdir(path) and not os.path.islink(path):
+        LOGGER.info(
+            "Removing non-DuckDB directory at %s (likely legacy KùzuDB layout) — "
+            "re-index with 'codespine analyse' to rebuild.",
+            path,
+        )
+        _remove_path(path)
+        return
+
+    # Regular file — try a throw-away read-only open to verify it's a DB.
+    # IOException  → file exists but is not a valid DuckDB database → remove.
+    # Connection/Catalog/Other exceptions → file is valid DuckDB (possibly
+    # already open by another connection in this process); leave it alone.
+    try:
+        probe = duckdb.connect(path, read_only=True)
+        probe.close()
+    except duckdb.IOException as exc:
+        LOGGER.info(
+            "Removing invalid DB file at %s (%s) — re-index with "
+            "'codespine analyse' to rebuild.",
+            path,
+            exc,
+        )
+        _remove_path(path)
+    except Exception:
+        # File is a valid DuckDB but we can't open it right now (in-use, perms,
+        # etc.) — not our problem to fix here; let the real open surface it.
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Schema DDL
 # ---------------------------------------------------------------------------
@@ -212,46 +255,31 @@ class DuckDBStore:
         from codespine.overlay.store import OverlayStore
         self.overlay_store = OverlayStore()
 
-        # Prefer snapshot for read-only access; fall back to write path.
+        # ----------------------------------------------------------------
+        # Pre-flight sanitize: KùzuDB may have left directories or partial
+        # files at the paths DuckDB is about to use.  Probe each path with a
+        # throw-away read-only connect — if it fails, whatever is there is
+        # not a valid DuckDB database, so remove it.  This runs BEFORE the
+        # real open so we never hit a mid-fallback failure mode.
+        # ----------------------------------------------------------------
+        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+        for p in (self._db_path, self._snapshot_path):
+            _sanitize_db_path(p)
+
+        # After sanitize, pick the file we actually open.
         snap_exists = os.path.exists(self._snapshot_path)
         db_file = self._snapshot_path if read_only and snap_exists else self._db_path
 
-        # ----------------------------------------------------------------
-        # Robust open: handle legacy KùzuDB artifacts at the target path.
-        # KùzuDB may leave a directory, a partial file, or a 0-byte sentinel
-        # at the same path DuckDB expects.  Rather than guessing the type,
-        # we attempt to connect and on any IOException we wipe whatever is
-        # there and retry once with a clean slate.
-        # ----------------------------------------------------------------
-        os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
-        for attempt in range(2):
-            # If read-only and the target file doesn't exist, we have nothing
-            # to read — use an in-memory DB so callers get [] instead of crash.
-            if read_only and not os.path.exists(db_file):
-                self._conn = duckdb.connect(":memory:")
-                self._ensure_schema()
-                return
+        # Read-only open with nothing on disk → in-memory empty DB so queries
+        # return [] cleanly instead of "database does not exist".
+        if read_only and not os.path.exists(db_file):
+            self._conn = duckdb.connect(":memory:")
+            self._ensure_schema()
+            return
 
-            try:
-                self._conn: duckdb.DuckDBPyConnection = duckdb.connect(
-                    db_file, read_only=read_only
-                )
-                break
-            except duckdb.IOException as exc:
-                if attempt > 0:
-                    raise  # second attempt also failed — give up
-                LOGGER.info(
-                    "Cannot open DB at %s (%s) — removing stale artifact "
-                    "and starting fresh. Re-index with 'codespine analyse'.",
-                    db_file,
-                    exc,
-                )
-                _remove_path(db_file)
-                # If the bad path was the snapshot, fall back to the write DB.
-                if db_file == self._snapshot_path:
-                    db_file = self._db_path
-                    os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
-
+        self._conn: duckdb.DuckDBPyConnection = duckdb.connect(
+            db_file, read_only=read_only
+        )
         if not read_only:
             self._ensure_schema()
 
