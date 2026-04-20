@@ -7,6 +7,8 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-04-20
+
 ### Changed
 
 - Made `codespine analyse` fast by default: embeddings are off, deep enrichment is opt-in in the foreground via `--complete`, the resolver honors a foreground budget, DB write batches are larger, and read-replica publishing plus enrichment can continue in a detached background process.
