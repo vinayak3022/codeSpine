@@ -98,6 +98,32 @@ def _spawn_background_enrichment(path: str) -> bool:
         return False
 
 
+def _spawn_background_continuation(path: str) -> bool:
+    """Continue a budget-paused core index in a detached process."""
+    task_id = create_task(
+        "indexing",
+        "Background core indexing",
+        path=path,
+        metadata={"trigger": "analyse-budget"},
+    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "codespine.cli", "continue-background", path, "--task-id", task_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+        )
+        update_task(task_id, status="running", phase="spawned", pid=proc.pid)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        finish_task(task_id, "failed", str(exc))
+        LOGGER.warning("Unable to spawn background continuation: %s", exc)
+        return False
+
+
 def _db_size_bytes(path: str) -> int:
     if os.path.isfile(path):
         return os.path.getsize(path)
@@ -371,6 +397,16 @@ def _index_shard_group(
                     _phase(
                         f"{prefix}Writing index...",
                         f"{files} files, {classes} classes, {methods} methods  ({elapsed_s:.1f}s)",
+                    )
+                return
+            if event == "budget_exhausted":
+                files = int(payload.get("files_indexed", 0))
+                total = int(payload.get("total", 0))
+                phase = str(payload.get("phase", "indexing"))
+                with output_lock:
+                    _phase(
+                        f"{prefix}Foreground budget...",
+                        f"paused during {phase} ({files}/{total} files); continuing in background",
                     )
                 return
             if event in ("resolve_calls_start",):
@@ -906,7 +942,16 @@ def analyse(
         recycle = getattr(store, "_recycle_conn", None)
         if callable(recycle):
             recycle()
-    if fast and _spawn_background_enrichment(abs_path):
+    core_partial = any(bool(getattr(result, "partial", False)) for result in all_results)
+    if fast and core_partial:
+        _live_phase(snap_label, "copying partial core")
+        sg.snapshot_all(background=False)
+        _finish_phase(snap_label, "partial index visible")
+        if _spawn_background_continuation(abs_path):
+            _phase("Background indexing...", "core indexing continues; run 'codespine background'")
+        else:
+            _phase("Background indexing...", "not started; rerun 'codespine analyse' to continue")
+    elif fast and _spawn_background_enrichment(abs_path):
         _phase(snap_label, "core snapshot now; enrichment continues in background")
     else:
         _live_phase(snap_label, "copying")
@@ -1020,6 +1065,50 @@ def enrich_background(path: str, task_id: str | None) -> None:
     except Exception as exc:  # noqa: BLE001
         finish_task(task_id, "failed", str(exc))
         LOGGER.exception("Background enrichment failed for %s: %s", abs_path, exc)
+        raise
+
+
+@main.command("continue-background", hidden=True)
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--task-id", default=None, hidden=True)
+def continue_background(path: str, task_id: str | None) -> None:
+    """Continue core indexing after a foreground budget pause."""
+    abs_path = os.path.abspath(path)
+    if task_id is None:
+        task_id = create_task("indexing", "Background core indexing", path=abs_path)
+    update_task(
+        task_id,
+        status="running",
+        phase="core indexing",
+        pid=os.getpid(),
+        progress=0.10,
+        detail="Continuing analyse without the foreground budget",
+    )
+    try:
+        with open(SETTINGS.log_file, "a", encoding="utf-8") as log:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "codespine.cli",
+                    "analyse",
+                    abs_path,
+                    "--budget",
+                    "0",
+                    "--allow-running",
+                ],
+                cwd=os.getcwd(),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if proc.returncode == 0:
+            finish_task(task_id, "succeeded", "Background core indexing complete")
+            return
+        finish_task(task_id, "failed", f"Background analyse exited with code {proc.returncode}")
+        raise click.ClickException(f"Background analyse exited with code {proc.returncode}")
+    except Exception as exc:  # noqa: BLE001
+        finish_task(task_id, "failed", str(exc))
         raise
 
 
@@ -1363,7 +1452,13 @@ def tasks_cmd(include_finished: bool, limit: int, as_json: bool) -> None:
 
 
 @main.command("background")
-@click.option("--all", "include_finished", is_flag=True, help="Include completed and failed tasks.")
+@click.option(
+    "--all/--running-only",
+    "include_finished",
+    default=True,
+    show_default=True,
+    help="Include completed and failed tasks, or show only currently running work.",
+)
 @click.option("--limit", default=20, show_default=True, type=int)
 @click.option("--json", "as_json", is_flag=True)
 def background_cmd(include_finished: bool, limit: int, as_json: bool) -> None:
@@ -1377,7 +1472,10 @@ def _show_background_tasks(include_finished: bool, limit: int, as_json: bool) ->
         _echo_json(tasks, True)
         return
     if not tasks:
-        click.echo("No background tasks.")
+        if include_finished:
+            click.echo("No background tasks recorded.")
+        else:
+            click.echo("No running background tasks.")
         return
     now = time.time()
     header = f"{'ID':<12}  {'Status':<10}  {'Progress':>8}  {'Phase':<26}  {'Age':>7}  Path"

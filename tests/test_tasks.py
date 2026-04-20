@@ -32,3 +32,15 @@ def test_background_command_shows_progress():
     assert task_id in result.output
     assert "40%" in result.output
     assert "execution flows" in result.output
+
+
+def test_background_command_shows_recent_finished_tasks_by_default():
+    task_id = create_task("indexing", "Background core indexing", path="/tmp/project")
+    finish_task(task_id, "failed", "boom")
+
+    result = CliRunner().invoke(main, ["background"])
+
+    assert result.exit_code == 0
+    assert task_id in result.output
+    assert "failed" in result.output
+    assert "boom" in result.output

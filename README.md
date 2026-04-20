@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v1.0.10** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.0.11** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 
@@ -45,6 +45,7 @@ pip install "codespine[ui]"
 ```
 
 The current lite UI is dependency-free and served locally by CodeSpine; the `ui` extra is the stable add-on install target for the browser explorer.
+Quotes are required in zsh: use `pip install "codespine[ui]"`, not `pip install codespine[ui]`.
 
 Everything at once (ml + community detection):
 
@@ -315,7 +316,7 @@ codespine force-reset                        # emergency: delete all data files
 
 `analyse` defaults to incremental mode. Repeat runs only process changed files and are fast.
 
-`analyse` runs in fast mode by default: it indexes the core graph, publishes that read replica from a detached process, then continues communities, flows, dead code, coupling, and cross-module enrichment in the background. Use `codespine tasks` or `codespine ui` to watch that work. Use `--complete --deep` when you want those passes refreshed before the command returns.
+`analyse` runs in fast mode by default: it indexes the core graph, honors the foreground time budget, publishes a read replica, then continues unfinished core indexing or enrichment in the background. Use `codespine background` or `codespine ui` to watch that work. Use `--complete --deep` when you want those passes refreshed before the command returns.
 
 ---
 
@@ -501,7 +502,7 @@ The deep analysis phase covers four passes that are expensive but optional:
 | Dead code | Finds methods with no callers (Java-aware exemptions) | Cleanup audits |
 | Change coupling | Analyses git history for co-changed file pairs | `get_change_coupling`, `related` |
 
-**Fast default:** `codespine analyse` prioritizes a queryable core index. Communities, flows, dead-code, git coupling, and cross-module links are queued in a detached background enrichment job unless you use `--complete`.
+**Fast default:** `codespine analyse` prioritizes a queryable core index and keeps the foreground run inside the configured budget. If core indexing or call/type resolution cannot finish in time, the partial index is published and a background continuation finishes the core graph. Communities, flows, dead-code, git coupling, and cross-module links are queued in a detached background enrichment job unless you use `--complete`.
 
 **Health checks:** every analyse run now performs a small self-test query suite and reports index anomalies such as large projects with zero call edges. Use `codespine health` for the terminal dashboard or `codespine self-test --json` in CI.
 

@@ -7,6 +7,18 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [1.0.11] - 2026-04-20
+
+### Changed
+
+- Consolidated DuckDB file/class/method/symbol writes into fewer transactions and increased default bulk-index batch sizes to reduce large-module DB-write time.
+- `codespine background` now shows recent completed/failed tasks by default, with `--running-only` available for active work only.
+
+### Fixed
+
+- Fast analyse now marks budget-paused indexing as partial, avoids caching it as complete, publishes the partial snapshot, and starts a tracked background continuation so core call/type resolution can finish after the CLI returns.
+- Documented quoted extras installation for zsh, for example `pip install "codespine[ui]"`.
+
 ## [1.0.10] - 2026-04-20
 
 ### Added

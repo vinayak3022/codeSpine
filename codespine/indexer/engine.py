@@ -88,6 +88,7 @@ class IndexResult:
     calls_resolved: int
     type_relationships: int
     embeddings_generated: int
+    partial: bool = False
 
 
 class JavaIndexer:
@@ -429,6 +430,7 @@ class JavaIndexer:
             total=_db_total,
             deleted_files=len(deleted_file_ids),
         )
+        budget_exhausted = False
 
         try:
             # ── Chunked DB writes ─────────────────────────────────────────────
@@ -644,26 +646,20 @@ class JavaIndexer:
                         with self.store.transaction():
                             self.store.clear_files_batch(clear_sub)
                         self.store._recycle_conn()
-                _db_phase_holder[0] = "writing files"
+                _db_phase_holder[0] = "writing rows"
                 with self.store.transaction():
                     self.store.upsert_files_batch(file_rows)
-                self.store._recycle_conn()
-                _db_phase_holder[0] = "writing classes"
-                with self.store.transaction():
                     self.store.upsert_classes_batch(class_rows)
-                self.store._recycle_conn()
-                _METHOD_SUB_BATCH = max(1, int(getattr(SETTINGS, "index_method_batch_size", 2000)))
-                _db_phase_holder[0] = "writing methods"
-                for method_sub in self._chunked(method_rows, _METHOD_SUB_BATCH):
-                    with self.store.transaction():
+                    _METHOD_SUB_BATCH = max(1, int(getattr(SETTINGS, "index_method_batch_size", 10000)))
+                    _db_phase_holder[0] = "writing methods"
+                    for method_sub in self._chunked(method_rows, _METHOD_SUB_BATCH):
                         self.store.upsert_methods_batch(method_sub)
-                    self.store._recycle_conn()
-                _SYMBOL_SUB_BATCH = max(1, int(getattr(SETTINGS, "index_symbol_batch_size", 2000)))
-                _db_phase_holder[0] = "writing symbols"
-                for symbol_sub in self._chunked(symbol_rows, _SYMBOL_SUB_BATCH):
-                    with self.store.transaction():
+                    _SYMBOL_SUB_BATCH = max(1, int(getattr(SETTINGS, "index_symbol_batch_size", 10000)))
+                    _db_phase_holder[0] = "writing symbols"
+                    for symbol_sub in self._chunked(symbol_rows, _SYMBOL_SUB_BATCH):
                         self.store.upsert_symbols_batch(symbol_sub)
-                    self.store._recycle_conn()
+                self.store._recycle_conn()
+                _db_phase_holder[0] = "building rows"
                 self._emit(
                     progress,
                     "db_write_progress",
@@ -673,6 +669,16 @@ class JavaIndexer:
                     methods=methods_indexed,
                     phase=_db_phase_holder[0],
                 )
+                if deadline is not None and time.perf_counter() >= max(0.0, deadline - 8.0):
+                    budget_exhausted = True
+                    self._emit(
+                        progress,
+                        "budget_exhausted",
+                        phase="db_write",
+                        files_indexed=files_indexed,
+                        total=_db_total,
+                    )
+                    break
                 _db_phase_holder[0] = "building rows"
         finally:
             _db_hb_stop.set()
@@ -688,7 +694,23 @@ class JavaIndexer:
         )
 
         def _deadline_expired() -> bool:
-            return deadline is not None and time.perf_counter() >= deadline
+            return budget_exhausted or (deadline is not None and time.perf_counter() >= deadline)
+
+        if budget_exhausted:
+            self._emit(progress, "resolve_calls_done", calls_resolved=0, partial=True)
+            self._emit(progress, "resolve_types_done", type_relationships=0, partial=True)
+            self._emit(progress, "di_done", injections=0, interface_bindings=0, partial=True)
+            return IndexResult(
+                project_id=project_id,
+                files_found=len(current_files),
+                files_indexed=files_indexed,
+                classes_indexed=classes_indexed,
+                methods_indexed=methods_indexed,
+                calls_resolved=0,
+                type_relationships=0,
+                embeddings_generated=classes_indexed + methods_indexed if embed else 0,
+                partial=True,
+            )
 
         self._emit(progress, "resolve_calls_start")
 
@@ -770,8 +792,6 @@ class JavaIndexer:
         if _deadline_expired():
             self._emit(progress, "resolve_types_done", type_relationships=0, partial=True)
             self._emit(progress, "di_done", injections=0, interface_bindings=0, partial=True)
-            self._prune_meta_cache(meta_cache, current_file_ids)
-            self._save_file_meta_cache(project_id, meta_cache)
             return IndexResult(
                 project_id=project_id,
                 files_found=len(current_files),
@@ -781,6 +801,7 @@ class JavaIndexer:
                 calls_resolved=calls_resolved,
                 type_relationships=0,
                 embeddings_generated=classes_indexed + methods_indexed if embed else 0,
+                partial=True,
             )
         type_rows = self._build_inheritance_edges(
             class_meta,
@@ -843,6 +864,7 @@ class JavaIndexer:
             calls_resolved=calls_resolved,
             type_relationships=type_relationships,
             embeddings_generated=classes_indexed + methods_indexed if embed else 0,
+            partial=partial_calls,
         )
 
     @staticmethod
