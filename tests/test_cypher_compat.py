@@ -301,3 +301,48 @@ def test_no_return_gives_star():
     sql = _translate("MATCH (n:File)")
     assert "SELECT" in sql
     assert "files" in sql
+
+
+# ---------------------------------------------------------------------------
+# Anonymous edge-count pattern (v1.0.5 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_anonymous_edge_count():
+    """`MATCH ()-[r]->() RETURN count(r) as count` — the query used by
+    `codespine analyse` to report total edges — must translate to a
+    DuckDB-valid query instead of falling through to `FROM dual`.
+    """
+    sql = _translate("MATCH ()-[r]->() RETURN count(r) as count")
+    # Must reference real edge tables, not the Oracle-style `dual`.
+    assert "dual" not in sql.lower()
+    assert "calls" in sql
+    assert "references_type" in sql
+    assert "injects" in sql
+    assert "binds_interface" in sql
+    assert "community_members" in sql
+    assert "flow_members" in sql
+    assert "co_changed_with" in sql
+    # Alias should survive so callers can read row["count"].
+    assert "AS count" in sql or "as count" in sql
+
+
+def test_anonymous_edge_count_no_alias():
+    sql = _translate("MATCH ()-[r]->() RETURN count(r)")
+    assert "dual" not in sql.lower()
+    assert "calls" in sql
+
+
+def test_anonymous_edge_count_unnamed_rel():
+    # `MATCH ()-[]->()` (no rel variable) should also be handled
+    sql = _translate("MATCH ()-[]->() RETURN count(*) as count")
+    assert "dual" not in sql.lower()
+    assert "calls" in sql
+
+
+def test_unmatched_pattern_uses_safe_fallback():
+    """If translator can't derive a FROM table, emit an empty DuckDB
+    relation rather than Oracle's `dual`.
+    """
+    sql = _translate("MATCH (x:NotARealLabel) RETURN x.id")
+    assert "dual" not in sql.lower()

@@ -77,7 +77,47 @@ def translate(cypher: str, params: dict[str, Any] | None = None) -> tuple[str, d
 # Internal translation pipeline
 # ---------------------------------------------------------------------------
 
+_ALL_EDGE_TABLES = (
+    "calls",
+    "references_type",
+    "injects",
+    "binds_interface",
+    "community_members",
+    "flow_members",
+    "co_changed_with",
+)
+
+
+def _translate_anonymous_edge_count(cypher: str) -> str | None:
+    """Handle `MATCH ()-[r]->() RETURN count(r) [as X]`.
+
+    Anonymous edge patterns carry no labels, so the generic translator
+    cannot derive a FROM table.  We special-case the count-all-edges
+    pattern by unioning row-counts across every edge table in the
+    schema, which is what CodeSpine actually asks for.
+    """
+    q = re.sub(r"\s+", " ", cypher.strip())
+    # Accept MATCH ()-[r]->() RETURN count(r) [as alias]
+    m = re.match(
+        r"(?i)MATCH\s*\(\s*\)\s*-\s*\[\s*(\w+)?\s*\]\s*->\s*\(\s*\)\s*"
+        r"RETURN\s+count\s*\(\s*\*?\w*\s*\)\s*(?:as\s+(\w+))?\s*$",
+        q,
+    )
+    if not m:
+        return None
+    alias = m.group(2) or "count"
+    unions = " UNION ALL ".join(
+        f"SELECT COUNT(*) AS c FROM {tbl}" for tbl in _ALL_EDGE_TABLES
+    )
+    return f"SELECT COALESCE(SUM(c), 0) AS {alias} FROM ({unions}) t"
+
+
 def _translate(cypher: str) -> str:
+    # Fast-path: anonymous edge-count query used by `analyse` summary.
+    special = _translate_anonymous_edge_count(cypher)
+    if special is not None:
+        return special
+
     q = re.sub(r"\s+", " ", cypher.strip())
 
     # Collect node aliases before we start mangling the string
@@ -248,7 +288,9 @@ def _translate(cypher: str) -> str:
                   if tbl not in {et.split()[0] for et in edge_from}
                   or any(alias in ef for ef in edge_from)]
     # Deduplicate: edge_from entries are already included via aliases
-    from_str = ", ".join(from_parts) if from_parts else "dual"
+    # Fallback: empty DuckDB-valid relation so an un-matched pattern
+    # degrades to zero rows instead of crashing with "table dual missing".
+    from_str = ", ".join(from_parts) if from_parts else "(SELECT 1 WHERE 1=0) _empty(x)"
 
     # ----------------------------------------------------------------
     # 7.  Transform WHERE conditions

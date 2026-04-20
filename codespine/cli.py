@@ -537,21 +537,28 @@ def analyse(path: str, full: bool, deep: bool, incremental_deep: bool, embed: bo
 
         _phase("Analyzing git history...", "skipped (large repo; rerun with --deep)")
 
-    vector_count = root_shard_store.query_records(
+    # Summary queries are best-effort: a translator miss or a transient
+    # DB error must never throw away a successful index.
+    def _safe_count(query: str) -> int:
+        try:
+            rows = root_shard_store.query_records(query)
+            return int(rows[0]["count"]) if rows else 0
+        except Exception as exc:  # noqa: BLE001 - summary stats are non-critical
+            click.secho(f"   (summary stat unavailable: {exc})", fg="yellow")
+            return 0
+
+    embeddings_generated = last_result.embeddings_generated if last_result else 0
+    vectors_stored = _safe_count(
         """
         MATCH (s:Symbol)
         WHERE s.embedding IS NOT NULL
         RETURN count(s) as count
         """
-    )
-    embeddings_generated = last_result.embeddings_generated if last_result else 0
-    vectors_stored = int(vector_count[0]["count"]) if vector_count else embeddings_generated
+    ) or embeddings_generated
     _phase("Generating embeddings...", f"{vectors_stored} vectors stored")
 
-    symbol_count = root_shard_store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
-    edge_count = root_shard_store.query_records("MATCH ()-[r]->() RETURN count(r) as count")
-    symbols = int(symbol_count[0]["count"]) if symbol_count else 0
-    edges = int(edge_count[0]["count"]) if edge_count else 0
+    symbols = _safe_count("MATCH (s:Symbol) RETURN count(s) as count")
+    edges = _safe_count("MATCH ()-[r]->() RETURN count(r) as count")
     elapsed = time.perf_counter() - started
 
     if not embed:
