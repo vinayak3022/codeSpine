@@ -137,8 +137,12 @@ def _index_shard_group(
 
     for mod_path, project_id in modules:
         # Per-module progress state (local — no shared mutation).
-        parse_state: dict = {"shown": False, "indexed": 0, "total": 0,
-                              "last_ts": 0.0, "printed_zero": False}
+        parse_state: dict = {
+            "shown": False, "indexed": 0, "total": 0,
+            "last_ts": 0.0, "printed_zero": False,
+            "current_file": "", "elapsed": 0.0,
+            "last_done": -1, "frozen_since": 0.0, "stall_warned": False,
+        }
         call_state: dict = {"shown": False, "count": 0, "last_ts": 0.0,
                              "started_at": 0.0}
 
@@ -160,11 +164,61 @@ def _index_shard_group(
                         _phase(f"{prefix}Parsing code...", "0/0")
                     parse_state["printed_zero"] = True
                 return
+            if event == "parse_heartbeat":
+                # Fires every 2s from a daemon thread — keeps spinner alive
+                # even when all worker threads are busy or one is hanging.
+                done    = int(payload.get("done", 0))
+                total   = int(payload.get("total", 0))
+                current = str(payload.get("current_file", ""))
+                elapsed_s = float(payload.get("elapsed", 0.0))
+                parse_state["indexed"] = done
+                parse_state["total"] = total
+                parse_state["current_file"] = current
+                parse_state["elapsed"] = elapsed_s
+                if total > 0 and not parallel:
+                    basename = os.path.basename(current) if current else ""
+                    click.echo(
+                        f"\r{_spinner_char()} {prefix}Parsing code...   "
+                        f"{_bar(done, total)} {done}/{total}  "
+                        f"{basename[:38]:<38}  {elapsed_s:.0f}s  ",
+                        nl=False,
+                    )
+                    parse_state["shown"] = True
+                    parse_state["last_ts"] = now
+
+                # ── Stall detection ──────────────────────────────────────
+                if done == parse_state["last_done"]:
+                    if parse_state["frozen_since"] == 0.0:
+                        parse_state["frozen_since"] = now
+                    stalled_for = now - parse_state["frozen_since"]
+                    if stalled_for >= 15.0 and not parse_state["stall_warned"]:
+                        parse_state["stall_warned"] = True
+                        basename = os.path.basename(current) if current else "unknown"
+                        with output_lock:
+                            click.echo()  # break out of \r line
+                            click.secho(
+                                f"  ⚠  Parsing stalled on {basename} for "
+                                f"{stalled_for:.0f}s — file may be pathological.\n"
+                                f"     Timeout at {os.environ.get('CODESPINE_PARSE_TIMEOUT_SECS', '60')}s. "
+                                f"To skip large files: "
+                                f"export CODESPINE_MAX_FILE_BYTES=2097152",
+                                fg="yellow",
+                            )
+                else:
+                    parse_state["last_done"] = done
+                    parse_state["frozen_since"] = 0.0
+                    parse_state["stall_warned"] = False
+                return
             if event == "parse_progress":
                 indexed = int(payload.get("indexed", 0))
                 total = int(payload.get("total", 0))
                 parse_state["indexed"] = indexed
                 parse_state["total"] = total
+                # Reset stall tracker on actual progress
+                if indexed != parse_state["last_done"]:
+                    parse_state["last_done"] = indexed
+                    parse_state["frozen_since"] = 0.0
+                    parse_state["stall_warned"] = False
                 if total == 0:
                     return
                 if indexed == total or (now - parse_state["last_ts"]) >= 0.2:

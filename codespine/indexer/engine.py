@@ -17,12 +17,50 @@ from codespine.search.vector import embed_text
 
 LOGGER = logging.getLogger(__name__)
 
+# Per-file parse size guard: files larger than this are skipped entirely.
+# Large generated Java files (proto, JAXB, etc.) can cause tree-sitter to
+# spin.  Override with env CODESPINE_MAX_FILE_BYTES (default 2 MB).
+_MAX_FILE_BYTES: int = int(os.environ.get("CODESPINE_MAX_FILE_BYTES", str(2 * 1024 * 1024)))
+
+# Per-file parse timeout in seconds. Override with CODESPINE_PARSE_TIMEOUT_SECS.
+_PARSE_TIMEOUT_SECS: int = int(os.environ.get("CODESPINE_PARSE_TIMEOUT_SECS", "60"))
+
+# Heartbeat period for the parse-phase heartbeat thread (seconds).
+_PARSE_HEARTBEAT_PERIOD: float = 2.0
+
 
 def _parse_file_worker(file_path: str, root_path: str, project_id: str) -> dict:
-    """Pure CPU/IO work – no DB access. Safe to run in a thread pool."""
+    """Pure CPU/IO work – no DB access. Safe to run in a thread pool.
+
+    Returns a result dict.  When the file is skipped (oversized), the dict
+    has ``parsed=None`` and ``skipped_reason`` set — callers must check and
+    skip DB writes for those entries.
+    """
     rel_path = os.path.relpath(file_path, root_path)
     is_test = "src/test/java" in file_path.replace("\\", "/")
     scope = JavaIndexer._scope_from_rel_path(rel_path)
+    # ── Size guard: skip files that are likely to hang tree-sitter ───────
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as exc:
+        raise RuntimeError(f"stat failed: {exc}") from exc
+    if file_size > _MAX_FILE_BYTES:
+        LOGGER.warning(
+            "Skipping oversized file (%d bytes > %d): %s "
+            "(raise CODESPINE_MAX_FILE_BYTES to include it)",
+            file_size, _MAX_FILE_BYTES, rel_path,
+        )
+        return {
+            "file_path": file_path,
+            "rel_path": rel_path,
+            "source": b"",
+            "parsed": None,
+            "f_id": file_id(project_id, rel_path),
+            "digest": "",
+            "is_test": is_test,
+            "scope": scope,
+            "skipped_reason": "oversized",
+        }
     with open(file_path, "rb") as fh:
         source = fh.read()
     parsed = parse_java_source(source)
@@ -241,29 +279,118 @@ class JavaIndexer:
 
         # ── Parallel parse (CPU/IO) ──────────────────────────────────────────
         # tree-sitter releases the GIL so ThreadPoolExecutor gives real speedup.
+        # A daemon heartbeat thread emits parse_heartbeat events every 2 s so
+        # the CLI spinner keeps ticking even when all workers are busy.
+        # Per-future timeouts skip files that hang (e.g. huge generated source).
         _workers = max(1, min(8, len(to_reindex), os.cpu_count() or 4))
         parse_results: list[dict] = []
         if to_reindex:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=_workers) as ex:
-                futs = {
-                    ex.submit(_parse_file_worker, fp, root_path, project_id): fp
-                    for fp in to_reindex
-                }
-                done = 0
-                for fut in concurrent.futures.as_completed(futs):
-                    done += 1
-                    fp = futs[fut]
-                    try:
-                        parse_results.append(fut.result())
-                    except Exception as exc:
-                        LOGGER.warning("Skipping %s: %s", fp, exc)
+            _parse_done_holder: list[int] = [0]
+            _parse_current_holder: list[str] = [""]
+            _parse_hb_stop = threading.Event()
+            _parse_start = time.perf_counter()
+            _total = len(to_reindex)
+
+            def _parse_heartbeat_worker() -> None:
+                while not _parse_hb_stop.wait(_PARSE_HEARTBEAT_PERIOD):
                     self._emit(
                         progress,
-                        "parse_progress",
-                        indexed=done,
-                        total=len(to_reindex),
-                        file_path=fp,
+                        "parse_heartbeat",
+                        done=_parse_done_holder[0],
+                        total=_total,
+                        current_file=_parse_current_holder[0],
+                        elapsed=time.perf_counter() - _parse_start,
                     )
+
+            _parse_hb_thread = threading.Thread(
+                target=_parse_heartbeat_worker,
+                daemon=True,
+                name="codespine-parse-heartbeat",
+            )
+            _parse_hb_thread.start()
+
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=_workers) as ex:
+                    futs: dict[concurrent.futures.Future, str] = {}
+                    submitted_at: dict[concurrent.futures.Future, float] = {}
+                    for fp in to_reindex:
+                        fut = ex.submit(_parse_file_worker, fp, root_path, project_id)
+                        futs[fut] = fp
+                        submitted_at[fut] = time.perf_counter()
+
+                    pending = set(futs)
+                    done_count = 0
+
+                    while pending:
+                        # Wait up to heartbeat period for any future to finish.
+                        try:
+                            for fut in concurrent.futures.as_completed(
+                                pending, timeout=_PARSE_HEARTBEAT_PERIOD
+                            ):
+                                pending.discard(fut)
+                                done_count += 1
+                                fp = futs[fut]
+                                _parse_done_holder[0] = done_count
+                                _parse_current_holder[0] = fp
+                                try:
+                                    parse_results.append(fut.result(timeout=0))
+                                except concurrent.futures.TimeoutError:
+                                    # Shouldn't happen (future is done), but guard anyway
+                                    pass
+                                except Exception as exc:
+                                    LOGGER.warning("Skipping %s: %s", fp, exc)
+                                self._emit(
+                                    progress,
+                                    "parse_progress",
+                                    indexed=done_count,
+                                    total=_total,
+                                    file_path=fp,
+                                )
+                        except concurrent.futures.TimeoutError:
+                            pass  # heartbeat tick — proceed to deadline scan
+
+                        # Abandon futures stuck past the per-file timeout.
+                        now = time.perf_counter()
+                        expired = [
+                            f for f in pending
+                            if now - submitted_at[f] > _PARSE_TIMEOUT_SECS
+                        ]
+                        for fut in expired:
+                            fp = futs[fut]
+                            LOGGER.warning(
+                                "Parse timeout after %ds, skipping: %s "
+                                "(thread may continue briefly in background)",
+                                _PARSE_TIMEOUT_SECS, fp,
+                            )
+                            fut.cancel()  # no-op if already running; cleans up pending ones
+                            # Insert a sentinel so the file is counted but has no symbols.
+                            parse_results.append({
+                                "file_path": fp,
+                                "rel_path": os.path.relpath(fp, root_path),
+                                "source": b"",
+                                "parsed": None,
+                                "f_id": file_id(project_id, os.path.relpath(fp, root_path)),
+                                "digest": "",
+                                "is_test": "src/test/java" in fp.replace("\\", "/"),
+                                "scope": JavaIndexer._scope_from_rel_path(
+                                    os.path.relpath(fp, root_path)
+                                ),
+                                "skipped_reason": "timeout",
+                            })
+                            pending.discard(fut)
+                            done_count += 1
+                            _parse_done_holder[0] = done_count
+                            self._emit(
+                                progress,
+                                "parse_progress",
+                                indexed=done_count,
+                                total=_total,
+                                file_path=fp,
+                                timed_out=True,
+                            )
+            finally:
+                _parse_hb_stop.set()
+                _parse_hb_thread.join(timeout=3.0)
 
         # ── Chunked DB writes ─────────────────────────────────────────────────
         if full:
@@ -297,6 +424,12 @@ class JavaIndexer:
             symbol_rows: list[dict] = []
 
             for pr in parse_chunk:
+                # Skipped files (oversized, timeout) carry parsed=None.
+                # Still count as indexed for accurate reporting, but skip
+                # class/method/symbol extraction.
+                if pr.get("parsed") is None:
+                    files_indexed += 1
+                    continue
                 file_path = pr["file_path"]
                 parsed = pr["parsed"]
                 f_id = pr["f_id"]
