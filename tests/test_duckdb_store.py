@@ -446,3 +446,42 @@ def test_corrupt_file_at_db_path_is_replaced(tmp_path: Path):
     store = DuckDBStore(db_path_override=db_path, snapshot_path_override=snap_path)
     rows = store.query_records("SELECT * FROM projects")
     assert rows == []
+
+
+def test_legacy_kuzu_dirs_at_both_paths_are_removed(tmp_path: Path):
+    """Regression: both db and db_read as KùzuDB directories (the exact
+    scenario from the field bug in v1.0.2)."""
+    db_path = str(tmp_path / "db")
+    snap_path = str(tmp_path / "db_read")
+
+    # Simulate KùzuDB directories at BOTH paths
+    for p in (db_path, snap_path):
+        os.makedirs(p)
+        (Path(p) / "catalog.kz").write_bytes(b"\x00" * 64)
+        (Path(p) / "data.kz").write_bytes(b"\x00" * 1024)
+
+    # Read-only open: legacy code would pick snap, fail, fall back to db, fail, raise.
+    # New code pre-sanitizes both paths, then returns an in-memory empty DB.
+    store = DuckDBStore(read_only=True, db_path_override=db_path, snapshot_path_override=snap_path)
+    rows = store.query_records("SELECT * FROM projects")
+    assert rows == []
+    # Both paths should be gone
+    assert not os.path.exists(db_path)
+    assert not os.path.exists(snap_path)
+
+
+def test_sharded_store_stats_flow_with_stale_kuzu_dirs(tmp_path: Path):
+    """Regression: ShardedGraphStore.list_project_metadata() must not crash
+    when every shard path is a stale KùzuDB directory (the failing
+    'codespine stats' scenario)."""
+    shards_dir = tmp_path / "shards"
+    # Pre-create 4 shards with legacy KùzuDB-style directories at both paths
+    for i in range(4):
+        (shards_dir / str(i)).mkdir(parents=True)
+        (shards_dir / str(i) / "db").mkdir()
+        (shards_dir / str(i) / "db" / "catalog.kz").write_bytes(b"\x00" * 32)
+        (shards_dir / str(i) / "db_read").mkdir()
+
+    sg = ShardedGraphStore(read_only=True, shards_dir=str(shards_dir), backend="duckdb")
+    # This is what `codespine stats` does — it must not raise.
+    assert sg.list_project_metadata() == []

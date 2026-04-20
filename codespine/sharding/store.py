@@ -299,6 +299,27 @@ class ShardedGraphStore:
             removed.extend(store.force_delete_all_data())
         return removed
 
+    def clear_analysis_artifacts(self) -> None:
+        """Fan-out: clear analysis artifacts (communities, flows, dead code) on every shard."""
+        for store in self.all_shards():
+            try:
+                store.clear_analysis_artifacts()
+            except Exception as exc:
+                LOGGER.warning("clear_analysis_artifacts failed on shard: %s", exc)
+
+    def rebuild_empty_db(self) -> None:
+        """Fan-out: rebuild each shard as an empty database."""
+        for store in self.all_shards():
+            try:
+                store.rebuild_empty_db()
+            except Exception as exc:
+                LOGGER.warning("rebuild_empty_db failed on shard: %s", exc)
+
+    def snapshot_to_read_replica(self, background: bool = False) -> bool:
+        """Alias for ``snapshot_all`` — matches GraphStore's API."""
+        self.snapshot_all(background=background)
+        return True
+
     def describe(self) -> dict:
         """Return a human-readable description of the shard topology."""
         shard_info = []

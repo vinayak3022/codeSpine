@@ -22,7 +22,6 @@ from codespine.analysis.deadcode import detect_dead_code
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
 from codespine.config import SETTINGS
-from codespine.db.store import GraphStore
 from codespine.sharding import ShardedGraphStore, ShardRouter
 from codespine.diff.branch_diff import compare_branches
 from codespine.indexer.engine import JavaIndexer
@@ -54,6 +53,17 @@ def _is_running() -> bool:
 
 def _current_repo_path() -> str:
     return os.getcwd()
+
+
+def _open_store(read_only: bool = True) -> ShardedGraphStore:
+    """Open the sharded store with the backend configured in SETTINGS.
+
+    Every CLI command must go through this helper so the correct backend
+    (DuckDB or KùzuDB) is selected transparently.  Direct ``GraphStore(...)``
+    calls were tied to the legacy single-DB KùzuDB layout and will fail on
+    any machine running the default DuckDB backend with sharded storage.
+    """
+    return ShardedGraphStore(read_only=read_only)
 
 
 def _db_size_bytes(path: str) -> int:
@@ -584,7 +594,7 @@ def analyse(path: str, full: bool, deep: bool, incremental_deep: bool, embed: bo
 @click.option("--json", "as_json", is_flag=True)
 def search(query: str, k: int, as_json: bool) -> None:
     """Hybrid search (BM25 + vector + fuzzy + RRF)."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     results = hybrid_search(store, query, k=k)
     _echo_json(results, as_json)
 
@@ -595,7 +605,7 @@ def search(query: str, k: int, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def context(query: str, max_depth: int, as_json: bool) -> None:
     """Get one-shot symbol context: search + impact + community + flows."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     result = build_symbol_context(store, query, max_depth=max_depth)
     _echo_json(result, as_json)
 
@@ -606,7 +616,7 @@ def context(query: str, max_depth: int, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def impact(symbol: str, max_depth: int, as_json: bool) -> None:
     """Impact analysis grouped by depth with confidence scores."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     result = analyze_impact(store, symbol, max_depth=max_depth)
     _echo_json(result, as_json)
 
@@ -616,7 +626,7 @@ def impact(symbol: str, max_depth: int, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def deadcode(limit: int, as_json: bool) -> None:
     """Detect dead code candidates with Java-aware exemptions."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     result = detect_dead_code(store, limit=limit)
     _echo_json(result, as_json)
 
@@ -627,7 +637,7 @@ def deadcode(limit: int, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def flow(entry_symbol: str | None, max_depth: int, as_json: bool) -> None:
     """Trace execution flows from detected entry points."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     result = trace_execution_flows(store, entry_symbol=entry_symbol, max_depth=max_depth)
     _echo_json(result, as_json)
 
@@ -637,7 +647,7 @@ def flow(entry_symbol: str | None, max_depth: int, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def community(symbol: str | None, as_json: bool) -> None:
     """Detect communities or lookup community for a symbol."""
-    store = GraphStore(read_only=False)
+    store = _open_store(read_only=False)
     detect_communities(store)
     if symbol:
         _echo_json(symbol_community(store, symbol), as_json)
@@ -655,7 +665,7 @@ def community(symbol: str | None, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def coupling(days: int, min_strength: float, min_cochanges: int, as_json: bool) -> None:
     """Compute and query git change coupling."""
-    store = GraphStore(read_only=False)
+    store = _open_store(read_only=False)
     project = store.query_records("MATCH (p:Project) RETURN p.id as id LIMIT 1")
     project_id = project[0]["id"] if project else os.path.basename(os.getcwd())
     compute_coupling(store, os.getcwd(), project_id, days=days, min_strength=min_strength, min_cochanges=min_cochanges)
@@ -681,7 +691,7 @@ def coupling(days: int, min_strength: float, min_cochanges: int, as_json: bool) 
 @click.option("--promote-on-commit/--no-promote-on-commit", default=True, show_default=True)
 def watch(path: str, global_interval: int, overlay_debounce_ms: int, promote_on_commit: bool) -> None:
     """Live re-indexing and periodic global analysis refresh."""
-    store = GraphStore(read_only=False)
+    store = _open_store(read_only=False)
     run_watch_mode(
         store,
         os.path.abspath(path),
@@ -720,12 +730,12 @@ def stats(as_json: bool, show_shards: bool) -> None:
     def _project_store(pid: str):
         return sg.shard(pid)
 
-    if not projects:
+    if not all_projects_meta:
         click.secho("No projects indexed yet. Run 'codespine analyse <path>'.", fg="yellow")
         return
 
     rows = []
-    for p in projects:
+    for p in all_projects_meta:
         pid = p["id"]
         # Route each query to the project's owning shard.
         ps = _project_store(pid)
@@ -813,7 +823,7 @@ def stats(as_json: bool, show_shards: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def list_projects(as_json: bool) -> None:
     """List indexed projects."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path, p.language as language ORDER BY p.id")
     _echo_json(projects, as_json)
 
@@ -837,7 +847,7 @@ def status(as_json: bool) -> None:
                 pid = int(f.read().strip())
         except Exception:
             pid = None
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     overlay = get_overlay_status(store)
 
     # Check for stale PID file
@@ -875,7 +885,7 @@ def status(as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def overlay_status_cmd(project: str | None, as_json: bool) -> None:
     """Show dirty overlay status by project/module."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     _echo_json(get_overlay_status(store, project=project), as_json)
 
 
@@ -884,7 +894,7 @@ def overlay_status_cmd(project: str | None, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def overlay_clear_cmd(project: str | None, as_json: bool) -> None:
     """Clear dirty overlay data without touching the committed base index."""
-    store = GraphStore(read_only=False)
+    store = _open_store(read_only=False)
     result = {"cleared": clear_overlay(store, project=project)}
     _echo_json(result, as_json)
 
@@ -894,7 +904,7 @@ def overlay_clear_cmd(project: str | None, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def overlay_promote_cmd(project: str | None, as_json: bool) -> None:
     """Promote dirty overlay changes into the committed base index now."""
-    store = GraphStore(read_only=False)
+    store = _open_store(read_only=False)
     result = {"promoted": promote_overlay(store, project=project, require_head_change=False)}
     _echo_json(result, as_json)
 
@@ -904,7 +914,7 @@ def overlay_promote_cmd(project: str | None, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def cypher(query: str, as_json: bool) -> None:
     """Run a raw Cypher query against the graph DB."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     try:
         result = store.query_records(query)
     except Exception as exc:
@@ -948,7 +958,7 @@ def clear_project_cmd(project_id: str, allow_running: bool) -> None:
         click.secho("Stop MCP first ('codespine stop') to modify index.", fg="yellow")
         return
     try:
-        store = GraphStore(read_only=False)
+        store = _open_store(read_only=False)
         recs = store.query_records(
             "MATCH (p:Project) WHERE p.id = $pid RETURN p.id as id, p.path as path",
             {"pid": project_id},
@@ -974,7 +984,7 @@ def clear_project_cmd(project_id: str, allow_running: bool) -> None:
         except OSError:
             pass
     # Update the read replica so read-only callers (stats, MCP) see the change.
-    GraphStore.snapshot_to_read_replica()
+    store.snapshot_to_read_replica()
     click.secho(f"Cleared project '{project_id}' (was at {project_path}).", fg="green")
 
 
@@ -991,12 +1001,12 @@ def clear_index_cmd(allow_running: bool) -> None:
         click.secho("Stop MCP first ('codespine stop') to modify index.", fg="yellow")
         return
     try:
-        store = GraphStore(read_only=False)
+        store = _open_store(read_only=False)
         projects = store.query_records("MATCH (p:Project) RETURN p.id as id")
     except Exception:
         # DB is corrupted — can't even open it.  Force-delete everything.
         click.secho("DB is corrupted. Running force-reset instead...", fg="yellow")
-        removed = GraphStore.force_delete_all_data()
+        removed = ShardedGraphStore(read_only=False).force_delete_all_data()
         click.secho(f"Force-reset complete. {len(removed)} path(s) removed. Index is now empty.", fg="green")
         return
     try:
@@ -1004,7 +1014,7 @@ def clear_index_cmd(allow_running: bool) -> None:
     except Exception as exc:
         # rebuild_empty_db failed even with fallbacks — force-delete.
         click.secho(f"rebuild failed ({exc}). Running force-reset...", fg="yellow")
-        GraphStore.force_delete_all_data()
+        store.force_delete_all_data()
         click.secho("Force-reset complete. Index is now empty.", fg="green")
         return
     store.overlay_store.clear_all()
@@ -1017,7 +1027,7 @@ def clear_index_cmd(allow_running: bool) -> None:
                 pass
     # Publish an empty read replica so that read-only callers (stats, MCP)
     # immediately see the cleared state and the MCP daemon hot-reloads.
-    GraphStore.snapshot_to_read_replica()
+    store.snapshot_to_read_replica()
     click.secho(f"Cleared {len(projects)} project(s). Index is now empty.", fg="green")
 
 
@@ -1038,7 +1048,7 @@ def force_reset_cmd(force: bool) -> None:
     ):
         click.echo("Aborted.")
         return
-    removed = GraphStore.force_delete_all_data()
+    removed = ShardedGraphStore(read_only=False).force_delete_all_data()
     if removed:
         for p in removed:
             click.echo(f"  removed: {p}")
@@ -1177,7 +1187,7 @@ def install_model() -> None:
 @main.command("run-mcp", hidden=True)
 def run_mcp() -> None:
     """Run MCP server in stdio mode."""
-    store = GraphStore(read_only=True)
+    store = _open_store(read_only=True)
     mcp = build_mcp_server(store, repo_path_provider=_current_repo_path)
     mcp.run()
 
