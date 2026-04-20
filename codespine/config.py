@@ -29,8 +29,10 @@ class Settings:
     rrf_k: int = 60
     semantic_candidate_pool: int = 2000
     write_batch_size: int = 500
-    index_file_batch_size: int = 20
-    edge_write_batch_size: int = 500
+    index_file_batch_size: int = 200
+    index_method_batch_size: int = 2000
+    index_symbol_batch_size: int = 2000
+    edge_write_batch_size: int = 5000
     default_coupling_days: int = 5
     default_min_coupling_strength: float = 0.3
     default_min_cochanges: int = 3

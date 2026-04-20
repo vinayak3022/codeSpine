@@ -1,3 +1,4 @@
+import time
 from types import SimpleNamespace
 
 from codespine.indexer.call_resolver import resolve_calls
@@ -41,3 +42,36 @@ def test_resolver_prefers_receiver_type_and_arity():
     out = list(resolve_calls(method_catalog, calls, method_context, class_catalog))
     assert ("src", "m1", 1.0, "receiver_this_exact") in out
     assert ("src", "m3", 0.8, "receiver_method_match") in out
+
+
+def test_resolver_stops_at_deadline():
+    method_catalog = {
+        "src": {
+            "name": "entry",
+            "param_count": 0,
+            "class_id": "c_service",
+            "class_fqcn": "com.example.Service",
+            "signature": "entry()",
+        },
+        "m1": {
+            "name": "run",
+            "param_count": 0,
+            "class_id": "c_service",
+            "class_fqcn": "com.example.Service",
+            "signature": "run()",
+        },
+    }
+    calls = {"src": [SimpleNamespace(name="run", receiver="this", arg_count=0)]}
+    method_context = {"src": {"class_id": "c_service", "class_fqcn": "com.example.Service"}}
+
+    out = list(
+        resolve_calls(
+            method_catalog,
+            calls,
+            method_context,
+            {"Service": ["com.example.Service"]},
+            deadline=time.perf_counter() - 1,
+        )
+    )
+
+    assert out == []

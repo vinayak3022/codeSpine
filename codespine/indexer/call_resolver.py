@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from typing import Iterator
 
@@ -58,6 +59,7 @@ def resolve_calls(
     class_catalog: dict[str, list[str]],
     *,
     scan_counter: list[int] | None = None,
+    deadline: float | None = None,
 ) -> Iterator[tuple[str, str, float, str]]:
     """Resolve call names to known method ids.
 
@@ -84,6 +86,8 @@ def resolve_calls(
             class_method_index_by_fqcn[class_fqcn][key].append(method_id)
 
     for source_id, call_sites in calls.items():
+        if deadline is not None and time.perf_counter() >= deadline:
+            return
         if scan_counter is not None:
             scan_counter[0] += 1
         src_meta = method_catalog.get(source_id, {})
@@ -94,6 +98,8 @@ def resolve_calls(
         field_types = src_ctx.get("field_types", {}) or {}
 
         for call in call_sites:
+            if deadline is not None and time.perf_counter() >= deadline:
+                return
             call_name = call.name
 
             key = (call_name, int(call.arg_count))

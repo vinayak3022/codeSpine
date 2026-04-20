@@ -1394,7 +1394,8 @@ def build_mcp_server(store, repo_path_provider):
         Parameters:
           path  – Absolute or relative path to the project/workspace to index.
           full  – If True, re-index every file even if unchanged (default: incremental).
-          deep  – If True, also run community detection, flows, and coupling (slower).
+          deep  – If True, run complete foreground community, flow, dead-code,
+                  and coupling enrichment (slower).
           embed – If True, generate vector embeddings for semantic search (slow when
                   sentence-transformers is installed; BM25/fuzzy search works without them).
 
@@ -1422,7 +1423,7 @@ def build_mcp_server(store, repo_path_provider):
         else:
             cmd.append("--incremental")
         if deep:
-            cmd.append("--deep")
+            cmd.extend(["--complete", "--deep"])
         if embed:
             cmd.append("--embed")
         else:

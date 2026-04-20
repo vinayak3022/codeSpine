@@ -190,6 +190,7 @@ class JavaIndexer:
         progress: Callable[[str, dict], None] | None = None,
         project_id: str | None = None,
         embed: bool = True,
+        deadline: float | None = None,
     ) -> IndexResult:
         root_path = os.path.abspath(root_path)
         if project_id is None:
@@ -651,13 +652,13 @@ class JavaIndexer:
                 with self.store.transaction():
                     self.store.upsert_classes_batch(class_rows)
                 self.store._recycle_conn()
-                _METHOD_SUB_BATCH = 200
+                _METHOD_SUB_BATCH = max(1, int(getattr(SETTINGS, "index_method_batch_size", 2000)))
                 _db_phase_holder[0] = "writing methods"
                 for method_sub in self._chunked(method_rows, _METHOD_SUB_BATCH):
                     with self.store.transaction():
                         self.store.upsert_methods_batch(method_sub)
                     self.store._recycle_conn()
-                _SYMBOL_SUB_BATCH = 200
+                _SYMBOL_SUB_BATCH = max(1, int(getattr(SETTINGS, "index_symbol_batch_size", 2000)))
                 _db_phase_holder[0] = "writing symbols"
                 for symbol_sub in self._chunked(symbol_rows, _SYMBOL_SUB_BATCH):
                     with self.store.transaction():
@@ -686,6 +687,9 @@ class JavaIndexer:
             elapsed=time.perf_counter() - _db_start,
         )
 
+        def _deadline_expired() -> bool:
+            return deadline is not None and time.perf_counter() >= deadline
+
         self._emit(progress, "resolve_calls_start")
 
         # ── Heartbeat thread ──────────────────────────────────────────────
@@ -693,43 +697,47 @@ class JavaIndexer:
         # many seconds on large repos with common method names.  A daemon
         # heartbeat thread fires every 2 s so the CLI progress spinner keeps
         # ticking even during those silent stretches.
-        _scan_counter: list[int] = [0]
-        _edges_counter: list[int] = [0]
-        _hb_stop = threading.Event()
-        _resolve_start = time.perf_counter()
-
-        def _heartbeat_worker() -> None:
-            while not _hb_stop.wait(2.0):
-                self._emit(
-                    progress,
-                    "resolve_calls_heartbeat",
-                    scanned=_scan_counter[0],
-                    edges=_edges_counter[0],
-                    elapsed=time.perf_counter() - _resolve_start,
-                )
-
-        _hb_thread = threading.Thread(
-            target=_heartbeat_worker,
-            daemon=True,
-            name="codespine-resolver-heartbeat",
-        )
-        _hb_thread.start()
-
-        # Deduplicate (src, dst) pairs — the same pair can appear many times
-        # when a method calls another method at multiple call sites.
-        # Keep the highest-confidence resolution to avoid N writes per pair.
         best_calls: dict[tuple[str, str], tuple[float, str]] = {}
-        try:
-            for src, dst, confidence, reason in resolve_calls(
-                method_catalog, method_calls, method_context, class_catalog,
-                scan_counter=_scan_counter,
-            ):
-                key = (src, dst)
-                if key not in best_calls or confidence > best_calls[key][0]:
-                    best_calls[key] = (confidence, reason)
-        finally:
-            _hb_stop.set()
-            _hb_thread.join(timeout=3.0)
+        partial_calls = _deadline_expired()
+        if not partial_calls:
+            _scan_counter: list[int] = [0]
+            _edges_counter: list[int] = [0]
+            _hb_stop = threading.Event()
+            _resolve_start = time.perf_counter()
+
+            def _heartbeat_worker() -> None:
+                while not _hb_stop.wait(2.0):
+                    self._emit(
+                        progress,
+                        "resolve_calls_heartbeat",
+                        scanned=_scan_counter[0],
+                        edges=_edges_counter[0],
+                        elapsed=time.perf_counter() - _resolve_start,
+                    )
+
+            _hb_thread = threading.Thread(
+                target=_heartbeat_worker,
+                daemon=True,
+                name="codespine-resolver-heartbeat",
+            )
+            _hb_thread.start()
+
+            # Deduplicate (src, dst) pairs — the same pair can appear many times
+            # when a method calls another method at multiple call sites.
+            # Keep the highest-confidence resolution to avoid N writes per pair.
+            try:
+                for src, dst, confidence, reason in resolve_calls(
+                    method_catalog, method_calls, method_context, class_catalog,
+                    scan_counter=_scan_counter,
+                    deadline=deadline,
+                ):
+                    key = (src, dst)
+                    if key not in best_calls or confidence > best_calls[key][0]:
+                        best_calls[key] = (confidence, reason)
+                partial_calls = _deadline_expired()
+            finally:
+                _hb_stop.set()
+                _hb_thread.join(timeout=3.0)
 
         # Stream writes in batches — never hold the full set in RAM.
         call_buf: list[dict] = []
@@ -751,9 +759,29 @@ class JavaIndexer:
                 self.store.add_calls_batch(call_buf)
             calls_resolved += len(call_buf)
             self.store._recycle_conn()
-        self._emit(progress, "resolve_calls_done", calls_resolved=calls_resolved)
+        self._emit(
+            progress,
+            "resolve_calls_done",
+            calls_resolved=calls_resolved,
+            partial=partial_calls,
+        )
 
         self._emit(progress, "resolve_types_start")
+        if _deadline_expired():
+            self._emit(progress, "resolve_types_done", type_relationships=0, partial=True)
+            self._emit(progress, "di_done", injections=0, interface_bindings=0, partial=True)
+            self._prune_meta_cache(meta_cache, current_file_ids)
+            self._save_file_meta_cache(project_id, meta_cache)
+            return IndexResult(
+                project_id=project_id,
+                files_found=len(current_files),
+                files_indexed=files_indexed,
+                classes_indexed=classes_indexed,
+                methods_indexed=methods_indexed,
+                calls_resolved=calls_resolved,
+                type_relationships=0,
+                embeddings_generated=classes_indexed + methods_indexed if embed else 0,
+            )
         type_rows = self._build_inheritance_edges(
             class_meta,
             class_catalog,

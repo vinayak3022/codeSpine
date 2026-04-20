@@ -59,8 +59,7 @@ Downloads and caches the embedding model. Only needed once. After this, `--embed
 codespine analyse /path/to/java-project
 
 # 2. (Optional) Run the expensive deep passes: communities, flows, dead code, coupling
-#    Auto-enabled for repos with ≤ 3,000 files; use --deep to force on larger repos.
-codespine analyse /path/to/java-project --deep
+codespine analyse /path/to/java-project --complete --deep
 
 # 3. (Optional) Add semantic embeddings for concept-level search
 codespine analyse /path/to/java-project --embed
@@ -248,8 +247,9 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 # Indexing
 codespine analyse <path>                     # incremental index (default)
 codespine analyse <path> --full              # full re-index from scratch
-codespine analyse <path> --deep              # + communities, flows, dead code, coupling
-codespine analyse <path> --incremental-deep  # incremental index + force deep passes
+codespine analyse <path> --budget 90         # fast index with a resolver deadline
+codespine analyse <path> --complete --deep   # + communities, flows, dead code, coupling
+codespine analyse <path> --complete --incremental-deep
 codespine analyse <path> --embed             # + vector embeddings
 
 # Live watch
@@ -295,7 +295,7 @@ codespine force-reset                        # emergency: delete all data files
 
 `analyse` defaults to incremental mode. Repeat runs only process changed files and are fast.
 
-Deep analysis (`--deep`) now runs automatically for repos with ≤ 3,000 files. For larger repos, pass `--deep` explicitly. Use `--incremental-deep` when you want a fast file-only update but still want communities, flows, dead code, and coupling refreshed.
+`analyse` runs in fast mode by default: it indexes the core graph, publishes that read replica from a detached process, then continues communities, flows, dead code, coupling, and cross-module enrichment in the background. Use `--complete --deep` when you want those passes refreshed before the command returns.
 
 ---
 
@@ -481,12 +481,12 @@ The deep analysis phase covers four passes that are expensive but optional:
 | Dead code | Finds methods with no callers (Java-aware exemptions) | Cleanup audits |
 | Change coupling | Analyses git history for co-changed file pairs | `get_change_coupling`, `related` |
 
-**Auto-threshold:** deep analysis runs automatically when the project has ≤ 3,000 Java files. Larger repos get lightweight flow/dead-code passes; full deep analysis requires `--deep`.
+**Fast default:** `codespine analyse` prioritizes a queryable core index. Communities, flows, dead-code, git coupling, and cross-module links are queued in a detached background enrichment job unless you use `--complete`.
 
-**Incremental deep:** `--incremental-deep` combines incremental file indexing with a forced full deep pass — useful after large refactors where you want the call graph refreshed quickly but also want updated communities and coupling.
+**Complete deep:** `--complete --deep` runs the expensive enrichment passes before returning. `--complete --incremental-deep` combines incremental file indexing with a forced full deep pass.
 
 ```bash
-codespine analyse . --incremental-deep
+codespine analyse . --complete --incremental-deep
 ```
 
 **Embeddings** (`--embed`) are independent of deep analysis. Without them, BM25 + fuzzy search still works. Add embeddings when you need concept-level retrieval ("find retry logic", "find payment processing").
