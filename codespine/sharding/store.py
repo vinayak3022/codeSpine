@@ -184,6 +184,15 @@ class ShardedGraphStore:
         except OSError as exc:
             LOGGER.warning("Migration from legacy path failed: %s — starting fresh", exc)
 
+    def shard_by_index(self, idx: int) -> _AnyStore | None:
+        """Return (or open) the store for shard *idx* directly.
+
+        Useful when you hold a shard index (e.g. from ``router.shard_for()``)
+        and want to access the store without a project-id lookup.  Returns
+        ``None`` if the shard doesn't exist yet in read-only mode.
+        """
+        return self._get_shard(idx)
+
     def all_shards(self) -> list[GraphStore]:
         """Open and return all physical shards that exist (for fan-out reads).
 

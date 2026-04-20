@@ -346,3 +346,171 @@ def test_unmatched_pattern_uses_safe_fallback():
     """
     sql = _translate("MATCH (x:NotARealLabel) RETURN x.id")
     assert "dual" not in sql.lower()
+
+
+# ---------------------------------------------------------------------------
+# Multi-MATCH + WITH pipeline (v1.0.6 regressions — stats crash)
+# ---------------------------------------------------------------------------
+
+
+def test_multi_match_with_separator_classes():
+    """MATCH … WITH f MATCH … — the exact stats.classes query that crashed in
+    v1.0.4 with 'syntax error at or near WITH'.
+    """
+    sql = _translate(
+        """
+        MATCH (f:File) WHERE f.project_id = $pid
+        WITH f
+        MATCH (c:Class) WHERE c.file_id = f.id
+        RETURN count(c) as n
+        """
+    )
+    assert "dual" not in sql.lower()
+    assert "WITH" not in sql, f"WITH survived in SQL: {sql!r}"
+    assert "files" in sql
+    assert "classes" in sql
+    assert "f.project_id = $pid" in sql
+    assert "c.file_id = f.id" in sql
+
+
+def test_multi_match_3stage_methods():
+    """Three MATCH + two WITH stages — stats.methods query."""
+    sql = _translate(
+        """
+        MATCH (f:File) WHERE f.project_id = $pid
+        WITH f
+        MATCH (c:Class) WHERE c.file_id = f.id
+        WITH c
+        MATCH (c)-[:HAS_METHOD]->(m:Method)
+        RETURN count(m) as n
+        """
+    )
+    assert "WITH" not in sql
+    assert "files" in sql and "classes" in sql and "methods" in sql
+    assert "m.class_id = c.id" in sql
+    assert "c.file_id = f.id" in sql
+    assert "f.project_id = $pid" in sql
+
+
+def test_multi_match_calls_anonymous_dst():
+    """MATCH … -[:CALLS]->() — anonymous destination in stats.calls query."""
+    sql = _translate(
+        """
+        MATCH (f:File) WHERE f.project_id = $pid
+        WITH f
+        MATCH (c:Class) WHERE c.file_id = f.id
+        WITH c
+        MATCH (c)-[:HAS_METHOD]->(m:Method)-[:CALLS]->()
+        RETURN count(*) as n
+        """
+    )
+    assert "WITH" not in sql
+    assert "calls" in sql
+    assert "m.class_id = c.id" in sql
+    assert "source_id" in sql
+
+
+def test_multi_match_embedding_filter():
+    """MATCH + WITH + IS NOT NULL filter — stats.embeddings query."""
+    sql = _translate(
+        """
+        MATCH (f:File) WHERE f.project_id = $pid
+        WITH f
+        MATCH (s:Symbol) WHERE s.file_id = f.id AND s.embedding IS NOT NULL
+        RETURN count(s) as n
+        """
+    )
+    assert "WITH" not in sql
+    assert "symbols" in sql
+    assert "IS NOT NULL" in sql
+    assert "s.file_id = f.id" in sql
+
+
+# ---------------------------------------------------------------------------
+# Virtual FK edges (v1.0.6 — HAS_METHOD / HAS_CLASS / DECLARES)
+# ---------------------------------------------------------------------------
+
+
+def test_has_method_virtual_edge():
+    sql = _translate(
+        "MATCH (c:Class)-[:HAS_METHOD]->(m:Method) RETURN m.id"
+    )
+    assert "class_id" in sql          # FK condition emitted
+    assert "references_type" not in sql   # no real edge table created
+    assert "methods" in sql and "classes" in sql
+
+
+def test_has_class_virtual_edge():
+    sql = _translate(
+        "MATCH (f:File)-[:HAS_CLASS]->(c:Class) RETURN c.fqcn"
+    )
+    assert "file_id" in sql
+    assert "classes" in sql and "files" in sql
+
+
+def test_declares_virtual_edge():
+    sql = _translate(
+        "MATCH (f:File)-[:DECLARES]->(s:Symbol) RETURN s.fqname"
+    )
+    assert "file_id" in sql
+    assert "symbols" in sql and "files" in sql
+
+
+# ---------------------------------------------------------------------------
+# Undirected edges (v1.0.6)
+# ---------------------------------------------------------------------------
+
+
+def test_undirected_co_changed_with():
+    sql = _translate(
+        "MATCH (a:File)-[r:CO_CHANGED_WITH]-(b:File) RETURN a.path, b.path"
+    )
+    # Both directions should appear in the join condition
+    assert "co_changed_with" in sql
+    assert "file_a" in sql and "file_b" in sql
+
+
+# ---------------------------------------------------------------------------
+# _split_clauses unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_split_clauses_simple():
+    from codespine.db._cypher_compat import _split_clauses
+    result = _split_clauses("MATCH (n:File) WHERE n.id = $x RETURN n.path")
+    kws = [kw for kw, _ in result]
+    assert kws == ["MATCH", "WHERE", "RETURN"]
+
+
+def test_split_clauses_multi_match():
+    from codespine.db._cypher_compat import _split_clauses
+    q = "MATCH (f:File) WHERE f.project_id = $pid WITH f MATCH (c:Class) RETURN c.id"
+    result = _split_clauses(q)
+    kws = [kw for kw, _ in result]
+    assert kws == ["MATCH", "WHERE", "WITH", "MATCH", "RETURN"]
+
+
+def test_split_clauses_keyword_inside_braces_ignored():
+    """NOT EXISTS { MATCH ... } must not split the outer clause."""
+    from codespine.db._cypher_compat import _split_clauses
+    q = "MATCH (m:Method) WHERE NOT EXISTS { MATCH (:Method)-[:CALLS]->(m) } RETURN m.id"
+    result = _split_clauses(q)
+    kws = [kw for kw, _ in result]
+    assert kws == ["MATCH", "WHERE", "RETURN"]
+
+
+def test_split_clauses_keyword_inside_parens_ignored():
+    """Keywords inside node patterns must not cause spurious splits."""
+    from codespine.db._cypher_compat import _split_clauses
+    q = "MATCH (n:Method {name: 'RETURN_VALUE'}) RETURN n.id"
+    result = _split_clauses(q)
+    kws = [kw for kw, _ in result]
+    assert kws == ["MATCH", "RETURN"]
+
+
+def test_split_clauses_order_by():
+    from codespine.db._cypher_compat import _split_clauses
+    q = "MATCH (n:Community) RETURN n.id ORDER BY n.cohesion"
+    result = _split_clauses(q)
+    kws = [kw for kw, _ in result]
+    assert "ORDER BY" in kws

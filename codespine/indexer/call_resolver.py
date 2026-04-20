@@ -56,10 +56,19 @@ def resolve_calls(
     calls: dict[str, list],
     method_context: dict[str, dict],
     class_catalog: dict[str, list[str]],
+    *,
+    scan_counter: list[int] | None = None,
 ) -> Iterator[tuple[str, str, float, str]]:
     """Resolve call names to known method ids.
 
     Yields tuples: (source_method_id, target_method_id, confidence, reason)
+
+    Parameters
+    ----------
+    scan_counter:
+        Optional single-element list.  When provided, ``scan_counter[0]``
+        is incremented for every source method processed so that a heartbeat
+        thread can report progress even during periods of zero edge emission.
     """
     name_arity_to_method_ids: dict[tuple[str, int], list[str]] = defaultdict(list)
     class_method_index_by_id: dict[str, dict[tuple[str, int], list[str]]] = defaultdict(lambda: defaultdict(list))
@@ -75,6 +84,8 @@ def resolve_calls(
             class_method_index_by_fqcn[class_fqcn][key].append(method_id)
 
     for source_id, call_sites in calls.items():
+        if scan_counter is not None:
+            scan_counter[0] += 1
         src_meta = method_catalog.get(source_id, {})
         src_ctx = method_context.get(source_id, {})
         src_class_id = src_meta.get("class_id", "") or src_ctx.get("class_id", "")

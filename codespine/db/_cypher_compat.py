@@ -8,10 +8,14 @@ Supported constructs
 --------------------
 - Node patterns            MATCH (alias:Label) or (a:L {prop: $v})
 - Anonymous nodes          (:Label) in NOT-EXISTS subqueries
-- Relationship patterns    (a)-[r:REL]->(b) or (a)-[:REL]->(b)
+- Relationship patterns    (a)-[r:REL]->(b) directed
+- Undirected edges         (a)-[r:REL]-(b)  → OR of both directions
+- Virtual FK edges         (a)-[:HAS_METHOD]->(b) → b.class_id = a.id (no edge table)
 - Multi-hop patterns       (a)-[:R1]->(x)-[:R2]->(b)
+- Anonymous destination    (a)-[:CALLS]->()
+- Multi-MATCH + WITH       Multiple MATCH clauses joined by WITH pipeline stages
 - WHERE                    =, <>, IN, CONTAINS, lower(), coalesce(),
-                           IS NULL, IS NOT NULL, >= , <=
+                           IS NULL, IS NOT NULL, >=, <=
 - NOT EXISTS subqueries    NOT EXISTS { MATCH (:N)-[:R]->(m) }
 - WITH … ORDER BY          Kuzu paging construct → plain ORDER BY
 - DISTINCT, ORDER BY, LIMIT
@@ -51,11 +55,42 @@ _REL_EDGE: dict[str, tuple[str, str, str, str | None]] = {
     "CO_CHANGED_WITH": ("co_changed_with",   "file_a",       "file_b",       None),
 }
 
+# Virtual FK edges: backed by a foreign-key column rather than a separate
+# edge table.  Format: (src_label_table, dst_label_table, dst_fk_col)
+# e.g. HAS_METHOD: methods.class_id = class.id
+_VIRTUAL_REL_EDGE: dict[str, tuple[str, str, str]] = {
+    "HAS_METHOD": ("classes", "methods",  "class_id"),
+    "HAS_CLASS":  ("files",   "classes",  "file_id"),
+    "DECLARES":   ("files",   "symbols",  "file_id"),
+}
+
+# All real edge tables (used for anonymous total-count query)
+_ALL_EDGE_TABLES = (
+    "calls",
+    "references_type",
+    "injects",
+    "binds_interface",
+    "community_members",
+    "flow_members",
+    "co_changed_with",
+)
+
+# Top-level Cypher keywords recognised by the clause splitter.
+# Order matters: longer / more-specific patterns must come before shorter ones.
+_TOP_KEYWORDS = (
+    "OPTIONAL MATCH",
+    "ORDER BY",
+    "MATCH",
+    "WITH",
+    "WHERE",
+    "RETURN",
+    "LIMIT",
+)
+
 
 def is_cypher(query: str) -> bool:
     """Return True if *query* looks like Cypher rather than SQL."""
-    q = query.lstrip()
-    return bool(re.match(r"(?i)\s*MATCH\b", q))
+    return bool(re.match(r"(?i)\s*MATCH\b", query.lstrip()))
 
 
 # ---------------------------------------------------------------------------
@@ -74,38 +109,116 @@ def translate(cypher: str, params: dict[str, Any] | None = None) -> tuple[str, d
 
 
 # ---------------------------------------------------------------------------
+# Clause splitter
+# ---------------------------------------------------------------------------
+
+def _split_clauses(q: str) -> list[tuple[str, str]]:
+    """Tokenise a (whitespace-normalised) Cypher query into clause pairs.
+
+    Returns a list of ``(keyword, body)`` tuples at the TOP level of the
+    query.  Keywords inside ``()``, ``[]``, ``{}`` or quoted strings are
+    NOT treated as clause boundaries.
+
+    Example::
+
+        "MATCH (f:File) WHERE f.id = $x WITH f MATCH (c:Class) RETURN c.name"
+        →  [("MATCH", "(f:File)"),
+            ("WHERE", "f.id = $x"),
+            ("WITH",  "f"),
+            ("MATCH", "(c:Class)"),
+            ("RETURN","c.name")]
+    """
+    results: list[tuple[str, str]] = []
+    n = len(q)
+    i = 0
+    depth_paren = depth_sq = depth_brace = 0
+    in_quote = False
+    quote_char = ""
+    current_kw: str | None = None
+    current_start = 0
+
+    while i < n:
+        ch = q[i]
+
+        # ── Quote handling ────────────────────────────────────────────────
+        if in_quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2        # skip escaped char
+                continue
+            if ch == quote_char:
+                in_quote = False
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_quote = True
+            quote_char = ch
+            i += 1
+            continue
+
+        # ── Depth tracking ────────────────────────────────────────────────
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+        elif ch == "[":
+            depth_sq += 1
+        elif ch == "]":
+            depth_sq = max(0, depth_sq - 1)
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+
+        # ── Keyword detection (top-level only) ───────────────────────────
+        if depth_paren == 0 and depth_sq == 0 and depth_brace == 0:
+            for kw in _TOP_KEYWORDS:
+                kl = len(kw)
+                if q[i : i + kl].upper() == kw:
+                    end_pos = i + kl
+                    # Require word boundary: end-of-string or non-word char
+                    if end_pos < n and (q[end_pos].isalnum() or q[end_pos] == "_"):
+                        continue     # e.g. "MATCHING" is not "MATCH"
+                    # Flush previous clause
+                    if current_kw is not None:
+                        body = q[current_start:i].strip()
+                        results.append((current_kw, body))
+                    current_kw = kw
+                    current_start = end_pos
+                    i = end_pos
+                    break
+            else:
+                i += 1
+        else:
+            i += 1
+
+    # Flush final clause
+    if current_kw is not None:
+        body = q[current_start:].strip()
+        results.append((current_kw, body))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Internal translation pipeline
 # ---------------------------------------------------------------------------
 
-_ALL_EDGE_TABLES = (
-    "calls",
-    "references_type",
-    "injects",
-    "binds_interface",
-    "community_members",
-    "flow_members",
-    "co_changed_with",
-)
-
-
 def _translate_anonymous_edge_count(cypher: str) -> str | None:
-    """Handle `MATCH ()-[r]->() RETURN count(r) [as X]`.
+    """Fast-path for ``MATCH ()-[r]->() RETURN count(r) [as X]``.
 
-    Anonymous edge patterns carry no labels, so the generic translator
+    Anonymous edge patterns carry no labels so the generic translator
     cannot derive a FROM table.  We special-case the count-all-edges
-    pattern by unioning row-counts across every edge table in the
-    schema, which is what CodeSpine actually asks for.
+    pattern by summing row-counts across every edge table.
     """
     q = re.sub(r"\s+", " ", cypher.strip())
-    # Accept MATCH ()-[r]->() RETURN count(r) [as alias]
     m = re.match(
-        r"(?i)MATCH\s*\(\s*\)\s*-\s*\[\s*(\w+)?\s*\]\s*->\s*\(\s*\)\s*"
-        r"RETURN\s+count\s*\(\s*\*?\w*\s*\)\s*(?:as\s+(\w+))?\s*$",
+        r"(?i)MATCH\s*\(\s*\)\s*-\s*\[\s*\w*\s*\]\s*->\s*\(\s*\)\s*"
+        r"RETURN\s+count\s*\(\s*[*]?\w*\s*\)\s*(?:as\s+(\w+))?\s*$",
         q,
     )
     if not m:
         return None
-    alias = m.group(2) or "count"
+    alias = m.group(1) or "count"
     unions = " UNION ALL ".join(
         f"SELECT COUNT(*) AS c FROM {tbl}" for tbl in _ALL_EDGE_TABLES
     )
@@ -113,25 +226,136 @@ def _translate_anonymous_edge_count(cypher: str) -> str | None:
 
 
 def _translate(cypher: str) -> str:
-    # Fast-path: anonymous edge-count query used by `analyse` summary.
+    # ── Fast-path: anonymous total-edge-count ────────────────────────────
     special = _translate_anonymous_edge_count(cypher)
     if special is not None:
         return special
 
     q = re.sub(r"\s+", " ", cypher.strip())
+    clauses = _split_clauses(q)
 
-    # Collect node aliases before we start mangling the string
-    aliases: dict[str, str] = {}          # alias → table
-    inline_conds: list[str] = []          # extra WHERE from {prop: $val}
-    edge_from: list[str] = []             # edge-table aliases to add to FROM
-    edge_conds: list[str] = []            # join conditions from rel patterns
+    aliases: dict[str, str] = {}      # alias → table name
+    inline_conds: list[str] = []      # WHERE from inline {prop: $val}
+    edge_conds: list[str] = []        # join conditions from real edge tables
+    virtual_conds: list[str] = []     # FK conditions from virtual edges
+    where_parts: list[str] = []       # collected WHERE bodies
+    ret_cols = "*"
+    ret_distinct = ""
+    order_clause = ""
+    limit_clause = ""
     _rel_counter = {"n": 0}
 
-    # ----------------------------------------------------------------
-    # 1.  Collect named node patterns  (alias:Label) or (alias:Label {..})
-    # ----------------------------------------------------------------
-    node_re = re.compile(r"\((\w+):(\w+)(?:\s*\{([^}]+)\})?\)")
-    for m in node_re.finditer(q):
+    for kw, body in clauses:
+        if kw == "MATCH":
+            _absorb_match(body, aliases, inline_conds, edge_conds,
+                          virtual_conds, _rel_counter)
+        elif kw == "OPTIONAL MATCH":
+            # Degenerate: register new node aliases so their columns are
+            # selectable, but don't add INNER JOIN constraints.
+            # Full LEFT JOIN support is a future enhancement.
+            _absorb_match_nodes_only(body, aliases)
+        elif kw == "WITH":
+            # Paging idiom: WITH x ORDER BY x.col LIMIT n
+            ob = re.search(r"(?i)ORDER\s+BY\s+(.+?)(?:\s+LIMIT\s+\S+)?\s*$", body)
+            if ob and not order_clause:
+                order_clause = "ORDER BY " + ob.group(1).strip()
+            lm = re.search(r"(?i)LIMIT\s+(\S+)", body)
+            if lm and not limit_clause:
+                limit_clause = "LIMIT " + lm.group(1)
+            # Pipeline-separator WITH (no ORDER BY) is simply dropped.
+        elif kw == "WHERE":
+            where_parts.append(body)
+        elif kw == "RETURN":
+            # DISTINCT
+            dm = re.match(r"(?i)DISTINCT\s+(.*)", body)
+            if dm:
+                ret_distinct = "DISTINCT "
+                body = dm.group(1)
+            # Trailing ORDER BY inside RETURN
+            ob = re.search(r"(?i)\s+ORDER\s+BY\s+(.+?)(?=\s*(?:LIMIT|$))", body)
+            if ob and not order_clause:
+                order_clause = "ORDER BY " + ob.group(1).strip()
+                body = body[: ob.start()].strip()
+            # Trailing LIMIT inside RETURN
+            lm = re.search(r"(?i)\s+LIMIT\s+(\S+)", body)
+            if lm and not limit_clause:
+                limit_clause = "LIMIT " + lm.group(1)
+                body = body[: lm.start()].strip()
+            ret_cols = body.strip()
+        elif kw == "ORDER BY":
+            if not order_clause:
+                order_clause = "ORDER BY " + body
+        elif kw == "LIMIT":
+            if not limit_clause:
+                limit_clause = "LIMIT " + body.split()[0]
+
+    # ── FROM clause ───────────────────────────────────────────────────────
+    seen: set[str] = set()
+    from_parts: list[str] = []
+    for alias, tbl in aliases.items():
+        entry = f"{tbl} {alias}"
+        if entry not in seen:
+            from_parts.append(entry)
+            seen.add(entry)
+    from_str = ", ".join(from_parts) if from_parts else "(SELECT 1 WHERE 1=0) _empty(x)"
+
+    # ── WHERE clause ──────────────────────────────────────────────────────
+    all_conds: list[str] = []
+    all_conds.extend(edge_conds)
+    all_conds.extend(virtual_conds)
+    all_conds.extend(inline_conds)
+    for wp in where_parts:
+        expanded = _expand_not_exists(wp, aliases)
+        transformed = _transform_where(expanded)
+        if transformed:
+            all_conds.append(transformed)
+    where_str = " AND ".join(c for c in all_conds if c)
+
+    # ── SELECT ────────────────────────────────────────────────────────────
+    select_str = _transform_select(ret_cols)
+
+    # ── Assemble ──────────────────────────────────────────────────────────
+    parts = [f"SELECT {ret_distinct}{select_str}", f"FROM {from_str}"]
+    if where_str:
+        parts.append(f"WHERE {where_str}")
+    if order_clause:
+        parts.append(order_clause)
+    if limit_clause:
+        parts.append(limit_clause)
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# MATCH body processing
+# ---------------------------------------------------------------------------
+
+# Rel pattern: (src)-[alias:TYPE]->(dst) or (src)-[alias:TYPE]-(dst)
+# dst alias is optional (anonymous destination)
+_REL_DIRECTED_RE = re.compile(
+    r"\((\w+)(?::\w+(?:\s*\{[^}]*\})?)?\)"   # src node
+    r"\s*-\[(\w*):(\w+)\]->\s*"               # -[alias:TYPE]->
+    r"\((\w*)(?::\w+(?:\s*\{[^}]*\})?)?\)"    # dst node (alias optional)
+)
+_REL_UNDIRECTED_RE = re.compile(
+    r"\((\w+)(?::\w+(?:\s*\{[^}]*\})?)?\)"   # src node
+    r"\s*-\[(\w*):(\w+)\]-\s*"                # -[alias:TYPE]-
+    r"\((\w*)(?::\w+(?:\s*\{[^}]*\})?)?\)"    # dst node
+)
+_NODE_RE = re.compile(r"\((\w+):(\w+)(?:\s*\{([^}]+)\})?\)")
+
+
+def _absorb_match(
+    body: str,
+    aliases: dict[str, str],
+    inline_conds: list[str],
+    edge_conds: list[str],
+    virtual_conds: list[str],
+    _rel_counter: dict[str, int],
+) -> None:
+    """Extract node aliases and relationship patterns from one MATCH body."""
+
+    # 1. Register named node patterns (alias:Label [{prop: $val}])
+    for m in _NODE_RE.finditer(body):
         alias, label, inline = m.group(1), m.group(2), m.group(3)
         if label in _LABEL_TABLE and alias not in aliases:
             aliases[alias] = _LABEL_TABLE[label]
@@ -139,13 +363,103 @@ def _translate(cypher: str) -> str:
             for kv in re.finditer(r"(\w+)\s*:\s*(\$\w+)", inline):
                 inline_conds.append(f"{alias}.{kv.group(1)} = {kv.group(2)}")
 
-    # ----------------------------------------------------------------
-    # 2.  Handle NOT EXISTS { MATCH (:N)-[:R]->(m) }
-    #     → NOT EXISTS (SELECT 1 FROM edge_table WHERE dst_col = m.id)
-    # ----------------------------------------------------------------
-    def _replace_not_exists(m_obj: re.Match) -> str:
+    # 2. Process directed rel patterns iteratively (handles multi-hop chains).
+    def _do_directed(m_obj: re.Match) -> str:
+        src, ralias, rtype, dst = (
+            m_obj.group(1), m_obj.group(2), m_obj.group(3), m_obj.group(4)
+        )
+        _process_rel(src, ralias, rtype, dst,
+                     aliases, edge_conds, virtual_conds, _rel_counter,
+                     undirected=False)
+        # Return just the dst node so multi-hop chains resolve left→right.
+        return f"({dst})" if dst else "()"
+
+    q = body
+    prev = None
+    while prev != q:
+        prev = q
+        q = _REL_DIRECTED_RE.sub(_do_directed, q)
+
+    # 3. Process undirected rel patterns.
+    for m in _REL_UNDIRECTED_RE.finditer(body):
+        src, ralias, rtype, dst = (
+            m.group(1), m.group(2), m.group(3), m.group(4)
+        )
+        _process_rel(src, ralias, rtype, dst,
+                     aliases, edge_conds, virtual_conds, _rel_counter,
+                     undirected=True)
+
+
+def _absorb_match_nodes_only(body: str, aliases: dict[str, str]) -> None:
+    """Register node aliases from an OPTIONAL MATCH without adding joins.
+
+    This ensures columns from OPTIONAL MATCH nodes are reachable in SELECT/
+    WHERE even though we don't yet emit a proper LEFT JOIN.
+    """
+    for m in _NODE_RE.finditer(body):
+        alias, label = m.group(1), m.group(2)
+        if label in _LABEL_TABLE and alias not in aliases:
+            aliases[alias] = _LABEL_TABLE[label]
+
+
+def _process_rel(
+    src_alias: str,
+    rel_alias: str,
+    rel_type: str,
+    dst_alias: str,
+    aliases: dict[str, str],
+    edge_conds: list[str],
+    virtual_conds: list[str],
+    _rel_counter: dict[str, int],
+    *,
+    undirected: bool,
+) -> None:
+    """Emit join conditions for one relationship hop."""
+
+    # ── Virtual FK edge (no edge table) ──────────────────────────────────
+    if rel_type in _VIRTUAL_REL_EDGE:
+        _, dst_tbl, dst_fk_col = _VIRTUAL_REL_EDGE[rel_type]
+        # Register dst alias if it carries a label (already done in
+        # _absorb_match's node scan, but also handle un-labelled refs).
+        if dst_alias and dst_alias not in aliases:
+            aliases[dst_alias] = dst_tbl
+        if dst_alias:
+            virtual_conds.append(f"{dst_alias}.{dst_fk_col} = {src_alias}.id")
+        return
+
+    # ── Real edge table ───────────────────────────────────────────────────
+    if rel_type not in _REL_EDGE:
+        return     # unknown relationship type — skip silently
+
+    edge_tbl, src_col, dst_col, extra = _REL_EDGE[rel_type]
+    _rel_counter["n"] += 1
+    ra = rel_alias or f"_r{_rel_counter['n']}"
+
+    if ra not in aliases:
+        aliases[ra] = edge_tbl
+        edge_conds.append(f"{ra}.{src_col} = {src_alias}.id")
+        if dst_alias:
+            if undirected:
+                # Undirected: match either direction.
+                edge_conds.append(
+                    f"({ra}.{dst_col} = {dst_alias}.id"
+                    f" OR {ra}.{src_col} = {dst_alias}.id)"
+                )
+            else:
+                edge_conds.append(f"{ra}.{dst_col} = {dst_alias}.id")
+        if extra:
+            edge_conds.append(f"{ra}.{extra}")
+
+
+# ---------------------------------------------------------------------------
+# WHERE expansion
+# ---------------------------------------------------------------------------
+
+def _expand_not_exists(body: str, aliases: dict[str, str]) -> str:
+    """Replace ``NOT EXISTS { MATCH ... }`` with a SQL subquery."""
+
+    def _replace(m_obj: re.Match) -> str:
         inner = m_obj.group(1)
-        # extract (:Label)-[:REL]->(alias) or (alias)-[:REL]->(:Label)
         rel_m = re.search(
             r"\((\w*):?(\w*)\)-\[:(\w+)\]->\((\w*):?(\w*)\)", inner
         )
@@ -156,165 +470,25 @@ def _translate(cypher: str) -> str:
         dst_alias = rel_m.group(4)
         if rel_type not in _REL_EDGE:
             return m_obj.group(0)
-        edge_tbl, src_col, dst_col, extra = _REL_EDGE[rel_type]
-        # Determine which side is the "anchor" (non-anonymous)
+        edge_tbl, src_col, dst_col, _ = _REL_EDGE[rel_type]
         if dst_alias and dst_alias in aliases:
-            subq = (
+            return (
                 f"NOT EXISTS (SELECT 1 FROM {edge_tbl} _ne"
                 f" WHERE _ne.{dst_col} = {dst_alias}.id)"
             )
-        elif src_alias and src_alias in aliases:
-            subq = (
+        if src_alias and src_alias in aliases:
+            return (
                 f"NOT EXISTS (SELECT 1 FROM {edge_tbl} _ne"
                 f" WHERE _ne.{src_col} = {src_alias}.id)"
             )
-        else:
-            return m_obj.group(0)
-        return subq
+        return m_obj.group(0)
 
-    q = re.sub(
+    return re.sub(
         r"NOT\s+EXISTS\s*\{\s*MATCH\s*([^}]+)\}",
-        _replace_not_exists,
-        q,
+        _replace,
+        body,
         flags=re.IGNORECASE,
     )
-
-    # ----------------------------------------------------------------
-    # 3.  Collect and remove relationship patterns
-    #     (a)-[r:REL]->(b)  or  (a)-[:REL]->(b)
-    #     Multi-hop: (a)-[:R1]->(x)-[:R2]->(b) is processed left to right.
-    # ----------------------------------------------------------------
-    # We'll iteratively strip one hop at a time.
-    rel_pattern = re.compile(
-        r"\((\w+)(?::\w+(?:\s*\{[^}]*\})?)?\)"  # src node (already parsed)
-        r"\s*-\[(\w*):(\w+)\]->\s*"
-        r"\((\w+)(?::\w+(?:\s*\{[^}]*\})?)?\)"  # dst node
-    )
-
-    def _process_rel(m_obj: re.Match) -> str:
-        src_alias = m_obj.group(1)
-        rel_alias = m_obj.group(2)
-        rel_type  = m_obj.group(3)
-        dst_alias = m_obj.group(4)
-        if rel_type not in _REL_EDGE:
-            return m_obj.group(0)  # leave unknown rels untouched
-        edge_tbl, src_col, dst_col, extra = _REL_EDGE[rel_type]
-        _rel_counter["n"] += 1
-        if not rel_alias:
-            rel_alias = f"_r{_rel_counter['n']}"
-        if rel_alias not in aliases:
-            aliases[rel_alias] = edge_tbl
-            edge_from.append(f"{edge_tbl} {rel_alias}")
-            edge_conds.append(f"{rel_alias}.{src_col} = {src_alias}.id")
-            edge_conds.append(f"{rel_alias}.{dst_col} = {dst_alias}.id")
-            if extra:
-                edge_conds.append(f"{rel_alias}.{extra}")
-        # Return just the dst node so multi-hop chains resolve left→right
-        return f"({dst_alias})"
-
-    # Apply repeatedly until no more rel patterns remain
-    prev = None
-    while prev != q:
-        prev = q
-        q = rel_pattern.sub(_process_rel, q)
-
-    # ----------------------------------------------------------------
-    # 4.  Remove all MATCH … clauses (now that relationships are handled)
-    #     We keep the text after the last MATCH so WHERE / RETURN survive.
-    # ----------------------------------------------------------------
-    # Remove "MATCH pattern [, pattern …]" segments
-    # A MATCH clause ends at WHERE, RETURN, WITH, ORDER, LIMIT, or another MATCH.
-    q = re.sub(
-        r"(?i)\bMATCH\s+"
-        r"(?:\([^)]*\)(?:\s*,\s*\([^)]*\))*)",
-        "",
-        q,
-    ).strip()
-
-    # ----------------------------------------------------------------
-    # 5.  Split into clauses: WHERE / WITH … ORDER BY / RETURN / LIMIT
-    # ----------------------------------------------------------------
-    # Extract RETURN clause (everything after RETURN, before ORDER BY / LIMIT)
-    ret_match = re.search(
-        r"(?i)\bRETURN\b\s+(DISTINCT\s+)?(.*?)(?=\s*(?:ORDER\s+BY|LIMIT|$))",
-        q,
-    )
-    ret_distinct = ""
-    ret_cols = "*"
-    if ret_match:
-        ret_distinct = "DISTINCT " if ret_match.group(1) else ""
-        ret_cols = ret_match.group(2).strip()
-        q = q[: ret_match.start()].strip() + q[ret_match.end() :]
-
-    # Extract ORDER BY
-    order_match = re.search(r"(?i)\bORDER\s+BY\b(.+?)(?=\s*(?:LIMIT|$))", q)
-    order_clause = ""
-    if order_match:
-        order_clause = "ORDER BY " + order_match.group(1).strip()
-        q = q[: order_match.start()].strip() + q[order_match.end() :]
-
-    # Extract LIMIT
-    limit_match = re.search(r"(?i)\bLIMIT\s+(\$?\w+|\d+)", q)
-    limit_clause = ""
-    if limit_match:
-        limit_clause = "LIMIT " + limit_match.group(1)
-        q = q[: limit_match.start()].strip() + q[limit_match.end() :]
-
-    # Extract WITH … ORDER BY (Kuzu paging: WITH m ORDER BY m.x LIMIT n)
-    with_match = re.search(
-        r"(?i)\bWITH\s+[\w, ]+\s+ORDER\s+BY\s+(.+?)(?=\s*(?:LIMIT|RETURN|$))", q
-    )
-    if with_match and not order_clause:
-        order_clause = "ORDER BY " + with_match.group(1).strip()
-        q = q[: with_match.start()].strip() + q[with_match.end() :]
-
-    # Remove remaining WITH clauses
-    q = re.sub(r"(?i)\bWITH\b[^R]*?(?=\bRETURN\b|$)", "", q).strip()
-
-    # Extract WHERE clause
-    where_match = re.search(r"(?i)\bWHERE\b(.+?)$", q, re.DOTALL)
-    where_parts: list[str] = []
-    if where_match:
-        where_parts.append(where_match.group(1).strip())
-        q = q[: where_match.start()].strip()
-
-    # Add inline prop conditions and edge join conditions
-    all_where = edge_conds + inline_conds + where_parts
-
-    # ----------------------------------------------------------------
-    # 6.  Build FROM clause from collected aliases + edge tables
-    # ----------------------------------------------------------------
-    from_parts = [f"{tbl} {alias}" for alias, tbl in aliases.items()
-                  if tbl not in {et.split()[0] for et in edge_from}
-                  or any(alias in ef for ef in edge_from)]
-    # Deduplicate: edge_from entries are already included via aliases
-    # Fallback: empty DuckDB-valid relation so an un-matched pattern
-    # degrades to zero rows instead of crashing with "table dual missing".
-    from_str = ", ".join(from_parts) if from_parts else "(SELECT 1 WHERE 1=0) _empty(x)"
-
-    # ----------------------------------------------------------------
-    # 7.  Transform WHERE conditions
-    # ----------------------------------------------------------------
-    where_str = " AND ".join(all_where) if all_where else ""
-    where_str = _transform_where(where_str)
-
-    # ----------------------------------------------------------------
-    # 8.  Transform SELECT (RETURN → SELECT)
-    # ----------------------------------------------------------------
-    select_str = _transform_select(ret_cols)
-
-    # ----------------------------------------------------------------
-    # 9.  Assemble final SQL
-    # ----------------------------------------------------------------
-    parts = [f"SELECT {ret_distinct}{select_str}", f"FROM {from_str}"]
-    if where_str:
-        parts.append(f"WHERE {where_str}")
-    if order_clause:
-        parts.append(order_clause)
-    if limit_clause:
-        parts.append(limit_clause)
-
-    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +499,6 @@ def _transform_where(where: str) -> str:
     if not where:
         return ""
     # CONTAINS → LIKE
-    # LHS can be: column reference (alias.col), lower(...), or coalesce(...)
     where = re.sub(
         r"(\w+\.\w+|\blower\([^)]+\)|\bcoalesce\([^)]+\))\s+CONTAINS\s+(\$\w+|'[^']*')",
         lambda m: f"{m.group(1)} LIKE '%' || {m.group(2)} || '%'",
@@ -339,7 +512,6 @@ def _transform_where(where: str) -> str:
         where,
         flags=re.IGNORECASE,
     )
-    # IN [literal list] stays as-is (DuckDB handles it)
     return where
 
 

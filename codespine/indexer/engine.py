@@ -4,6 +4,8 @@ import concurrent.futures
 import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -480,16 +482,49 @@ class JavaIndexer:
                 self.store._recycle_conn()
 
         self._emit(progress, "resolve_calls_start")
-        # Deduplicate (src, dst) pairs — the same pair can appear many times when
-        # a method calls another method multiple times at different call sites.
+
+        # ── Heartbeat thread ──────────────────────────────────────────────
+        # The resolver is CPU-bound and may produce zero writable edges for
+        # many seconds on large repos with common method names.  A daemon
+        # heartbeat thread fires every 2 s so the CLI progress spinner keeps
+        # ticking even during those silent stretches.
+        _scan_counter: list[int] = [0]
+        _edges_counter: list[int] = [0]
+        _hb_stop = threading.Event()
+        _resolve_start = time.perf_counter()
+
+        def _heartbeat_worker() -> None:
+            while not _hb_stop.wait(2.0):
+                self._emit(
+                    progress,
+                    "resolve_calls_heartbeat",
+                    scanned=_scan_counter[0],
+                    edges=_edges_counter[0],
+                    elapsed=time.perf_counter() - _resolve_start,
+                )
+
+        _hb_thread = threading.Thread(
+            target=_heartbeat_worker,
+            daemon=True,
+            name="codespine-resolver-heartbeat",
+        )
+        _hb_thread.start()
+
+        # Deduplicate (src, dst) pairs — the same pair can appear many times
+        # when a method calls another method at multiple call sites.
         # Keep the highest-confidence resolution to avoid N writes per pair.
         best_calls: dict[tuple[str, str], tuple[float, str]] = {}
-        for src, dst, confidence, reason in resolve_calls(
-            method_catalog, method_calls, method_context, class_catalog
-        ):
-            key = (src, dst)
-            if key not in best_calls or confidence > best_calls[key][0]:
-                best_calls[key] = (confidence, reason)
+        try:
+            for src, dst, confidence, reason in resolve_calls(
+                method_catalog, method_calls, method_context, class_catalog,
+                scan_counter=_scan_counter,
+            ):
+                key = (src, dst)
+                if key not in best_calls or confidence > best_calls[key][0]:
+                    best_calls[key] = (confidence, reason)
+        finally:
+            _hb_stop.set()
+            _hb_thread.join(timeout=3.0)
 
         # Stream writes in batches — never hold the full set in RAM.
         call_buf: list[dict] = []
@@ -502,6 +537,7 @@ class JavaIndexer:
                 with self.store.transaction():
                     self.store.add_calls_batch(call_buf)
                 calls_resolved += len(call_buf)
+                _edges_counter[0] = calls_resolved
                 self.store._recycle_conn()
                 self._emit(progress, "resolve_calls_progress", calls_resolved=calls_resolved)
                 call_buf = []

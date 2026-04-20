@@ -192,6 +192,21 @@ def _index_shard_group(
                 with output_lock:
                     _phase(f"{prefix}Tracing calls...", "starting...")
                 return
+            if event == "resolve_calls_heartbeat":
+                # Fires every 2 s from a daemon thread so the spinner stays
+                # alive even when the resolver produces no new edges.
+                scanned = int(payload.get("scanned", 0))
+                edges   = int(payload.get("edges", 0))
+                elapsed_s = float(payload.get("elapsed", 0.0))
+                if not parallel:
+                    click.echo(
+                        f"\r{_spinner_char()} {prefix}Tracing calls...   "
+                        f"{edges:>6} resolved / {scanned} scanned  {elapsed_s:.1f}s  ",
+                        nl=False,
+                    )
+                    call_state["shown"] = True
+                call_state["last_ts"] = now
+                return
             if event == "resolve_calls_progress":
                 call_state["count"] = int(payload.get("calls_resolved", 0))
                 if (now - call_state["last_ts"]) >= 0.25:
@@ -345,6 +360,37 @@ def analyse(path: str, full: bool, deep: bool, incremental_deep: bool, embed: bo
     # For single-project analysis this is transparent — shard() always
     # returns a GraphStore pointing to the correct shard path.
     sg = ShardedGraphStore(read_only=False)
+
+    # ── SIGINT handler: flush partial index on Ctrl+C ────────────────────
+    # The handler captures `sg` by closure.  On interrupt it snapshots all
+    # open shards so `codespine stats` and MCP see the partial result, then
+    # calls os._exit(130) to bypass Python cleanup (safe for CLI process).
+    # A second Ctrl+C hard-exits immediately.
+    _sigint_pressed: list[bool] = [False]
+    _old_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def _sigint_flush(signum: int, frame: object) -> None:  # noqa: ARG001
+        if _sigint_pressed[0]:
+            os._exit(130)
+        _sigint_pressed[0] = True
+        # Restore default handler so a second Ctrl+C exits immediately.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        click.secho(
+            "\n\n⚠  Interrupted — flushing partial index to read replica…",
+            fg="yellow",
+        )
+        try:
+            sg.snapshot_all(background=False)
+            click.secho(
+                "✓ Partial index saved. Run 'codespine stats' to see what was indexed.",
+                fg="yellow",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(130)
+
+    signal.signal(signal.SIGINT, _sigint_flush)
+
     # The indexer is initialised per-module below with the right shard store.
     # We keep a single ShardedGraphStore to fan-out cross-module linking later.
 
@@ -594,6 +640,9 @@ def analyse(path: str, full: bool, deep: bool, incremental_deep: bool, embed: bo
     sg.snapshot_all(background=False)
     _finish_phase(snap_label, "MCP will reload automatically")
 
+    # Restore original SIGINT handler now that we've finished cleanly.
+    signal.signal(signal.SIGINT, _old_sigint_handler)
+
 
 @main.command()
 @click.argument("query")
@@ -741,15 +790,27 @@ def stats(as_json: bool, show_shards: bool) -> None:
         click.secho("No projects indexed yet. Run 'codespine analyse <path>'.", fg="yellow")
         return
 
+    def _stat_count(store, query: str, params: dict) -> int:
+        """Run a stats count query — returns 0 on any failure."""
+        try:
+            rows = store.query_records(query, params)
+            return int(rows[0]["n"]) if rows else 0
+        except Exception as exc:  # noqa: BLE001
+            click.secho(f"   (stat unavailable: {exc})", fg="yellow")
+            return 0
+
     rows = []
     for p in all_projects_meta:
         pid = p["id"]
         # Route each query to the project's owning shard.
         ps = _project_store(pid)
-        files = ps.query_records(
-            "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n", {"pid": pid}
+        n_files = _stat_count(
+            ps,
+            "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n",
+            {"pid": pid},
         )
-        classes = ps.query_records(
+        n_classes = _stat_count(
+            ps,
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -758,7 +819,8 @@ def stats(as_json: bool, show_shards: bool) -> None:
             """,
             {"pid": pid},
         )
-        methods = ps.query_records(
+        n_methods = _stat_count(
+            ps,
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -769,7 +831,8 @@ def stats(as_json: bool, show_shards: bool) -> None:
             """,
             {"pid": pid},
         )
-        calls = ps.query_records(
+        n_calls = _stat_count(
+            ps,
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -780,7 +843,8 @@ def stats(as_json: bool, show_shards: bool) -> None:
             """,
             {"pid": pid},
         )
-        emb = ps.query_records(
+        n_emb = _stat_count(
+            ps,
             """
             MATCH (f:File) WHERE f.project_id = $pid
             WITH f
@@ -793,11 +857,11 @@ def stats(as_json: bool, show_shards: bool) -> None:
             "project": pid,
             "path": p["path"],
             "shard": sg.router.shard_for(pid),
-            "files": files[0]["n"] if files else 0,
-            "classes": classes[0]["n"] if classes else 0,
-            "methods": methods[0]["n"] if methods else 0,
-            "calls_out": calls[0]["n"] if calls else 0,
-            "embeddings": emb[0]["n"] if emb else 0,
+            "files": n_files,
+            "classes": n_classes,
+            "methods": n_methods,
+            "calls_out": n_calls,
+            "embeddings": n_emb,
         })
 
     if as_json:
