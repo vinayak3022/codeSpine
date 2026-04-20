@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v1.0.0** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.0.10** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 
@@ -30,11 +30,21 @@ File changes are written directly to the graph and are immediately queryable —
 pip install codespine
 ```
 
+Default install includes the CLI, MCP server, Java indexer, watch mode, health checks, background task tracking, and graph/search commands.
+
 Optional semantic search (sentence-transformers):
 
 ```bash
 pip install "codespine[ml]"
 ```
+
+Add the local index explorer UI:
+
+```bash
+pip install "codespine[ui]"
+```
+
+The current lite UI is dependency-free and served locally by CodeSpine; the `ui` extra is the stable add-on install target for the browser explorer.
 
 Everything at once (ml + community detection):
 
@@ -84,6 +94,8 @@ Detecting execution flows...   34 processes found
 Finding dead code...           12 unreachable symbols
 Analyzing git history...       18 coupled file pairs
 Generating embeddings...       623 vectors stored
+Index self-test...             passed
+Index health...                no anomalies
 
 Done in 4.2s — 623 symbols, 1,847 edges, 8 clusters, 34 flows
 Publishing read replica...     MCP will reload automatically
@@ -252,6 +264,12 @@ codespine analyse <path> --complete --deep   # + communities, flows, dead code, 
 codespine analyse <path> --complete --incremental-deep
 codespine analyse <path> --embed             # + vector embeddings
 
+# Background jobs and local UI
+codespine background                         # background task progress
+codespine tasks                              # running/recent background work
+codespine ui                                 # local read-only index explorer
+codespine ui --open                          # open http://127.0.0.1:8765
+
 # Live watch
 codespine watch --path .                     # file-save-triggered direct-to-graph writes
 codespine watch --path . --install-hook      # also install post-commit git hook
@@ -269,6 +287,8 @@ codespine diff main..feature                 # symbol-level branch diff
 
 # Status & Info
 codespine stats                              # per-project stats (--shards for shard layout)
+codespine health                             # index coverage and anomaly dashboard
+codespine self-test                          # smoke queries for schema/translator checks
 codespine list                               # indexed projects
 codespine status                             # service and database status
 codespine guide                              # tool catalog and workflows
@@ -295,7 +315,7 @@ codespine force-reset                        # emergency: delete all data files
 
 `analyse` defaults to incremental mode. Repeat runs only process changed files and are fast.
 
-`analyse` runs in fast mode by default: it indexes the core graph, publishes that read replica from a detached process, then continues communities, flows, dead code, coupling, and cross-module enrichment in the background. Use `--complete --deep` when you want those passes refreshed before the command returns.
+`analyse` runs in fast mode by default: it indexes the core graph, publishes that read replica from a detached process, then continues communities, flows, dead code, coupling, and cross-module enrichment in the background. Use `codespine tasks` or `codespine ui` to watch that work. Use `--complete --deep` when you want those passes refreshed before the command returns.
 
 ---
 
@@ -482,6 +502,10 @@ The deep analysis phase covers four passes that are expensive but optional:
 | Change coupling | Analyses git history for co-changed file pairs | `get_change_coupling`, `related` |
 
 **Fast default:** `codespine analyse` prioritizes a queryable core index. Communities, flows, dead-code, git coupling, and cross-module links are queued in a detached background enrichment job unless you use `--complete`.
+
+**Health checks:** every analyse run now performs a small self-test query suite and reports index anomalies such as large projects with zero call edges. Use `codespine health` for the terminal dashboard or `codespine self-test --json` in CI.
+
+**Background visibility:** `codespine background` shows running background job progress in the terminal, and `codespine tasks` remains available as the shorter registry view. `codespine ui` serves a local read-only index explorer with project counts, index health, and the same background task state at `http://127.0.0.1:8765`.
 
 **Complete deep:** `--complete --deep` runs the expensive enrichment passes before returning. `--complete --incremental-deep` combines incremental file indexing with a forced full deep pass.
 

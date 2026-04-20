@@ -78,7 +78,7 @@ def test_multiple_nodes():
 
 
 def test_where_equality():
-    sql = _translate("MATCH (n:Method) WHERE n.project_id = $pid RETURN n.name")
+    sql = _translate("MATCH (n:File) WHERE n.project_id = $pid RETURN n.path")
     assert "n.project_id = $pid" in sql
     assert "WHERE" in sql
 
@@ -87,6 +87,13 @@ def test_where_contains_becomes_like():
     sql = _translate("MATCH (n:Method) WHERE n.name CONTAINS $q RETURN n.name")
     assert "LIKE" in sql
     assert "$q" in sql
+    assert "CONTAINS" not in sql
+
+
+def test_where_contains_lower_rhs_becomes_like():
+    sql = _translate("MATCH (n:Method) WHERE lower(n.signature) CONTAINS lower($q) RETURN n.name")
+    assert "LIKE" in sql
+    assert "lower($q)" in sql
     assert "CONTAINS" not in sql
 
 
@@ -287,8 +294,24 @@ def test_project_scope():
         "RETURN n.id, n.name, n.signature"
     )
     assert "methods" in sql
-    assert "n.project_id = $pid" in sql
+    assert "n.project_id = $pid" not in sql
+    assert "_n_project_class" in sql
+    assert "_n_project_file.project_id = $pid" in sql
     assert "n.id" in sql and "n.name" in sql and "n.signature" in sql
+
+
+def test_class_project_scope_rewrites_to_file_project_id():
+    sql = _translate("MATCH (c:Class) WHERE c.project_id = $pid RETURN c.id")
+    assert "c.project_id = $pid" not in sql
+    assert "_c_project_file.project_id = $pid" in sql
+    assert "c.file_id = _c_project_file.id" in sql
+
+
+def test_symbol_project_scope_rewrites_to_file_project_id():
+    sql = _translate("MATCH (s:Symbol) WHERE s.project_id = $pid RETURN s.id")
+    assert "s.project_id = $pid" not in sql
+    assert "_s_project_file.project_id = $pid" in sql
+    assert "s.file_id = _s_project_file.id" in sql
 
 
 # ---------------------------------------------------------------------------

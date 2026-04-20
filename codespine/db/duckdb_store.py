@@ -329,24 +329,34 @@ class DuckDBStore:
         """
         from codespine.db._cypher_compat import is_cypher, translate  # lazy import
 
+        original_query = query
         use_named_params = False
         if is_cypher(query):
             query, params = translate(query, params)
             # translate() preserves/returns a dict; SQL uses $name placeholders.
             use_named_params = True
 
-        if params:
-            if use_named_params and isinstance(params, dict):
-                # Named $param style — DuckDB accepts dict directly
-                rel = self._conn.execute(query, params)
+        try:
+            if params:
+                if use_named_params and isinstance(params, dict):
+                    # Named $param style — DuckDB accepts dict directly
+                    rel = self._conn.execute(query, params)
+                else:
+                    # Positional ? style — DuckDB requires a list
+                    param_vals = list(params.values()) if isinstance(params, dict) else list(params)
+                    rel = self._conn.execute(query, param_vals)
             else:
-                # Positional ? style — DuckDB requires a list
-                param_vals = list(params.values()) if isinstance(params, dict) else list(params)
-                rel = self._conn.execute(query, param_vals)
-        else:
-            rel = self._conn.execute(query)
-        cols = [d[0] for d in rel.description or []]
-        return [dict(zip(cols, row)) for row in rel.fetchall()]
+                rel = self._conn.execute(query)
+            cols = [d[0] for d in rel.description or []]
+            return [dict(zip(cols, row)) for row in rel.fetchall()]
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "DuckDB query failed: %s; cypher=%r; sql=%r",
+                exc,
+                original_query[:500],
+                query[:500],
+            )
+            raise RuntimeError(f"CodeSpine query failed ({type(exc).__name__}): {str(exc)[:300]}") from exc
 
     def _executemany(self, sql: str, rows: list[list]) -> None:
         """Bulk insert using DuckDB's executemany (fast batch path)."""

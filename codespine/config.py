@@ -21,6 +21,7 @@ class Settings:
 
     pid_file: str = os.path.expanduser("~/.codespine.pid")
     log_file: str = os.path.expanduser("~/.codespine.log")
+    task_registry_path: str = os.path.expanduser("~/.codespine_tasks.json")
     embedding_cache_path: str = os.path.expanduser("~/.codespine_embedding_cache.json")
     index_meta_dir: str = os.path.expanduser("~/.codespine_index_meta")
     overlay_dir: str = os.path.expanduser("~/.codespine_overlay")

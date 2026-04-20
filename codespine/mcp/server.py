@@ -22,9 +22,11 @@ from codespine.analysis.deadcode import detect_dead_code as detect_dead_code_ana
 from codespine.analysis.flow import trace_execution_flows as trace_flows_analysis
 from codespine.analysis.impact import analyze_impact
 from codespine.diff.branch_diff import compare_branches as compare_branches_analysis
+from codespine.health import index_health
 from codespine.overlay.git_state import current_head
 from codespine.overlay.merge import overlay_summary
 from codespine.search.hybrid import hybrid_search
+from codespine.tasks import active_tasks
 from codespine.watch.watcher import (
     clear_overlay as clear_overlay_state,
     get_overlay_status as get_overlay_status_state,
@@ -384,6 +386,13 @@ def build_mcp_server(store, repo_path_provider):
         analyse_running = _analyse["proc"] is not None and _analyse["proc"].poll() is None
         overlay_meta = overlay_summary(overlay_store) if overlay_store is not None else {}
         overlay_status = get_overlay_status_state(store) if overlay_store is not None else []
+        try:
+            health = index_health(store)
+            health_summary = health.get("summary", {})
+            health_projects = health.get("projects", [])
+        except Exception:
+            health_summary = {}
+            health_projects = []
 
         now = int(time.time())
         stale_projects = []
@@ -467,6 +476,11 @@ def build_mcp_server(store, repo_path_provider):
                 "watch_path": _watch["path"] if watch_running else None,
                 "analyse_running": analyse_running,
                 "analyse_path": _analyse["path"] if analyse_running else None,
+                "tasks": active_tasks(limit=10),
+            },
+            "index_health": {
+                "summary": health_summary,
+                "projects": health_projects,
             },
             "overlay_projects": overlay_status,
             "notes": notes,

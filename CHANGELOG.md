@@ -7,11 +7,29 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [1.0.10] - 2026-04-20
+
+### Added
+
+- Added `codespine health` and `codespine self-test` so local users and CI can verify that the graph has usable project counts, call-edge coverage, and working schema/translator smoke queries.
+- Added index-health data to `codespine status`, MCP `get_capabilities()`, and the lightweight `codespine ui` explorer.
+- Added `codespine background` as the explicit CLI command for background task progress, with `codespine tasks` kept as a compatible alias.
+
+### Fixed
+
+- Rewrote DuckDB compatibility for `lower(...) CONTAINS lower($q)` and legacy `Method`/`Class`/`Symbol.project_id` Cypher queries so MCP tools keep working against the normalized DuckDB schema.
+- Wrapped DuckDB query failures with concise CodeSpine errors and logs that include the translated SQL, avoiding raw engine tracebacks in user-facing tools.
+
 ## [1.0.9] - 2026-04-20
 
 ### Changed
 
 - Made `codespine analyse` fast by default: embeddings are off, deep enrichment is opt-in in the foreground via `--complete`, the resolver honors a foreground budget, DB write batches are larger, and read-replica publishing plus enrichment can continue in a detached background process.
+
+### Added
+
+- Added a persistent background task registry, `codespine tasks`, and a lightweight read-only `codespine ui` index explorer so local users can see indexed projects and running enrichment work.
+- Added the `codespine[ui]` optional extra as the add-on installation target for the local index explorer while keeping the default `codespine` install focused on core CLI/MCP/indexing features.
 
 ## [1.0.8] - 2026-04-20
 

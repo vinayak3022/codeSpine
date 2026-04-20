@@ -289,16 +289,6 @@ def _translate(cypher: str) -> str:
             if not limit_clause:
                 limit_clause = "LIMIT " + body.split()[0]
 
-    # ── FROM clause ───────────────────────────────────────────────────────
-    seen: set[str] = set()
-    from_parts: list[str] = []
-    for alias, tbl in aliases.items():
-        entry = f"{tbl} {alias}"
-        if entry not in seen:
-            from_parts.append(entry)
-            seen.add(entry)
-    from_str = ", ".join(from_parts) if from_parts else "(SELECT 1 WHERE 1=0) _empty(x)"
-
     # ── WHERE clause ──────────────────────────────────────────────────────
     all_conds: list[str] = []
     all_conds.extend(edge_conds)
@@ -307,12 +297,38 @@ def _translate(cypher: str) -> str:
     for wp in where_parts:
         expanded = _expand_not_exists(wp, aliases)
         transformed = _transform_where(expanded)
+        transformed, project_conds = _rewrite_project_id_refs(transformed, aliases)
+        all_conds.extend(project_conds)
         if transformed:
             all_conds.append(transformed)
-    where_str = " AND ".join(c for c in all_conds if c)
+    where_str = " AND ".join(dict.fromkeys(c for c in all_conds if c))
 
     # ── SELECT ────────────────────────────────────────────────────────────
     select_str = _transform_select(ret_cols)
+    select_str, select_project_conds = _rewrite_project_id_refs(select_str, aliases)
+    if select_project_conds:
+        where_str = " AND ".join(
+            dict.fromkeys([where_str, *select_project_conds] if where_str else select_project_conds)
+        )
+    if order_clause:
+        rewritten_order, order_project_conds = _rewrite_project_id_refs(order_clause, aliases)
+        order_clause = rewritten_order
+        if order_project_conds:
+            where_str = " AND ".join(
+                dict.fromkeys([where_str, *order_project_conds] if where_str else order_project_conds)
+            )
+
+    # ── FROM clause ───────────────────────────────────────────────────────
+    # Built after WHERE/SELECT rewrites because project_id compatibility may
+    # introduce synthetic joins from Method/Class/Symbol back to File.
+    seen: set[str] = set()
+    from_parts: list[str] = []
+    for alias, tbl in aliases.items():
+        entry = f"{tbl} {alias}"
+        if entry not in seen:
+            from_parts.append(entry)
+            seen.add(entry)
+    from_str = ", ".join(from_parts) if from_parts else "(SELECT 1 WHERE 1=0) _empty(x)"
 
     # ── Assemble ──────────────────────────────────────────────────────────
     parts = [f"SELECT {ret_distinct}{select_str}", f"FROM {from_str}"]
@@ -500,7 +516,7 @@ def _transform_where(where: str) -> str:
         return ""
     # CONTAINS → LIKE
     where = re.sub(
-        r"(\w+\.\w+|\blower\([^)]+\)|\bcoalesce\([^)]+\))\s+CONTAINS\s+(\$\w+|'[^']*')",
+        r"(\w+\.\w+|\blower\([^)]+\)|\bcoalesce\([^)]+\))\s+CONTAINS\s+(\$\w+|'[^']*'|\blower\([^)]+\)|\bcoalesce\([^)]+\))",
         lambda m: f"{m.group(1)} LIKE '%' || {m.group(2)} || '%'",
         where,
         flags=re.IGNORECASE,
@@ -513,6 +529,43 @@ def _transform_where(where: str) -> str:
         flags=re.IGNORECASE,
     )
     return where
+
+
+def _rewrite_project_id_refs(text: str, aliases: dict[str, str]) -> tuple[str, list[str]]:
+    """Map alias.project_id to the File table for labels without that column.
+
+    Kuzu call-sites historically used ``m.project_id`` / ``c.project_id`` /
+    ``s.project_id`` as a convenient graph property.  DuckDB normalizes project
+    ownership through ``files.project_id``.  Rewriting here keeps existing tool
+    queries valid without hand-editing every Cypher call-site.
+    """
+    if not text or "project_id" not in text:
+        return text, []
+    conds: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        alias = match.group(1)
+        table = aliases.get(alias)
+        if table == "files" or table is None:
+            return match.group(0)
+        if table == "methods":
+            class_alias = f"_{alias}_project_class"
+            file_alias = f"_{alias}_project_file"
+            aliases.setdefault(class_alias, "classes")
+            aliases.setdefault(file_alias, "files")
+            conds.append(f"{alias}.class_id = {class_alias}.id")
+            conds.append(f"{class_alias}.file_id = {file_alias}.id")
+            return f"{file_alias}.project_id"
+        if table in {"classes", "symbols"}:
+            file_alias = f"_{alias}_project_file"
+            aliases.setdefault(file_alias, "files")
+            conds.append(f"{alias}.file_id = {file_alias}.id")
+            return f"{file_alias}.project_id"
+        return match.group(0)
+
+    rewritten = re.sub(r"\b(\w+)\.project_id\b", _replace, text)
+    deduped = list(dict.fromkeys(conds))
+    return rewritten, deduped
 
 
 def _transform_select(ret: str) -> str:

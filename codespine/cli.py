@@ -8,8 +8,12 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import click
 import psutil
@@ -24,9 +28,11 @@ from codespine.analysis.impact import analyze_impact
 from codespine.config import SETTINGS
 from codespine.sharding import ShardedGraphStore, ShardRouter
 from codespine.diff.branch_diff import compare_branches
+from codespine.health import index_health, project_health, smoke_test_index
 from codespine.indexer.engine import JavaIndexer
 from codespine.mcp.server import build_mcp_server
 from codespine.search.hybrid import hybrid_search
+from codespine.tasks import active_tasks, create_task, finish_task, list_tasks, update_task
 from codespine.watch.watcher import clear_overlay, get_overlay_status, promote_overlay, run_watch_mode
 
 logging.basicConfig(filename=SETTINGS.log_file, level=logging.INFO)
@@ -68,9 +74,15 @@ def _open_store(read_only: bool = True) -> ShardedGraphStore:
 
 def _spawn_background_enrichment(path: str) -> bool:
     """Publish the fast index, then enrich it in a detached process."""
+    task_id = create_task(
+        "enrichment",
+        "Background graph enrichment",
+        path=path,
+        metadata={"trigger": "analyse-fast"},
+    )
     try:
-        subprocess.Popen(
-            [sys.executable, "-m", "codespine.cli", "enrich-background", path],
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "codespine.cli", "enrich-background", path, "--task-id", task_id],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -78,8 +90,10 @@ def _spawn_background_enrichment(path: str) -> bool:
             cwd=os.getcwd(),
             env=os.environ.copy(),
         )
+        update_task(task_id, status="running", phase="spawned", pid=proc.pid)
         return True
     except Exception as exc:  # noqa: BLE001
+        finish_task(task_id, "failed", str(exc))
         LOGGER.warning("Unable to spawn background enrichment: %s", exc)
         return False
 
@@ -97,6 +111,16 @@ def _db_size_bytes(path: str) -> int:
             except OSError:
                 pass
     return total
+
+
+def _format_elapsed(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "-"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
 
 
 def _phase(label: str, value: str) -> None:
@@ -820,6 +844,31 @@ def analyse(
 
     symbols = _safe_count("MATCH (s:Symbol) RETURN count(s) as count")
     edges = _safe_count("MATCH ()-[r]->() RETURN count(r) as count")
+
+    self_test = smoke_test_index(root_shard_store)
+    if self_test.get("ok"):
+        _phase("Index self-test...", "passed")
+    else:
+        failed = [c.get("name", "unknown") for c in self_test.get("checks", []) if not c.get("ok")]
+        click.secho(f"Index self-test...          failed ({', '.join(failed)})", fg="yellow")
+
+    health_anomalies: list[dict] = []
+    try:
+        for _, pid in modules_with_ids:
+            health_anomalies.extend(project_health(sg.shard(pid), pid).get("anomalies", []))
+        critical = sum(1 for a in health_anomalies if a.get("severity") == "critical")
+        if critical:
+            click.secho(
+                f"Index health...             {critical} critical anomaly(s); run 'codespine health'",
+                fg="yellow",
+            )
+        elif health_anomalies:
+            _phase("Index health...", f"{len(health_anomalies)} warning(s); run 'codespine health'")
+        else:
+            _phase("Index health...", "no anomalies")
+    except Exception as exc:  # noqa: BLE001 - post-index diagnostics are best-effort
+        click.secho(f"Index health...             unavailable ({exc})", fg="yellow")
+
     elapsed = time.perf_counter() - started
 
     if not embed:
@@ -877,10 +926,25 @@ def publish_snapshot() -> None:
 
 @main.command("enrich-background", hidden=True)
 @click.argument("path", type=click.Path(exists=True))
-def enrich_background(path: str) -> None:
+@click.option("--task-id", default=None, hidden=True)
+def enrich_background(path: str, task_id: str | None) -> None:
     """Run expensive post-index graph enrichment outside the analyse foreground."""
     abs_path = os.path.abspath(path)
     LOGGER.info("Background enrichment starting for %s", abs_path)
+    if task_id is None:
+        task_id = create_task("enrichment", "Background graph enrichment", path=abs_path)
+    update_task(
+        task_id,
+        status="running",
+        phase="starting",
+        pid=os.getpid(),
+        detail="Preparing background enrichment",
+    )
+
+    def _task_phase(phase: str, detail: str = "", progress: float | None = None) -> None:
+        update_task(task_id, status="running", phase=phase, detail=detail, progress=progress)
+        if detail:
+            LOGGER.info("%s: %s", phase, detail)
 
     project_roots = JavaIndexer.detect_projects_in_workspace(abs_path)
     modules_with_ids: list[tuple[str, str]] = []
@@ -905,9 +969,11 @@ def enrich_background(path: str) -> None:
     try:
         # Publish the fast core graph first so MCP/search can use it while the
         # more expensive enrichment keeps working.
+        _task_phase("publishing core snapshot", "Making the fast index visible", 0.05)
         sg.snapshot_all(background=False)
 
         if is_multi and len(xmod_pids) > 1:
+            _task_phase("cross-module linking", "Linking calls across indexed modules", 0.20)
             xmod_edges = link_cross_module_calls(
                 root_shard_store,
                 project_ids=xmod_pids,
@@ -915,21 +981,25 @@ def enrich_background(path: str) -> None:
             )
             LOGGER.info("Background cross-module linking wrote %d edges", xmod_edges)
 
+        _task_phase("community detection", "Detecting graph communities", 0.40)
         communities = detect_communities(
             root_shard_store,
             progress=lambda s: LOGGER.info("Community detection: %s", s),
         )
         LOGGER.info("Background community detection found %d clusters", len(communities))
 
+        _task_phase("execution flows", "Tracing execution flows", 0.60)
         flows = trace_execution_flows(
             root_shard_store,
             progress=lambda s: LOGGER.info("Execution flow tracing: %s", s),
         )
         LOGGER.info("Background flow tracing found %d flows", len(flows))
 
+        _task_phase("dead code", "Finding dead-code candidates", 0.75)
         dead = detect_dead_code(root_shard_store, limit=500)
         LOGGER.info("Background dead-code scan found %d candidates", _dead_result_count(dead))
 
+        _task_phase("git coupling", "Analyzing git co-change history", 0.85)
         root_shard_store.clear_coupling()
         coupling_project = root_basename if is_multi else root_project_id
         coupling_pairs = compute_coupling(
@@ -943,9 +1013,12 @@ def enrich_background(path: str) -> None:
         )
         LOGGER.info("Background coupling analysis found %d pairs", len(coupling_pairs))
 
+        _task_phase("publishing enriched snapshot", "Publishing enriched graph", 0.95)
         sg.snapshot_all(background=False)
+        finish_task(task_id, "succeeded", "Background enrichment complete")
         LOGGER.info("Background enrichment finished for %s", abs_path)
     except Exception as exc:  # noqa: BLE001
+        finish_task(task_id, "failed", str(exc))
         LOGGER.exception("Background enrichment failed for %s: %s", abs_path, exc)
         raise
 
@@ -1196,6 +1269,81 @@ def stats(as_json: bool, show_shards: bool) -> None:
         )
 
 
+@main.command("health")
+@click.option("--json", "as_json", is_flag=True)
+def health_cmd(as_json: bool) -> None:
+    """Show index health, coverage, and anomaly checks."""
+    store = _open_store(read_only=True)
+    try:
+        result = index_health(store)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"Unable to read index health: {exc}") from exc
+
+    if as_json:
+        _echo_json(result, True)
+        return
+
+    projects = result.get("projects", [])
+    summary = result.get("summary", {})
+    if not projects:
+        click.secho("No projects indexed yet. Run 'codespine analyse <path>'.", fg="yellow")
+        return
+
+    click.secho(
+        f"Index health: {summary.get('project_count', 0)} project(s), "
+        f"{summary.get('anomaly_count', 0)} anomaly(s), "
+        f"{summary.get('critical_count', 0)} critical",
+        fg="cyan",
+    )
+    click.echo()
+    col_w = max(len(str(p.get("project_id", ""))) for p in projects)
+    header = f"{'Project':<{col_w}}  {'Shard':>5}  {'Files':>6}  {'Methods':>8}  {'Calls':>8}  {'Coverage':>9}  Health"
+    click.secho(header, fg="cyan")
+    click.echo("-" * len(header))
+    for project in projects:
+        anomalies = project.get("anomalies", [])
+        health = "ok"
+        if any(a.get("severity") == "critical" for a in anomalies):
+            health = "critical"
+        elif anomalies:
+            health = "warning"
+        click.echo(
+            f"{project.get('project_id', ''):<{col_w}}  "
+            f"{str(project.get('shard') if project.get('shard') is not None else '-') :>5}  "
+            f"{int(project.get('files', 0)):>6}  "
+            f"{int(project.get('methods', 0)):>8}  "
+            f"{int(project.get('calls', 0)):>8}  "
+            f"{float(project.get('call_edge_coverage', 0.0)) * 100:>8.1f}%  "
+            f"{health}"
+        )
+        for anomaly in anomalies:
+            click.secho(
+                f"  - {anomaly.get('severity', 'warning')}: {anomaly.get('message', '')}",
+                fg="yellow" if anomaly.get("severity") != "critical" else "red",
+            )
+
+
+@main.command("self-test")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def self_test_cmd(ctx: click.Context, as_json: bool) -> None:
+    """Run smoke queries that catch schema and translator regressions."""
+    store = _open_store(read_only=True)
+    result = smoke_test_index(store)
+    if as_json:
+        _echo_json(result, True)
+    else:
+        if result.get("ok"):
+            click.secho("Index self-test passed.", fg="green")
+        else:
+            click.secho("Index self-test failed.", fg="red")
+            for check in result.get("checks", []):
+                if not check.get("ok"):
+                    click.echo(f"  - {check.get('name')}: {check.get('error', '')}")
+    if not result.get("ok"):
+        ctx.exit(1)
+
+
 @main.command("list")
 @click.option("--json", "as_json", is_flag=True)
 def list_projects(as_json: bool) -> None:
@@ -1203,6 +1351,270 @@ def list_projects(as_json: bool) -> None:
     store = _open_store(read_only=True)
     projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path, p.language as language ORDER BY p.id")
     _echo_json(projects, as_json)
+
+
+@main.command("tasks")
+@click.option("--all", "include_finished", is_flag=True, help="Include completed and failed tasks.")
+@click.option("--limit", default=20, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def tasks_cmd(include_finished: bool, limit: int, as_json: bool) -> None:
+    """Show CodeSpine background tasks."""
+    _show_background_tasks(include_finished=include_finished, limit=limit, as_json=as_json)
+
+
+@main.command("background")
+@click.option("--all", "include_finished", is_flag=True, help="Include completed and failed tasks.")
+@click.option("--limit", default=20, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def background_cmd(include_finished: bool, limit: int, as_json: bool) -> None:
+    """Show background task progress."""
+    _show_background_tasks(include_finished=include_finished, limit=limit, as_json=as_json)
+
+
+def _show_background_tasks(include_finished: bool, limit: int, as_json: bool) -> None:
+    tasks = list_tasks(include_finished=include_finished, limit=limit)
+    if as_json:
+        _echo_json(tasks, True)
+        return
+    if not tasks:
+        click.echo("No background tasks.")
+        return
+    now = time.time()
+    header = f"{'ID':<12}  {'Status':<10}  {'Progress':>8}  {'Phase':<26}  {'Age':>7}  Path"
+    click.secho(header, fg="cyan")
+    click.echo("-" * len(header))
+    for task in tasks:
+        started = task.get("started_at")
+        age = _format_elapsed(now - float(started)) if started else "-"
+        path = task.get("path") or ""
+        phase = str(task.get("phase") or "")[:26]
+        progress = task.get("progress")
+        if isinstance(progress, (int, float)):
+            progress_str = f"{min(max(float(progress), 0.0), 1.0) * 100:.0f}%"
+        else:
+            progress_str = "-"
+        click.echo(
+            f"{str(task.get('id', '')):<12}  "
+            f"{str(task.get('status', '')):<10}  "
+            f"{progress_str:>8}  "
+            f"{phase:<26}  "
+            f"{age:>7}  "
+            f"{path}"
+        )
+        detail = task.get("detail")
+        if detail:
+            click.echo(f"{'':<12}  {'':<10}  {'':>8}  {str(detail)[:80]}")
+
+
+def _project_summaries() -> list[dict]:
+    sg = ShardedGraphStore(read_only=True)
+    out: list[dict] = []
+    for project in sg.list_project_metadata():
+        pid = project.get("id", "")
+        shard_store = sg.shard(pid)
+
+        def _count(query: str) -> int:
+            try:
+                rows = shard_store.query_records(query, {"pid": pid})
+                return int(rows[0]["n"]) if rows else 0
+            except Exception:
+                return 0
+
+        out.append(
+            {
+                **project,
+                "shard": sg.router.shard_for(pid),
+                "files": _count("MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n"),
+                "classes": _count(
+                    "MATCH (c:Class), (f:File) WHERE c.file_id = f.id AND f.project_id = $pid RETURN count(c) as n"
+                ),
+                "methods": _count(
+                    "MATCH (m:Method), (c:Class), (f:File) "
+                    "WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid RETURN count(m) as n"
+                ),
+                "calls": _count(
+                    "MATCH (ma:Method)-[:CALLS]->(mb:Method), (ca:Class), (fa:File) "
+                    "WHERE ma.class_id = ca.id AND ca.file_id = fa.id AND fa.project_id = $pid RETURN count(*) as n"
+                ),
+            }
+        )
+    return out
+
+
+def _ui_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeSpine Index Explorer</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; color: #202124; background: #f7f9fb; }
+    header { padding: 24px 28px 18px; background: #ffffff; border-bottom: 1px solid #d9e1ea; }
+    h1 { margin: 0 0 6px; font-size: 26px; font-weight: 720; letter-spacing: 0; }
+    main { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.8fr); gap: 18px; padding: 18px 28px 32px; }
+    section { min-width: 0; }
+    .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+    input { width: min(420px, 100%); padding: 10px 12px; border: 1px solid #c8d3df; border-radius: 6px; font-size: 14px; }
+    button { padding: 10px 14px; border: 1px solid #1b6f79; border-radius: 6px; background: #1b6f79; color: white; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #d9e1ea; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #e7edf3; font-size: 14px; vertical-align: top; }
+    th { background: #eef4f8; font-weight: 680; }
+    .muted { color: #65727f; }
+    .stack { display: grid; gap: 18px; }
+    .panel { background: white; border: 1px solid #d9e1ea; padding: 14px; }
+    .panel h2 { margin: 0 0 10px; font-size: 18px; letter-spacing: 0; }
+    .task { border-top: 1px solid #e7edf3; padding: 10px 0; }
+    .task:first-of-type { border-top: 0; }
+    .metric { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 7px 0; border-top: 1px solid #e7edf3; }
+    .metric:first-of-type { border-top: 0; }
+    .status { display: inline-block; padding: 2px 8px; border-radius: 6px; background: #e7f4ea; color: #137333; font-size: 12px; }
+    .status.failed { background: #fce8e6; color: #a50e0e; }
+    .status.running, .status.queued { background: #e8f0fe; color: #174ea6; }
+    .status.warning { background: #fef7e0; color: #b06000; }
+    .status.critical { background: #fce8e6; color: #a50e0e; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 14px; } header { padding: 18px 14px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>CodeSpine Index Explorer</h1>
+    <div class="muted">Local read-only view of indexed projects and background enrichment tasks.</div>
+  </header>
+  <main>
+    <section>
+      <div class="toolbar">
+        <input id="filter" placeholder="Filter projects by id or path">
+        <button id="refresh">Refresh</button>
+      </div>
+      <table>
+        <thead><tr><th>Project</th><th>Shard</th><th>Files</th><th>Classes</th><th>Methods</th><th>Calls</th><th>Path</th></tr></thead>
+        <tbody id="projects"><tr><td colspan="7" class="muted">Loading...</td></tr></tbody>
+      </table>
+    </section>
+    <aside class="stack">
+      <section class="panel">
+        <h2>Index Health</h2>
+        <div id="health" class="muted">Loading...</div>
+      </section>
+      <section class="panel">
+        <h2>Background Tasks</h2>
+        <div id="tasks" class="muted">Loading...</div>
+      </section>
+      <section class="panel">
+        <h2>Install</h2>
+        <div class="muted">Use <code>codespine background</code> for the same task state in the terminal. A richer add-on UI can build on these endpoints.</div>
+      </section>
+    </aside>
+  </main>
+  <script>
+    let projects = [];
+    async function getJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(url); return await r.json(); }
+    function renderProjects() {
+      const q = document.getElementById('filter').value.toLowerCase();
+      const rows = projects.filter(p => (`${p.id || ''} ${p.path || ''}`).toLowerCase().includes(q));
+      document.getElementById('projects').innerHTML = rows.length ? rows.map(p => `
+        <tr><td>${p.id || ''}</td><td>${p.shard}</td><td>${p.files}</td><td>${p.classes}</td><td>${p.methods}</td><td>${p.calls}</td><td class="muted">${p.path || ''}</td></tr>
+      `).join('') : '<tr><td colspan="7" class="muted">No projects found.</td></tr>';
+    }
+    function renderTasks(tasks) {
+      const el = document.getElementById('tasks');
+      if (!tasks.length) { el.innerHTML = 'No background tasks.'; return; }
+      el.innerHTML = tasks.map(t => `
+        <div class="task">
+          <div><span class="status ${t.status}">${t.status}</span> <strong>${t.phase || t.kind}</strong></div>
+          <div class="muted">${t.label || ''}</div>
+          <div class="muted">${t.path || ''}</div>
+          ${t.detail ? `<div>${t.detail}</div>` : ''}
+        </div>
+      `).join('');
+    }
+    function renderHealth(health) {
+      const el = document.getElementById('health');
+      const summary = health.summary || {};
+      const projects = health.projects || [];
+      const critical = summary.critical_count || 0;
+      const anomalies = summary.anomaly_count || 0;
+      const status = critical ? 'critical' : anomalies ? 'warning' : '';
+      const worst = critical ? 'critical' : anomalies ? 'warning' : 'ok';
+      const lowest = projects.reduce((min, p) => Math.min(min, Number(p.call_edge_coverage || 0)), projects.length ? 1 : 0);
+      const coverage = projects.length ? `${Math.round(lowest * 1000) / 10}%` : '-';
+      el.innerHTML = `
+        <div><span class="status ${status}">${worst}</span></div>
+        <div class="metric"><span>Projects</span><strong>${summary.project_count || 0}</strong></div>
+        <div class="metric"><span>Anomalies</span><strong>${anomalies}</strong></div>
+        <div class="metric"><span>Lowest call coverage</span><strong>${coverage}</strong></div>
+        ${projects.flatMap(p => (p.anomalies || []).map(a => `<div class="task"><strong>${p.project_id}</strong><div>${a.message || ''}</div></div>`)).join('')}
+      `;
+    }
+    async function refresh() {
+      const [p, t, h] = await Promise.all([getJSON('/api/projects'), getJSON('/api/tasks'), getJSON('/api/health')]);
+      projects = p; renderProjects(); renderTasks(t); renderHealth(h);
+    }
+    document.getElementById('filter').addEventListener('input', renderProjects);
+    document.getElementById('refresh').addEventListener('click', refresh);
+    refresh(); setInterval(refresh, 5000);
+  </script>
+</body>
+</html>"""
+
+
+@main.command("ui")
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8765, show_default=True, type=int)
+@click.option("--open/--no-open", "open_browser", default=False, show_default=True)
+def ui(host: str, port: int, open_browser: bool) -> None:
+    """Serve a lightweight local read-only index explorer."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            LOGGER.debug("ui: " + fmt, *args)
+
+        def _send(self, body: bytes, content_type: str, status_code: int = HTTPStatus.OK) -> None:
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, data: object) -> None:
+            self._send(json.dumps(data, indent=2).encode("utf-8"), "application/json; charset=utf-8")
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                self._send(_ui_html().encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if parsed.path == "/api/tasks":
+                self._json(list_tasks(include_finished=True, limit=30))
+                return
+            if parsed.path == "/api/projects":
+                self._json(_project_summaries())
+                return
+            if parsed.path == "/api/health":
+                self._json(index_health(_open_store(read_only=True)))
+                return
+            if parsed.path == "/api/status":
+                self._json({
+                    "tasks": list_tasks(include_finished=True, limit=30),
+                    "projects": _project_summaries(),
+                    "health": index_health(_open_store(read_only=True)),
+                })
+                return
+            self._send(b"not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    url = f"http://{host}:{port}"
+    click.secho(f"CodeSpine UI running at {url}", fg="green")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("\nStopping UI.")
+    finally:
+        server.server_close()
 
 
 @main.command()
@@ -1225,7 +1637,15 @@ def status(as_json: bool) -> None:
         except Exception:
             pid = None
     store = _open_store(read_only=True)
-    overlay = get_overlay_status(store)
+    try:
+        overlay = get_overlay_status(store)
+    except Exception:
+        overlay = []
+    tasks = active_tasks(limit=10)
+    try:
+        health_summary = index_health(store).get("summary", {})
+    except Exception:
+        health_summary = {}
 
     # Check for stale PID file
     stale_pid = pid is not None and not running
@@ -1243,6 +1663,8 @@ def status(as_json: bool) -> None:
         "log_file": SETTINGS.log_file,
         "overlay_dir": SETTINGS.overlay_dir,
         "overlay_projects": overlay,
+        "background_tasks": tasks,
+        "health_summary": health_summary,
     }
     if as_json:
         _echo_json(payload, True)
@@ -1255,6 +1677,20 @@ def status(as_json: bool) -> None:
             click.echo("For IDE:   codespine mcp  (stdio mode)")
         else:
             click.echo(f"\nMCP server running (PID {pid}). Stop with: codespine stop")
+        if tasks:
+            click.echo("\nBackground tasks:")
+            for task in tasks:
+                click.echo(
+                    f"  {task.get('id')}  {task.get('status')}  "
+                    f"{task.get('phase')}  {task.get('path') or ''}"
+                )
+        if health_summary:
+            click.echo(
+                "\nIndex health: "
+                f"{health_summary.get('project_count', 0)} project(s), "
+                f"{health_summary.get('anomaly_count', 0)} anomaly(s), "
+                f"{health_summary.get('critical_count', 0)} critical"
+            )
 
 
 @main.command("overlay-status")
@@ -1475,6 +1911,7 @@ def setup() -> None:
     click.echo("\nRecommended setup:")
     click.echo("  pip install -e '.[full]'                # core + ML + community detection")
     click.echo("  pip install -e '.[ml]'                  # just ML embeddings")
+    click.echo("  pip install -e '.[ui]'                  # core + local browser explorer")
     click.echo("\nQuick start:")
     click.echo("  codespine analyse /path/to/java-project --full")
     click.echo("  codespine start                         # launch MCP server")
