@@ -192,3 +192,99 @@ def test_parse_loop_skips_none_parsed_in_db_write(tmp_path):
         _ = pr["parsed"].classes
 
     assert files_indexed == 1, "Skipped sentinel should increment files_indexed"
+
+
+# ---------------------------------------------------------------------------
+# Test D: DB-write progress covers the silent post-parse phase
+# ---------------------------------------------------------------------------
+
+
+def test_db_write_heartbeat_emits_until_write_done(tmp_path, monkeypatch):
+    """The post-parse DB write phase must emit start/heartbeat/progress/done
+    events so the CLI does not look frozen before call tracing begins."""
+    import codespine.indexer.engine as eng
+
+    class _Txn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _SlowStore:
+        def query_records(self, *_args, **_kwargs):
+            return []
+
+        def clear_project(self, *_args, **_kwargs):
+            pass
+
+        def clear_file(self, *_args, **_kwargs):
+            pass
+
+        def upsert_project(self, *_args, **_kwargs):
+            pass
+
+        def transaction(self):
+            return _Txn()
+
+        def clear_files_batch(self, *_args, **_kwargs):
+            pass
+
+        def upsert_files_batch(self, *_args, **_kwargs):
+            pass
+
+        def upsert_classes_batch(self, *_args, **_kwargs):
+            pass
+
+        def upsert_methods_batch(self, *_args, **_kwargs):
+            time.sleep(0.03)
+
+        def upsert_symbols_batch(self, *_args, **_kwargs):
+            time.sleep(0.03)
+
+        def add_calls_batch(self, *_args, **_kwargs):
+            pass
+
+        def add_references_batch(self, *_args, **_kwargs):
+            pass
+
+        def add_injections_batch(self, *_args, **_kwargs):
+            pass
+
+        def add_interface_bindings_batch(self, *_args, **_kwargs):
+            pass
+
+        def _recycle_conn(self):
+            pass
+
+    monkeypatch.setattr(eng, "_PARSE_HEARTBEAT_PERIOD", 0.005)
+    monkeypatch.setattr(eng, "resolve_calls", lambda *_args, **_kwargs: iter(()))
+
+    java_file = tmp_path / "src/main/java/com/example/Foo.java"
+    java_file.parent.mkdir(parents=True)
+    java_file.write_text(
+        "package com.example; public class Foo { void run() {} }\n",
+        encoding="utf-8",
+    )
+
+    events: list[tuple[str, dict]] = []
+    indexer = eng.JavaIndexer(_SlowStore())
+    indexer.index_project(
+        str(tmp_path),
+        full=True,
+        progress=lambda event, payload: events.append((event, dict(payload))),
+        project_id="proj",
+        embed=False,
+    )
+
+    names = [event for event, _payload in events]
+    assert "db_write_start" in names
+    assert "db_write_heartbeat" in names
+    assert "db_write_progress" in names
+    assert "db_write_done" in names
+    assert names.index("db_write_done") < names.index("resolve_calls_start")
+
+    done_payload = next(payload for event, payload in events if event == "db_write_done")
+    assert done_payload["files_indexed"] == 1
+    assert done_payload["classes"] == 1
+    assert done_payload["methods"] == 1

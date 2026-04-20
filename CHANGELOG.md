@@ -7,6 +7,12 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-04-20
+
+### Fixed
+
+- Added live DB-write progress after parsing so `codespine analyse` no longer appears frozen while committing files, classes, methods, and symbols before call tracing starts.
+
 ## [0.5.6] - 2026-03-14
 
 ### Fixed

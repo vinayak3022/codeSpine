@@ -145,6 +145,10 @@ def _index_shard_group(
         }
         call_state: dict = {"shown": False, "count": 0, "last_ts": 0.0,
                              "started_at": 0.0}
+        db_state: dict = {
+            "shown": False, "done": 0, "total": 0, "last_ts": 0.0,
+            "started_at": 0.0,
+        }
 
         def _progress(event: str, payload: dict) -> None:
             now = time.perf_counter()
@@ -237,11 +241,101 @@ def _index_shard_group(
                     parse_state["shown"] = True
                     parse_state["last_ts"] = now
                 return
-            if event in ("resolve_calls_start",):
+            if event == "db_write_start":
                 if parse_state["shown"]:
                     with output_lock:
                         click.echo()
                     parse_state["shown"] = False
+                total = int(payload.get("total", 0))
+                deleted = int(payload.get("deleted_files", 0))
+                db_state["done"] = 0
+                db_state["total"] = total
+                db_state["started_at"] = now
+                status = f"starting ({total} files"
+                if deleted:
+                    status += f", {deleted} deleted"
+                status += ")"
+                with output_lock:
+                    _phase(f"{prefix}Writing index...", status)
+                return
+            if event == "db_write_heartbeat":
+                done = int(payload.get("done", 0))
+                total = int(payload.get("total", 0))
+                classes = int(payload.get("classes", 0))
+                methods = int(payload.get("methods", 0))
+                phase = str(payload.get("phase", "writing"))
+                elapsed_s = float(payload.get("elapsed", 0.0))
+                db_state["done"] = done
+                db_state["total"] = total
+                if not parallel:
+                    click.echo(
+                        f"\r{_spinner_char()} {prefix}Writing index...   "
+                        f"{_bar(done, total)} {done}/{total}  "
+                        f"{classes} classes / {methods} methods  "
+                        f"{phase[:18]:<18} {elapsed_s:.0f}s  ",
+                        nl=False,
+                    )
+                else:
+                    with output_lock:
+                        click.echo(
+                            f"\r{prefix}Writing {done}/{total} "
+                            f"({classes} classes, {methods} methods, {elapsed_s:.0f}s)  ",
+                            nl=False,
+                        )
+                db_state["shown"] = True
+                db_state["last_ts"] = now
+                return
+            if event == "db_write_progress":
+                done = int(payload.get("done", 0))
+                total = int(payload.get("total", 0))
+                classes = int(payload.get("classes", 0))
+                methods = int(payload.get("methods", 0))
+                phase = str(payload.get("phase", "writing"))
+                db_state["done"] = done
+                db_state["total"] = total
+                if total == 0 and done == 0:
+                    return
+                if done == total or (now - db_state["last_ts"]) >= 0.25:
+                    elapsed_s = now - db_state["started_at"]
+                    if not parallel:
+                        click.echo(
+                            f"\r{_spinner_char()} {prefix}Writing index...   "
+                            f"{_bar(done, total)} {done}/{total}  "
+                            f"{classes} classes / {methods} methods  "
+                            f"{phase[:18]:<18} {elapsed_s:.0f}s  ",
+                            nl=False,
+                        )
+                    else:
+                        with output_lock:
+                            click.echo(
+                                f"\r{prefix}Writing {done}/{total} "
+                                f"({classes} classes, {methods} methods, {elapsed_s:.0f}s)  ",
+                                nl=False,
+                            )
+                    db_state["shown"] = True
+                    db_state["last_ts"] = now
+                return
+            if event == "db_write_done":
+                if db_state["shown"]:
+                    with output_lock:
+                        click.echo()
+                db_state["shown"] = False
+                files = int(payload.get("files_indexed", db_state["done"]))
+                classes = int(payload.get("classes", 0))
+                methods = int(payload.get("methods", 0))
+                elapsed_s = float(payload.get("elapsed", 0.0))
+                with output_lock:
+                    _phase(
+                        f"{prefix}Writing index...",
+                        f"{files} files, {classes} classes, {methods} methods  ({elapsed_s:.1f}s)",
+                    )
+                return
+            if event in ("resolve_calls_start",):
+                if parse_state["shown"] or db_state["shown"]:
+                    with output_lock:
+                        click.echo()
+                    parse_state["shown"] = False
+                    db_state["shown"] = False
                 call_state["started_at"] = now
                 with output_lock:
                     _phase(f"{prefix}Tracing calls...", "starting...")
@@ -309,7 +403,7 @@ def _index_shard_group(
         total_files += result.files_found
 
         # Flush any dangling progress line.
-        if parse_state["shown"]:
+        if parse_state["shown"] or db_state["shown"]:
             with output_lock:
                 click.echo()
 

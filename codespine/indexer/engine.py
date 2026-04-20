@@ -392,227 +392,299 @@ class JavaIndexer:
                 _parse_hb_stop.set()
                 _parse_hb_thread.join(timeout=3.0)
 
-        # ── Chunked DB writes ─────────────────────────────────────────────────
-        if full:
-            self.store.clear_project(project_id)
-        elif deleted_file_ids:
-            for delete_chunk in self._chunked(deleted_file_ids, file_batch_size):
-                with self.store.transaction():
-                    for fid in delete_chunk:
-                        self.store.clear_file(fid)
-                self.store._recycle_conn()
+        # ── DB-write heartbeat thread ─────────────────────────────────────────
+        # The DB write phase can be silent for many seconds on large repos:
+        # clearing stale rows, committing files/classes/methods/symbols, and
+        # recycling DuckDB connections all happen before call tracing starts.
+        # Keep emitting progress so the CLI never appears frozen after parsing.
+        _db_done_holder: list[int] = [0]
+        _db_classes_holder: list[int] = [0]
+        _db_methods_holder: list[int] = [0]
+        _db_phase_holder: list[str] = ["preparing"]
+        _db_hb_stop = threading.Event()
+        _db_start = time.perf_counter()
+        _db_total = len(parse_results)
 
-        # Clean up stale project entries that point to the same path under a
-        # different ID (e.g. re-indexing "vision-server" directly after it was
-        # previously indexed as "vision::vision-server" from a workspace root).
-        try:
-            stale = self.store.query_records(
-                "MATCH (p:Project) WHERE p.path = $path AND p.id <> $pid RETURN p.id as id",
-                {"path": root_path, "pid": project_id},
-            )
-            for old in stale:
-                self.store.clear_project(old["id"])
-        except Exception:
-            pass  # best-effort cleanup
-
-        self.store.upsert_project(project_id, root_path)
-
-        for parse_chunk in self._chunked(parse_results, file_batch_size):
-            file_rows: list[dict] = []
-            class_rows: list[dict] = []
-            method_rows: list[dict] = []
-            symbol_rows: list[dict] = []
-
-            for pr in parse_chunk:
-                # Skipped files (oversized, timeout) carry parsed=None.
-                # Still count as indexed for accurate reporting, but skip
-                # class/method/symbol extraction.
-                if pr.get("parsed") is None:
-                    files_indexed += 1
-                    continue
-                file_path = pr["file_path"]
-                parsed = pr["parsed"]
-                f_id = pr["f_id"]
-                file_digest = pr["digest"]
-                is_test = pr["is_test"]
-                scope = pr["scope"]
-                source = pr["source"]
-
-                file_rows.append(
-                    {
-                        "id": f_id,
-                        "path": file_path,
-                        "project_id": project_id,
-                        "is_test": is_test,
-                        "hash": file_digest,
-                    }
+        def _db_heartbeat_worker() -> None:
+            while not _db_hb_stop.wait(_PARSE_HEARTBEAT_PERIOD):
+                self._emit(
+                    progress,
+                    "db_write_heartbeat",
+                    done=_db_done_holder[0],
+                    total=_db_total,
+                    classes=_db_classes_holder[0],
+                    methods=_db_methods_holder[0],
+                    phase=_db_phase_holder[0],
+                    elapsed=time.perf_counter() - _db_start,
                 )
-                self._update_meta_cache_entry(meta_cache, f_id, file_path, file_digest, len(source), imports=parsed.imports)
 
-                for cls in parsed.classes:
-                    c_id = class_id(cls.fqcn, scope)
-                    class_rows.append(
+        _db_hb_thread = threading.Thread(
+            target=_db_heartbeat_worker, daemon=True, name="codespine-db-heartbeat"
+        )
+        _db_hb_thread.start()
+        self._emit(
+            progress,
+            "db_write_start",
+            total=_db_total,
+            deleted_files=len(deleted_file_ids),
+        )
+
+        try:
+            # ── Chunked DB writes ─────────────────────────────────────────────
+            _db_phase_holder[0] = "clearing"
+            if full:
+                self.store.clear_project(project_id)
+            elif deleted_file_ids:
+                for delete_chunk in self._chunked(deleted_file_ids, file_batch_size):
+                    with self.store.transaction():
+                        for fid in delete_chunk:
+                            self.store.clear_file(fid)
+                    self.store._recycle_conn()
+
+            # Clean up stale project entries that point to the same path under a
+            # different ID (e.g. re-indexing "vision-server" directly after it was
+            # previously indexed as "vision::vision-server" from a workspace root).
+            _db_phase_holder[0] = "preparing"
+            try:
+                stale = self.store.query_records(
+                    "MATCH (p:Project) WHERE p.path = $path AND p.id <> $pid RETURN p.id as id",
+                    {"path": root_path, "pid": project_id},
+                )
+                for old in stale:
+                    self.store.clear_project(old["id"])
+            except Exception:
+                pass  # best-effort cleanup
+
+            self.store.upsert_project(project_id, root_path)
+
+            _db_phase_holder[0] = "building rows"
+            for parse_chunk in self._chunked(parse_results, file_batch_size):
+                file_rows: list[dict] = []
+                class_rows: list[dict] = []
+                method_rows: list[dict] = []
+                symbol_rows: list[dict] = []
+
+                for pr in parse_chunk:
+                    # Skipped files (oversized, timeout) carry parsed=None.
+                    # Still count as indexed for accurate reporting, but skip
+                    # class/method/symbol extraction.
+                    if pr.get("parsed") is None:
+                        files_indexed += 1
+                        _db_done_holder[0] = files_indexed
+                        continue
+                    file_path = pr["file_path"]
+                    parsed = pr["parsed"]
+                    f_id = pr["f_id"]
+                    file_digest = pr["digest"]
+                    is_test = pr["is_test"]
+                    scope = pr["scope"]
+                    source = pr["source"]
+
+                    file_rows.append(
                         {
+                            "id": f_id,
+                            "path": file_path,
+                            "project_id": project_id,
+                            "is_test": is_test,
+                            "hash": file_digest,
+                        }
+                    )
+                    self._update_meta_cache_entry(meta_cache, f_id, file_path, file_digest, len(source), imports=parsed.imports)
+
+                    for cls in parsed.classes:
+                        c_id = class_id(cls.fqcn, scope)
+                        class_rows.append(
+                            {
+                                "id": c_id,
+                                "fqcn": cls.fqcn,
+                                "name": cls.name,
+                                "package": cls.package,
+                                "file_id": f_id,
+                            }
+                        )
+                        class_catalog.setdefault(cls.name, [])
+                        if cls.fqcn not in class_catalog[cls.name]:
+                            class_catalog[cls.name].append(cls.fqcn)
+                        fqcn_to_class_ids.setdefault(cls.fqcn, [])
+                        if c_id not in fqcn_to_class_ids[cls.fqcn]:
+                            fqcn_to_class_ids[cls.fqcn].append(c_id)
+                        class_meta[c_id] = {
+                            "id": c_id,
+                            "fqcn": cls.fqcn,
+                            "package": parsed.package,
+                            "imports": parsed.imports,
+                            "extends": cls.extends,
+                            "interfaces": cls.interfaces,
+                            "annotations": cls.annotations,
+                            "scope": scope,
+                        }
+                        class_methods.setdefault(c_id, {})
+
+                        cls_symbol_id = symbol_id("class", cls.fqcn, scope)
+                        symbol_rows.append(
+                            {
+                                "id": cls_symbol_id,
+                                "kind": "class",
+                                "name": cls.name,
+                                "fqname": cls.fqcn,
+                                "file_id": f_id,
+                                "line": cls.line,
+                                "col": cls.col,
+                                "embedding": embed_text(f"class {cls.fqcn}") if embed else None,
+                            }
+                        )
+                        classes_indexed += 1
+                        _db_classes_holder[0] = classes_indexed
+
+                        # Collect DI metadata for the resolver pass.
+                        di_cls_entry: dict = {
                             "id": c_id,
                             "fqcn": cls.fqcn,
                             "name": cls.name,
                             "package": cls.package,
-                            "file_id": f_id,
+                            "annotations": cls.annotations,
+                            "injected_fields": [
+                                {
+                                    "name": f.name,
+                                    "type_name": f.type_name,
+                                    "injection_annotation": f.injection_annotation,
+                                    "qualifier": f.qualifier,
+                                }
+                                for f in cls.fields
+                                if f.injection_annotation
+                            ],
+                            "methods_with_provides": [
+                                {
+                                    "name": m.name,
+                                    "provides_type": m.provides_type,
+                                    "provides_annotation": next(
+                                        (a for a in m.annotations if a.split(".")[-1] in {"Provides", "Bean"}),
+                                        "Provides",
+                                    ),
+                                }
+                                for m in cls.methods
+                                if m.provides_type
+                            ],
                         }
-                    )
-                    class_catalog.setdefault(cls.name, [])
-                    if cls.fqcn not in class_catalog[cls.name]:
-                        class_catalog[cls.name].append(cls.fqcn)
-                    fqcn_to_class_ids.setdefault(cls.fqcn, [])
-                    if c_id not in fqcn_to_class_ids[cls.fqcn]:
-                        fqcn_to_class_ids[cls.fqcn].append(c_id)
-                    class_meta[c_id] = {
-                        "id": c_id,
-                        "fqcn": cls.fqcn,
-                        "package": parsed.package,
-                        "imports": parsed.imports,
-                        "extends": cls.extends,
-                        "interfaces": cls.interfaces,
-                        "annotations": cls.annotations,
-                        "scope": scope,
-                    }
-                    class_methods.setdefault(c_id, {})
+                        di_classes.append(di_cls_entry)
 
-                    cls_symbol_id = symbol_id("class", cls.fqcn, scope)
-                    symbol_rows.append(
-                        {
-                            "id": cls_symbol_id,
-                            "kind": "class",
-                            "name": cls.name,
-                            "fqname": cls.fqcn,
-                            "file_id": f_id,
-                            "line": cls.line,
-                            "col": cls.col,
-                            "embedding": embed_text(f"class {cls.fqcn}") if embed else None,
-                        }
-                    )
-                    classes_indexed += 1
+                        for fld in cls.fields:
+                            fqfield = f"{cls.fqcn}#{fld.name}"
+                            symbol_rows.append(
+                                {
+                                    "id": symbol_id("field", fqfield, scope),
+                                    "kind": "field",
+                                    "name": fld.name,
+                                    "fqname": fqfield,
+                                    "file_id": f_id,
+                                    "line": fld.line,
+                                    "col": fld.col,
+                                    "embedding": embed_text(f"field {fqfield} {fld.type_name}") if embed else None,
+                                }
+                            )
 
-                    # Collect DI metadata for the resolver pass.
-                    di_cls_entry: dict = {
-                        "id": c_id,
-                        "fqcn": cls.fqcn,
-                        "name": cls.name,
-                        "package": cls.package,
-                        "annotations": cls.annotations,
-                        "injected_fields": [
-                            {
-                                "name": f.name,
-                                "type_name": f.type_name,
-                                "injection_annotation": f.injection_annotation,
-                                "qualifier": f.qualifier,
-                            }
-                            for f in cls.fields
-                            if f.injection_annotation
-                        ],
-                        "methods_with_provides": [
-                            {
-                                "name": m.name,
-                                "provides_type": m.provides_type,
-                                "provides_annotation": next(
-                                    (a for a in m.annotations if a.split(".")[-1] in {"Provides", "Bean"}),
-                                    "Provides",
-                                ),
-                            }
-                            for m in cls.methods
-                            if m.provides_type
-                        ],
-                    }
-                    di_classes.append(di_cls_entry)
+                        for method in cls.methods:
+                            m_id = method_id(cls.fqcn, method.signature, scope)
+                            method_rows.append(
+                                {
+                                    "id": m_id,
+                                    "class_id": c_id,
+                                    "name": method.name,
+                                    "signature": method.signature,
+                                    "return_type": method.return_type,
+                                    "modifiers": method.modifiers + [f"@{a}" for a in method.annotations],
+                                    "is_constructor": method.name == cls.name,
+                                    "is_test": is_test,
+                                }
+                            )
 
-                    for fld in cls.fields:
-                        fqfield = f"{cls.fqcn}#{fld.name}"
-                        symbol_rows.append(
-                            {
-                                "id": symbol_id("field", fqfield, scope),
-                                "kind": "field",
-                                "name": fld.name,
-                                "fqname": fqfield,
-                                "file_id": f_id,
-                                "line": fld.line,
-                                "col": fld.col,
-                                "embedding": embed_text(f"field {fqfield} {fld.type_name}") if embed else None,
-                            }
-                        )
+                            fqname = f"{cls.fqcn}#{method.signature}"
+                            symbol_rows.append(
+                                {
+                                    "id": symbol_id("method", fqname, scope),
+                                    "kind": "method",
+                                    "name": method.name,
+                                    "fqname": fqname,
+                                    "file_id": f_id,
+                                    "line": method.line,
+                                    "col": method.col,
+                                    "embedding": embed_text(f"method {fqname} returns {method.return_type}") if embed else None,
+                                }
+                            )
+                            methods_indexed += 1
+                            _db_methods_holder[0] = methods_indexed
 
-                    for method in cls.methods:
-                        m_id = method_id(cls.fqcn, method.signature, scope)
-                        method_rows.append(
-                            {
-                                "id": m_id,
-                                "class_id": c_id,
-                                "name": method.name,
+                            method_catalog[m_id] = {
                                 "signature": method.signature,
-                                "return_type": method.return_type,
-                                "modifiers": method.modifiers + [f"@{a}" for a in method.annotations],
-                                "is_constructor": method.name == cls.name,
-                                "is_test": is_test,
-                            }
-                        )
-
-                        fqname = f"{cls.fqcn}#{method.signature}"
-                        symbol_rows.append(
-                            {
-                                "id": symbol_id("method", fqname, scope),
-                                "kind": "method",
                                 "name": method.name,
-                                "fqname": fqname,
-                                "file_id": f_id,
-                                "line": method.line,
-                                "col": method.col,
-                                "embedding": embed_text(f"method {fqname} returns {method.return_type}") if embed else None,
+                                "param_count": len(method.parameter_types),
+                                "class_fqcn": cls.fqcn,
+                                "class_id": c_id,
                             }
-                        )
-                        methods_indexed += 1
+                            method_calls[m_id] = method.calls
+                            method_context[m_id] = {
+                                "class_id": c_id,
+                                "class_fqcn": cls.fqcn,
+                                "local_types": method.local_types,
+                                "field_types": cls.field_types,
+                                "imports": parsed.imports,
+                                "package": parsed.package,
+                            }
+                            class_methods[c_id][method.signature] = m_id
+                    files_indexed += 1
+                    _db_done_holder[0] = files_indexed
 
-                        method_catalog[m_id] = {
-                            "signature": method.signature,
-                            "name": method.name,
-                            "param_count": len(method.parameter_types),
-                            "class_fqcn": cls.fqcn,
-                            "class_id": c_id,
-                        }
-                        method_calls[m_id] = method.calls
-                        method_context[m_id] = {
-                            "class_id": c_id,
-                            "class_fqcn": cls.fqcn,
-                            "local_types": method.local_types,
-                            "field_types": cls.field_types,
-                            "imports": parsed.imports,
-                            "package": parsed.package,
-                        }
-                        class_methods[c_id][method.signature] = m_id
-                files_indexed += 1
-
-            # For incremental re-indexes clear files in bulk first, then use
-            # CREATE (not MERGE) for all writes — after clear the nodes are
-            # guaranteed absent so we skip the costly existence-check MERGE pays.
-            if not full:
-                for clear_sub in self._chunked([r["id"] for r in file_rows], 100):
+                # For incremental re-indexes clear files in bulk first, then use
+                # CREATE (not MERGE) for all writes — after clear the nodes are
+                # guaranteed absent so we skip the costly existence-check MERGE pays.
+                _db_phase_holder[0] = "clearing files"
+                if not full:
+                    for clear_sub in self._chunked([r["id"] for r in file_rows], 100):
+                        with self.store.transaction():
+                            self.store.clear_files_batch(clear_sub)
+                        self.store._recycle_conn()
+                _db_phase_holder[0] = "writing files"
+                with self.store.transaction():
+                    self.store.upsert_files_batch(file_rows)
+                self.store._recycle_conn()
+                _db_phase_holder[0] = "writing classes"
+                with self.store.transaction():
+                    self.store.upsert_classes_batch(class_rows)
+                self.store._recycle_conn()
+                _METHOD_SUB_BATCH = 200
+                _db_phase_holder[0] = "writing methods"
+                for method_sub in self._chunked(method_rows, _METHOD_SUB_BATCH):
                     with self.store.transaction():
-                        self.store.clear_files_batch(clear_sub)
+                        self.store.upsert_methods_batch(method_sub)
                     self.store._recycle_conn()
-            with self.store.transaction():
-                self.store.upsert_files_batch(file_rows)
-            self.store._recycle_conn()
-            with self.store.transaction():
-                self.store.upsert_classes_batch(class_rows)
-            self.store._recycle_conn()
-            _METHOD_SUB_BATCH = 200
-            for method_sub in self._chunked(method_rows, _METHOD_SUB_BATCH):
-                with self.store.transaction():
-                    self.store.upsert_methods_batch(method_sub)
-                self.store._recycle_conn()
-            _SYMBOL_SUB_BATCH = 200
-            for symbol_sub in self._chunked(symbol_rows, _SYMBOL_SUB_BATCH):
-                with self.store.transaction():
-                    self.store.upsert_symbols_batch(symbol_sub)
-                self.store._recycle_conn()
+                _SYMBOL_SUB_BATCH = 200
+                _db_phase_holder[0] = "writing symbols"
+                for symbol_sub in self._chunked(symbol_rows, _SYMBOL_SUB_BATCH):
+                    with self.store.transaction():
+                        self.store.upsert_symbols_batch(symbol_sub)
+                    self.store._recycle_conn()
+                self._emit(
+                    progress,
+                    "db_write_progress",
+                    done=files_indexed,
+                    total=_db_total,
+                    classes=classes_indexed,
+                    methods=methods_indexed,
+                    phase=_db_phase_holder[0],
+                )
+                _db_phase_holder[0] = "building rows"
+        finally:
+            _db_hb_stop.set()
+            _db_hb_thread.join(timeout=3.0)
+
+        self._emit(
+            progress,
+            "db_write_done",
+            files_indexed=files_indexed,
+            classes=classes_indexed,
+            methods=methods_indexed,
+            elapsed=time.perf_counter() - _db_start,
+        )
 
         self._emit(progress, "resolve_calls_start")
 
