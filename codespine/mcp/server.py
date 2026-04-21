@@ -25,6 +25,7 @@ from codespine.diff.branch_diff import compare_branches as compare_branches_anal
 from codespine.health import index_health
 from codespine.overlay.git_state import current_head
 from codespine.overlay.merge import overlay_summary
+from codespine.project_state import derive_project_status, list_project_states, load_project_state, snapshot_info, synthetic_project_state
 from codespine.search.hybrid import hybrid_search
 from codespine.tasks import active_tasks
 from codespine.watch.watcher import (
@@ -197,6 +198,38 @@ def _staleness_meta(
     return _json(final)
 
 
+def _project_inventory(store) -> list[dict]:
+    state_by_id = {item.get("project_id"): item for item in list_project_states() if item.get("project_id")}
+    try:
+        projects = store.list_project_metadata() if hasattr(store, "list_project_metadata") else store.query_records(
+            "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
+        )
+    except Exception:
+        projects = []
+    meta_by_id = {item.get("id"): item for item in projects if item.get("id")}
+    project_ids = sorted({pid for pid in list(meta_by_id) + list(state_by_id) if pid})
+    out: list[dict] = []
+    for pid in project_ids:
+        project = meta_by_id.get(pid, {})
+        state = state_by_id.get(pid) or synthetic_project_state(pid, path=project.get("path", ""))
+        snap = snapshot_info(pid, store.router if hasattr(store, "router") else None)
+        out.append(
+            {
+                "project_id": pid,
+                "path": state.get("path") or project.get("path"),
+                "indexed_at": project.get("indexed_at"),
+                "project_state": derive_project_status(state, snap),
+                "core_state": state.get("core_state"),
+                "deep_state": state.get("deep_state"),
+                "last_error": state.get("last_error"),
+                "repair_hint": state.get("repair_hint"),
+                "snapshot_valid": snap.get("snapshot_valid"),
+                "write_db_valid": snap.get("write_db_valid"),
+            }
+        )
+    return out
+
+
 class _StoreProxy:
     """Wraps a GraphStore and hot-reloads from the read replica when the
     post-analyse sentinel file is touched.
@@ -333,23 +366,7 @@ def build_mcp_server(store, repo_path_provider):
         Call this before other tools so you know what's ready without trial-and-error.
         Features marked false may need 'codespine analyse --deep' or optional dependencies.
         """
-        try:
-            projects = store.query_records(
-                """
-                MATCH (p:Project)
-                RETURN p.id as id,
-                       p.path as path,
-                       p.indexed_at as indexed_at,
-                       p.indexed_commit as indexed_commit,
-                       p.overlay_dirty as overlay_dirty
-                """
-            )
-        except Exception:
-            # Old DB schema (pre-0.4.0) doesn't have indexed_at column yet.
-            # Falls back gracefully; column is added next time 'analyse' runs.
-            projects = store.query_records(
-                "MATCH (p:Project) RETURN p.id as id, p.path as path"
-            )
+        projects = _project_inventory(store)
         sym_q = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
         comm_q = store.query_records("MATCH (c:Community) RETURN count(c) as count")
         flow_q = store.query_records("MATCH (f:Flow) RETURN count(f) as count")
@@ -375,6 +392,9 @@ def build_mcp_server(store, repo_path_provider):
         n_comm = comm_q[0]["count"] if comm_q else 0
         n_flows = flow_q[0]["count"] if flow_q else 0
         n_coup = coup_q[0]["count"] if coup_q else 0
+        queryable_projects = [p for p in projects if p.get("project_state") in {"ready", "enriching", "degraded"}]
+        partial_projects = [p for p in projects if p.get("project_state") == "partial"]
+        search_ready = bool(queryable_projects and n_sym > 0)
 
         # Check if any symbols have embeddings stored
         emb_q = store.query_records(
@@ -400,13 +420,19 @@ def build_mcp_server(store, repo_path_provider):
             ts = int(p.get("indexed_at") or 0)
             if ts and (now - ts) > 3600 and not watch_running:
                 age_h = (now - ts) // 3600
-                stale_projects.append(f"{p['id']} ({age_h}h old)")
+                stale_projects.append(f"{p['project_id']} ({age_h}h old)")
 
         notes: dict[str, str] = {}
         if stale_projects:
             notes["stale_index"] = (
                 f"Index is stale for: {', '.join(stale_projects)}. "
                 "Run analyse_project() or start_watch() to refresh."
+            )
+        if partial_projects:
+            notes["partial_projects"] = (
+                "Partial core indexes are present: "
+                + ", ".join(p["project_id"] for p in partial_projects[:5])
+                + ". Run codespine repair to finish them before trusting deep analysis."
             )
         if not n_comm:
             notes["community_detection"] = "Run 'codespine analyse --deep' to enable"
@@ -449,11 +475,11 @@ def build_mcp_server(store, repo_path_provider):
             "features": {
                 "ping": True,
                 "list_projects": True,
-                "search_hybrid": n_sym > 0,
-                "get_impact": n_sym > 0,
-                "get_symbol_context": n_sym > 0,
-                "detect_dead_code": n_sym > 0,
-                "trace_execution_flows": n_sym > 0,
+                "search_hybrid": search_ready,
+                "get_impact": search_ready,
+                "get_symbol_context": search_ready,
+                "detect_dead_code": search_ready,
+                "trace_execution_flows": search_ready,
                 "community_detection": n_comm > 0,
                 "execution_flows": n_flows > 0,
                 "change_coupling": n_coup > 0,
@@ -477,6 +503,7 @@ def build_mcp_server(store, repo_path_provider):
                 "analyse_running": analyse_running,
                 "analyse_path": _analyse["path"] if analyse_running else None,
                 "tasks": active_tasks(limit=10),
+                "projects": projects,
             },
             "index_health": {
                 "summary": health_summary,
@@ -509,14 +536,7 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def list_projects():
         """List all indexed projects with their symbol and file counts."""
-        try:
-            projects = store.query_records(
-                "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
-            )
-        except Exception:
-            projects = store.query_records(
-                "MATCH (p:Project) RETURN p.id as id, p.path as path"
-            )
+        projects = _project_inventory(store)
         if not projects:
             return {"available": False, "note": "No projects indexed yet. Run 'codespine analyse <path>'."}
         now = int(time.time())
@@ -528,21 +548,25 @@ def build_mcp_server(store, repo_path_provider):
                 WHERE s.file_id = f.id AND f.project_id = $pid
                 RETURN count(s) as count
                 """,
-                {"pid": p["id"]},
+                {"pid": p["project_id"]},
             )
             files = store.query_records(
                 "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as count",
-                {"pid": p["id"]},
+                {"pid": p["project_id"]},
             )
             indexed_at_ts = int(p.get("indexed_at") or 0)
             age_s = now - indexed_at_ts if indexed_at_ts else None
             entry: dict = {
-                "project_id": p["id"],
+                "project_id": p["project_id"],
                 "path": p["path"],
                 "symbol_count": sym[0]["count"] if sym else 0,
                 "file_count": files[0]["count"] if files else 0,
                 "indexed_at_epoch": indexed_at_ts or None,
                 "index_age_seconds": age_s,
+                "project_state": p.get("project_state"),
+                "core_state": p.get("core_state"),
+                "deep_state": p.get("deep_state"),
+                "repair_hint": p.get("repair_hint"),
             }
             if age_s is not None and age_s > 3600:
                 entry["stale_warning"] = (
@@ -816,20 +840,14 @@ def build_mcp_server(store, repo_path_provider):
         Use this to understand the size and coverage of each indexed project before
         deciding which project= scope to pass to analysis tools.
         """
-        projects = store.query_records(
-            """
-            MATCH (p:Project)
-            RETURN p.id as id, p.path as path, p.indexed_commit as indexed_commit, p.overlay_dirty as overlay_dirty
-            ORDER BY p.id
-            """
-        )
+        projects = _project_inventory(store)
         if not projects:
             return {"available": False, "note": "No projects indexed yet. Run 'codespine analyse <path>'."}
 
         per_project = []
         total_files = total_classes = total_methods = total_calls = total_emb = 0
         for p in projects:
-            pid = p["id"]
+            pid = p["project_id"]
             files = store.query_records(
                 "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n", {"pid": pid}
             )
@@ -862,8 +880,10 @@ def build_mcp_server(store, repo_path_provider):
                 "methods": n_methods,
                 "calls_out": n_calls,
                 "embeddings": n_emb,
-                "indexed_commit": p.get("indexed_commit", ""),
-                "overlay_dirty": bool(p.get("overlay_dirty", False)),
+                "project_state": p.get("project_state"),
+                "core_state": p.get("core_state"),
+                "deep_state": p.get("deep_state"),
+                "repair_hint": p.get("repair_hint"),
             })
             total_files += n_files
             total_classes += n_classes

@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v1.0.11** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.0.12** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 
@@ -258,12 +258,14 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 
 ```bash
 # Indexing
-codespine analyse <path>                     # incremental index (default)
+codespine analyse <path>                     # trust-first incremental index (default)
 codespine analyse <path> --full              # full re-index from scratch
-codespine analyse <path> --budget 90         # fast index with a resolver deadline
+codespine analyse <path> --fast --budget 90  # budgeted partial core index
 codespine analyse <path> --complete --deep   # + communities, flows, dead code, coupling
 codespine analyse <path> --complete --incremental-deep
 codespine analyse <path> --embed             # + vector embeddings
+codespine repair <project-id-or-path>        # retry failed or incomplete phase
+codespine repair <project-id-or-path> --full # force full core rebuild
 
 # Background jobs and local UI
 codespine background                         # background task progress
@@ -316,7 +318,7 @@ codespine force-reset                        # emergency: delete all data files
 
 `analyse` defaults to incremental mode. Repeat runs only process changed files and are fast.
 
-`analyse` runs in fast mode by default: it indexes the core graph, honors the foreground time budget, publishes a read replica, then continues unfinished core indexing or enrichment in the background. Use `codespine background` or `codespine ui` to watch that work. Use `--complete --deep` when you want those passes refreshed before the command returns.
+`analyse` is trust-first by default: it completes the core graph in the foreground, validates and publishes the read replica, then keeps deep enrichment moving in the background. Use `--fast` only when you want a budgeted partial core index. Use `codespine background`, `codespine ui`, or `codespine repair` to inspect and recover incomplete or degraded work.
 
 ---
 
@@ -502,11 +504,15 @@ The deep analysis phase covers four passes that are expensive but optional:
 | Dead code | Finds methods with no callers (Java-aware exemptions) | Cleanup audits |
 | Change coupling | Analyses git history for co-changed file pairs | `get_change_coupling`, `related` |
 
-**Fast default:** `codespine analyse` prioritizes a queryable core index and keeps the foreground run inside the configured budget. If core indexing or call/type resolution cannot finish in time, the partial index is published and a background continuation finishes the core graph. Communities, flows, dead-code, git coupling, and cross-module links are queued in a detached background enrichment job unless you use `--complete`.
+**Trust-first default:** `codespine analyse` now treats success as “the core graph is complete, validated, and queryable.” The default foreground path finishes parse, DB writes, call resolution, type resolution, DI resolution, and snapshot publish before it returns. Deep enrichment still continues in the background unless you use `--complete --deep`.
+
+**Fast mode:** `codespine analyse --fast` keeps the old budgeted behavior for large repos. If the budget expires before the core graph is complete, CodeSpine publishes a partial snapshot, marks the project as partial, and tracks the background continuation until the core graph is repaired.
 
 **Health checks:** every analyse run now performs a small self-test query suite and reports index anomalies such as large projects with zero call edges. Use `codespine health` for the terminal dashboard or `codespine self-test --json` in CI.
 
-**Background visibility:** `codespine background` shows running background job progress in the terminal, and `codespine tasks` remains available as the shorter registry view. `codespine ui` serves a local read-only index explorer with project counts, index health, and the same background task state at `http://127.0.0.1:8765`.
+**Background visibility:** `codespine background` shows status, result, last phase, progress, and repair hints in the terminal, and `codespine tasks` remains available as the shorter registry view. `codespine ui` serves a local explorer with project state (`ready`, `enriching`, `partial`, `degraded`, `repair_required`), background tasks, and one-click Repair/Reindex actions at `http://127.0.0.1:8765`.
+
+**Repair flows:** `codespine repair <project-id-or-path>` retries the failed or incomplete phase first. Use `--full` when the project needs a full core rebuild.
 
 **Complete deep:** `--complete --deep` runs the expensive enrichment passes before returning. `--complete --incremental-deep` combines incremental file indexing with a forced full deep pass.
 

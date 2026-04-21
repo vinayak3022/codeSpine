@@ -62,7 +62,12 @@ def test_index_health_aggregates_project_anomalies():
 
     health = index_health(store)
 
-    assert health["summary"] == {"project_count": 1, "anomaly_count": 1, "critical_count": 1}
+    assert health["summary"] == {
+        "project_count": 1,
+        "anomaly_count": 1,
+        "critical_count": 1,
+        "state_counts": {"ready": 1},
+    }
     assert health["projects"][0]["shard"] == 2
 
 
@@ -74,4 +79,3 @@ def test_smoke_test_index_reports_query_failures():
     assert result["ok"] is False
     assert result["failed_count"] == 1
     assert result["checks"][2]["name"] == "contains_lower_rhs"
-

@@ -8,6 +8,7 @@ backend="duckdb".
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -461,13 +462,44 @@ def test_legacy_kuzu_dirs_at_both_paths_are_removed(tmp_path: Path):
         (Path(p) / "data.kz").write_bytes(b"\x00" * 1024)
 
     # Read-only open: legacy code would pick snap, fail, fall back to db, fail, raise.
-    # New code pre-sanitizes both paths, then returns an in-memory empty DB.
+    # New code never deletes paths in read-only mode and returns an empty view.
     store = DuckDBStore(read_only=True, db_path_override=db_path, snapshot_path_override=snap_path)
     rows = store.query_records("SELECT * FROM projects")
     assert rows == []
-    # Both paths should be gone
-    assert not os.path.exists(db_path)
-    assert not os.path.exists(snap_path)
+    assert os.path.exists(db_path)
+    assert os.path.exists(snap_path)
+
+
+def test_read_only_open_does_not_delete_existing_snapshot(tmp_path: Path):
+    db_path = str(tmp_path / "db")
+    snap_path = str(tmp_path / "db_read")
+    Path(snap_path).write_bytes(b"not-a-duckdb-snapshot")
+
+    store = DuckDBStore(read_only=True, db_path_override=db_path, snapshot_path_override=snap_path)
+
+    assert store.query_records("SELECT * FROM projects") == []
+    assert os.path.exists(snap_path)
+
+
+def test_invalid_temp_snapshot_does_not_replace_last_good_replica(tmp_path: Path, monkeypatch):
+    db_path = str(tmp_path / "db")
+    snap_path = str(tmp_path / "db_read")
+    store = DuckDBStore(db_path_override=db_path, snapshot_path_override=snap_path)
+    store.upsert_project("good", "/good")
+    assert store.snapshot_to_read_replica() is True
+    before = Path(snap_path).read_bytes()
+
+    original_copy2 = shutil.copy2
+
+    def fake_copy2(src, dst, *args, **kwargs):
+        result = original_copy2(src, dst, *args, **kwargs)
+        Path(dst).write_bytes(b"broken snapshot")
+        return result
+
+    monkeypatch.setattr("codespine.db.duckdb_store.shutil.copy2", fake_copy2)
+
+    assert store.snapshot_to_read_replica() is False
+    assert Path(snap_path).read_bytes() == before
 
 
 def test_sharded_store_stats_flow_with_stale_kuzu_dirs(tmp_path: Path):

@@ -197,9 +197,9 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None, strict
                    m.is_constructor as is_constructor,
                    m.is_test as is_test,
                    f.path as file_path
-            LIMIT $limit
+            LIMIT $lim
             """,
-            {"limit": int(limit * 5), "proj": project},
+            {"lim": int(limit * 5), "proj": project},
         )
     else:
         candidates = store.query_records(
@@ -215,9 +215,9 @@ def detect_dead_code(store, limit: int = 200, project: str | None = None, strict
                    m.is_constructor as is_constructor,
                    m.is_test as is_test,
                    f.path as file_path
-            LIMIT $limit
+            LIMIT $lim
             """,
-            {"limit": int(limit * 5)},
+            {"lim": int(limit * 5)},
         )
 
     if not candidates:

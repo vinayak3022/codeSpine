@@ -2,6 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from codespine.project_state import (
+    derive_project_status,
+    list_project_states,
+    load_project_state,
+    snapshot_info,
+    synthetic_project_state,
+)
+
 
 def _count(store, query: str, params: dict[str, Any] | None = None) -> int:
     rows = store.query_records(query, params or {})
@@ -15,7 +23,13 @@ def _count(store, query: str, params: dict[str, Any] | None = None) -> int:
     return int(next(iter(row.values()), 0))
 
 
-def project_health(store, project_id: str) -> dict[str, Any]:
+def project_health(
+    store,
+    project_id: str,
+    *,
+    state: dict[str, Any] | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return indexing health metrics for one project."""
     files = _count(store, "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n", {"pid": project_id})
     classes = _count(
@@ -59,6 +73,34 @@ def project_health(store, project_id: str) -> dict[str, Any]:
                 "message": f"{project_id} call-edge coverage is {coverage:.1%}.",
             }
         )
+    state = state or load_project_state(project_id)
+    snapshot = snapshot or snapshot_info(project_id)
+    project_state = derive_project_status(state, snapshot)
+    if project_state == "partial":
+        anomalies.append(
+            {
+                "severity": "warning",
+                "code": "partial_core_index",
+                "message": f"{project_id} has a partial core index. Run '{state.get('repair_hint') or f'codespine repair {project_id}'}'.",
+            }
+        )
+    elif project_state == "degraded":
+        anomalies.append(
+            {
+                "severity": "warning",
+                "code": "deep_enrichment_failed",
+                "message": state.get("last_error") or f"{project_id} needs deep-enrichment repair.",
+            }
+        )
+    elif project_state == "repair_required":
+        repair_message = state.get("last_error") or f"{project_id} has no valid published snapshot."
+        anomalies.append(
+            {
+                "severity": "critical",
+                "code": "repair_required",
+                "message": repair_message,
+            }
+        )
     return {
         "project_id": project_id,
         "files": files,
@@ -67,33 +109,48 @@ def project_health(store, project_id: str) -> dict[str, Any]:
         "calls": calls,
         "methods_with_outgoing_calls": methods_with_outgoing,
         "call_edge_coverage": round(coverage, 4),
+        "project_state": project_state,
+        "core_state": state.get("core_state"),
+        "deep_state": state.get("deep_state"),
+        "last_error": state.get("last_error"),
+        "repair_hint": state.get("repair_hint"),
+        "snapshot_valid": snapshot.get("snapshot_valid"),
+        "write_db_valid": snapshot.get("write_db_valid"),
         "anomalies": anomalies,
     }
 
 
 def index_health(store) -> dict[str, Any]:
     """Return project health plus aggregate anomaly counts."""
+    state_by_id = {item.get("project_id"): item for item in list_project_states() if item.get("project_id")}
     try:
         projects = store.list_project_metadata()
     except AttributeError:
         projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path")
+    meta_by_id = {item.get("id"): item for item in projects if item.get("id")}
+    project_ids = sorted({pid for pid in list(meta_by_id) + list(state_by_id) if pid})
     per_project = []
-    for project in projects:
-        pid = project.get("id")
-        if not pid:
-            continue
+    for pid in project_ids:
+        project = meta_by_id.get(pid, {})
+        state = state_by_id.get(pid) or synthetic_project_state(pid, path=project.get("path", ""))
+        snap = snapshot_info(pid, store.router if hasattr(store, "router") else None)
         project_store = store.shard(pid) if hasattr(store, "shard") else store
-        item = project_health(project_store, pid)
-        item["path"] = project.get("path")
-        item["shard"] = store.router.shard_for(pid) if hasattr(store, "router") else None
+        item = project_health(project_store, pid, state=state, snapshot=snap)
+        item["path"] = state.get("path") or project.get("path")
+        item["shard"] = snap.get("shard") if snap.get("shard") is not None else (store.router.shard_for(pid) if hasattr(store, "router") else None)
         per_project.append(item)
     anomalies = [a for p in per_project for a in p.get("anomalies", [])]
+    state_counts: dict[str, int] = {}
+    for project in per_project:
+        state = str(project.get("project_state") or "unknown")
+        state_counts[state] = state_counts.get(state, 0) + 1
     return {
         "projects": per_project,
         "summary": {
             "project_count": len(per_project),
             "anomaly_count": len(anomalies),
             "critical_count": sum(1 for a in anomalies if a.get("severity") == "critical"),
+            "state_counts": state_counts,
         },
     }
 
@@ -106,6 +163,7 @@ def smoke_test_index(store) -> dict[str, Any]:
         ("contains_lower_rhs", "MATCH (s:Symbol) WHERE lower(s.name) CONTAINS lower($q) RETURN count(s) as n", {"q": "x"}),
         ("method_project_scope", "MATCH (m:Method) WHERE m.project_id = $pid RETURN count(m) as n", {"pid": "__none__"}),
         ("edge_count", "MATCH ()-[r]->() RETURN count(r) as n", {}),
+        ("limit_param", "MATCH (m:Method) RETURN m.id as id LIMIT $lim", {"lim": 1}),
     ]
     results: list[dict[str, Any]] = []
     for name, query, params in checks:
@@ -120,4 +178,3 @@ def smoke_test_index(store) -> dict[str, Any]:
         "checks": results,
         "failed_count": len(failed),
     }
-

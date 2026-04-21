@@ -67,14 +67,26 @@ def _refresh_liveness(task: dict[str, Any], now: float) -> dict[str, Any]:
     if not alive:
         task = dict(task)
         task["status"] = "failed"
-        task["phase"] = "lost"
+        task["result_status"] = "failed"
+        task["last_phase"] = task.get("last_phase") or task.get("phase") or "running"
         task["detail"] = "Process is no longer running and did not mark completion."
+        task["repair_hint"] = task.get("repair_hint") or "codespine background --all"
         task["finished_at"] = now
         task["updated_at"] = now
     return task
 
 
-def create_task(kind: str, label: str, path: str | None = None, metadata: dict[str, Any] | None = None) -> str:
+def create_task(
+    kind: str,
+    label: str,
+    path: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    *,
+    project_id: str | None = None,
+    retry_of: str | None = None,
+    attempt: int = 1,
+    repair_hint: str | None = None,
+) -> str:
     data = _load_raw()
     now = _now()
     task_id = uuid.uuid4().hex[:12]
@@ -84,11 +96,17 @@ def create_task(kind: str, label: str, path: str | None = None, metadata: dict[s
             "kind": kind,
             "label": label,
             "path": path,
+            "project_id": project_id,
             "status": "queued",
             "phase": "queued",
+            "last_phase": "queued",
+            "result_status": None,
             "detail": "",
             "progress": None,
             "pid": None,
+            "repair_hint": repair_hint,
+            "retry_of": retry_of,
+            "attempt": max(1, int(attempt)),
             "metadata": metadata or {},
             "started_at": now,
             "updated_at": now,
@@ -104,20 +122,34 @@ def update_task(task_id: str, **fields: Any) -> None:
     now = _now()
     for task in data["tasks"]:
         if task.get("id") == task_id:
+            if "phase" in fields and fields["phase"]:
+                fields["last_phase"] = fields["phase"]
+            if "status" in fields and fields["status"] in TERMINAL_STATUSES:
+                fields.setdefault("result_status", fields["status"])
             task.update(fields)
             task["updated_at"] = now
             break
     _save_raw(data)
 
 
-def finish_task(task_id: str, status: str = "succeeded", detail: str | None = None) -> None:
+def finish_task(
+    task_id: str,
+    status: str = "succeeded",
+    detail: str | None = None,
+    *,
+    repair_hint: str | None = None,
+) -> None:
     fields: dict[str, Any] = {
         "status": status,
-        "phase": status,
+        "result_status": status,
         "finished_at": _now(),
     }
+    if status == "succeeded":
+        fields["progress"] = 1.0
     if detail is not None:
         fields["detail"] = detail
+    if repair_hint is not None:
+        fields["repair_hint"] = repair_hint
     update_task(task_id, **fields)
 
 
@@ -134,4 +166,3 @@ def list_tasks(include_finished: bool = True, limit: int = 20) -> list[dict[str,
 
 def active_tasks(limit: int = 20) -> list[dict[str, Any]]:
     return list_tasks(include_finished=False, limit=limit)
-

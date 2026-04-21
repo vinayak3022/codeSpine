@@ -52,6 +52,20 @@ def _remove_path(path: str) -> None:
         LOGGER.warning("Could not remove %s: %s", path, exc)
 
 
+def is_valid_duckdb_database_path(path: str) -> bool:
+    """Return True when *path* is a readable DuckDB database file."""
+    if not os.path.exists(path) or os.path.islink(path):
+        return False
+    if os.path.isdir(path):
+        return False
+    try:
+        probe = duckdb.connect(path, read_only=True)
+        probe.close()
+        return True
+    except Exception:
+        return False
+
+
 def _sanitize_db_path(path: str) -> None:
     """Ensure *path* is either absent or a valid DuckDB database file.
 
@@ -263,12 +277,22 @@ class DuckDBStore:
         # real open so we never hit a mid-fallback failure mode.
         # ----------------------------------------------------------------
         os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-        for p in (self._db_path, self._snapshot_path):
-            _sanitize_db_path(p)
-
-        # After sanitize, pick the file we actually open.
-        snap_exists = os.path.exists(self._snapshot_path)
-        db_file = self._snapshot_path if read_only and snap_exists else self._db_path
+        if read_only:
+            db_file = self._db_path
+            if is_valid_duckdb_database_path(self._snapshot_path):
+                db_file = self._snapshot_path
+            elif is_valid_duckdb_database_path(self._db_path):
+                db_file = self._db_path
+            else:
+                LOGGER.warning(
+                    "No valid DuckDB snapshot for %s; read-only commands will use an empty view until repair.",
+                    self._snapshot_path if os.path.exists(self._snapshot_path) else self._db_path,
+                )
+                db_file = "__codespine_missing_readonly__"
+        else:
+            for p in (self._db_path, self._snapshot_path):
+                _sanitize_db_path(p)
+            db_file = self._db_path
 
         # Read-only open with nothing on disk → in-memory empty DB so queries
         # return [] cleanly instead of "database does not exist".
@@ -951,14 +975,19 @@ class DuckDBStore:
             if os.path.exists(tmp):
                 os.remove(tmp)
             shutil.copy2(src, tmp)
-            if os.path.exists(dst):
-                os.remove(dst)
-            os.rename(tmp, dst)
+            if not is_valid_duckdb_database_path(tmp):
+                raise RuntimeError(f"temporary snapshot validation failed for {tmp}")
+            os.replace(tmp, dst)
             with open(dst + ".updated", "w") as f:
                 f.write(str(int(time.time())))
             return True
         except Exception as exc:
             LOGGER.warning("DuckDB snapshot failed: %s", exc)
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             return False
 
     # ------------------------------------------------------------------

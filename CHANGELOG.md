@@ -7,6 +7,24 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [1.0.12] - 2026-04-21
+
+### Added
+
+- Added a durable per-project state sidecar so CLI, MCP, and the local UI can agree on whether a project is `ready`, `enriching`, `partial`, `degraded`, or `repair_required`.
+- Added `codespine repair <project-id-or-path> [--full]` plus UI repair/reindex actions and a `POST /api/repair` endpoint for recoverable failures.
+
+### Changed
+
+- `codespine analyse` is now trust-first by default: it completes and validates the core graph before returning, then runs deep enrichment in the background unless `--complete --deep` is used.
+- Background task records now preserve the last real phase, terminal result, repair hints, and 100% completion on success.
+
+### Fixed
+
+- Hardened DuckDB snapshot publishing so read-only opens never delete the active replica, temporary copies are validated before promotion, and the last good snapshot is retained on failure.
+- Fixed Cypher clause splitting so named parameters like `$limit` are no longer parsed as top-level `LIMIT` clauses.
+- Added real DuckDB-backed dead-code regression coverage for multiline `LIMIT $...` queries.
+
 ## [1.0.11] - 2026-04-20
 
 ### Changed

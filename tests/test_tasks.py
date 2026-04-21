@@ -19,6 +19,9 @@ def test_task_registry_tracks_running_and_finished_tasks():
     recent = list_tasks(include_finished=True)
     assert recent[0]["id"] == task_id
     assert recent[0]["status"] == "succeeded"
+    assert recent[0]["result_status"] == "succeeded"
+    assert recent[0]["last_phase"] == "community detection"
+    assert recent[0]["progress"] == 1.0
     assert recent[0]["detail"] == "done"
 
 
@@ -44,3 +47,15 @@ def test_background_command_shows_recent_finished_tasks_by_default():
     assert task_id in result.output
     assert "failed" in result.output
     assert "boom" in result.output
+
+
+def test_failed_task_preserves_last_phase_and_hint():
+    task_id = create_task("repair", "Repair", path="/tmp/project", repair_hint="codespine repair /tmp/project")
+    update_task(task_id, status="running", phase="dead code", pid=None, progress=0.75)
+    finish_task(task_id, "failed", "parser blew up", repair_hint="codespine repair /tmp/project")
+
+    recent = list_tasks(include_finished=True)
+
+    assert recent[0]["last_phase"] == "dead code"
+    assert recent[0]["result_status"] == "failed"
+    assert recent[0]["repair_hint"] == "codespine repair /tmp/project"

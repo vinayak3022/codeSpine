@@ -220,6 +220,22 @@ def test_limit_param():
     assert "LIMIT $lim" in sql
 
 
+def test_limit_named_limit_param_not_split():
+    sql = _translate("MATCH (n:Method) RETURN n.id LIMIT $limit")
+    assert "LIMIT $limit" in sql
+
+
+def test_multiline_limit_named_limit_param_not_split():
+    sql = _translate(
+        """
+        MATCH (m:Method)
+        RETURN m.id
+        LIMIT $limit
+        """
+    )
+    assert "LIMIT $limit" in sql
+
+
 # ---------------------------------------------------------------------------
 # WITH … ORDER BY (Kuzu paging construct)
 # ---------------------------------------------------------------------------

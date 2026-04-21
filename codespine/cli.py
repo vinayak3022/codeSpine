@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 import click
 import psutil
+from click.core import ParameterSource
 
 from codespine.analysis.community import detect_communities, symbol_community
 from codespine.analysis.context import build_symbol_context
@@ -31,6 +32,16 @@ from codespine.diff.branch_diff import compare_branches
 from codespine.health import index_health, project_health, smoke_test_index
 from codespine.indexer.engine import JavaIndexer
 from codespine.mcp.server import build_mcp_server
+from codespine.project_state import (
+    derive_project_status,
+    list_project_states,
+    load_project_state,
+    record_snapshot_success,
+    repair_hint_for,
+    snapshot_info,
+    synthetic_project_state,
+    update_project_state,
+)
 from codespine.search.hybrid import hybrid_search
 from codespine.tasks import active_tasks, create_task, finish_task, list_tasks, update_task
 from codespine.watch.watcher import clear_overlay, get_overlay_status, promote_overlay, run_watch_mode
@@ -72,13 +83,110 @@ def _open_store(read_only: bool = True) -> ShardedGraphStore:
     return ShardedGraphStore(read_only=read_only)
 
 
-def _spawn_background_enrichment(path: str) -> bool:
+def _discover_modules(abs_path: str) -> tuple[list[str], list[tuple[str, str]], bool]:
+    project_roots = JavaIndexer.detect_projects_in_workspace(abs_path)
+    is_workspace = not (len(project_roots) == 1 and project_roots[0] == abs_path)
+    modules_with_ids: list[tuple[str, str]] = []
+    for proj_root in project_roots:
+        proj_name = os.path.basename(proj_root)
+        module_dirs = JavaIndexer.detect_modules(proj_root)
+        is_multi_module = not (len(module_dirs) == 1 and module_dirs[0] == proj_root)
+        if is_multi_module:
+            for module_path in module_dirs:
+                modules_with_ids.append((module_path, f"{proj_name}::{os.path.basename(module_path)}"))
+        else:
+            modules_with_ids.append((proj_root, proj_name))
+    return project_roots, modules_with_ids, is_workspace
+
+
+def _set_project_states(modules_with_ids: list[tuple[str, str]], **fields: object) -> None:
+    for module_path, project_id in modules_with_ids:
+        update_project_state(project_id, path=module_path, **fields)
+
+
+def _record_snapshot_for_projects(modules_with_ids: list[tuple[str, str]]) -> None:
+    for module_path, project_id in modules_with_ids:
+        update_project_state(project_id, path=module_path)
+        record_snapshot_success(project_id)
+
+
+def _resolve_repair_target(target: str) -> tuple[str, list[tuple[str, str]], dict[str, object]]:
+    if os.path.exists(target):
+        abs_path = os.path.abspath(target)
+        _, modules_with_ids, _ = _discover_modules(abs_path)
+        states = [load_project_state(pid) for _, pid in modules_with_ids]
+        primary = states[0] if states else {}
+        return abs_path, modules_with_ids, primary
+
+    for state in list_project_states():
+        if state.get("project_id") == target:
+            path = str(state.get("path") or "")
+            if not path:
+                raise click.ClickException(f"Project '{target}' has no recorded path; run a full re-index.")
+            abs_path = os.path.abspath(path)
+            _, modules_with_ids, _ = _discover_modules(abs_path) if os.path.exists(abs_path) else ([abs_path], [(abs_path, target)], False)
+            return abs_path, modules_with_ids, state
+
+    abs_target = os.path.abspath(target)
+    for state in list_project_states():
+        if os.path.abspath(str(state.get("path") or "")) == abs_target:
+            _, modules_with_ids, _ = _discover_modules(abs_target) if os.path.exists(abs_target) else ([abs_target], [(abs_target, str(state.get("project_id") or os.path.basename(abs_target)))], False)
+            return abs_target, modules_with_ids, state
+
+    raise click.ClickException(f"Could not resolve '{target}' to an indexed project or path.")
+
+
+def _start_repair(target: str, force_full: bool = False) -> dict[str, object]:
+    abs_path, modules_with_ids, primary_state = _resolve_repair_target(target)
+    state = primary_state or (load_project_state(modules_with_ids[0][1]) if modules_with_ids else {})
+    snap = snapshot_info(modules_with_ids[0][1]) if modules_with_ids else {}
+    project_status = derive_project_status(state, snap)
+
+    if force_full or project_status == "repair_required":
+        task_id = _spawn_background_full_repair(abs_path)
+        mode = "full"
+    elif project_status == "partial":
+        task_id = _spawn_background_continuation(abs_path, trigger="repair-core")
+        mode = "core"
+    elif project_status == "degraded":
+        task_id = _spawn_background_enrichment(abs_path, trigger="repair-deep")
+        mode = "deep"
+    elif project_status == "enriching":
+        return {
+            "ok": True,
+            "status": project_status,
+            "path": abs_path,
+            "note": "Deep enrichment is already running.",
+        }
+    else:
+        return {
+            "ok": True,
+            "status": project_status,
+            "path": abs_path,
+            "note": "Project is already healthy.",
+        }
+
+    if task_id is None:
+        raise click.ClickException("Unable to start repair task.")
+    return {
+        "ok": True,
+        "mode": mode,
+        "path": abs_path,
+        "task_id": task_id,
+        "project_ids": [pid for _, pid in modules_with_ids],
+    }
+
+
+def _spawn_background_enrichment(path: str, *, trigger: str = "analyse") -> str | None:
     """Publish the fast index, then enrich it in a detached process."""
+    _, modules_with_ids, _ = _discover_modules(os.path.abspath(path))
+    project_id = modules_with_ids[0][1] if len(modules_with_ids) == 1 else None
     task_id = create_task(
         "enrichment",
         "Background graph enrichment",
         path=path,
-        metadata={"trigger": "analyse-fast"},
+        project_id=project_id,
+        metadata={"trigger": trigger},
     )
     try:
         proc = subprocess.Popen(
@@ -91,20 +199,30 @@ def _spawn_background_enrichment(path: str) -> bool:
             env=os.environ.copy(),
         )
         update_task(task_id, status="running", phase="spawned", pid=proc.pid)
-        return True
+        _set_project_states(
+            modules_with_ids,
+            deep_state="running",
+            last_task_id=task_id,
+            repair_hint="",
+            last_error="",
+        )
+        return task_id
     except Exception as exc:  # noqa: BLE001
         finish_task(task_id, "failed", str(exc))
         LOGGER.warning("Unable to spawn background enrichment: %s", exc)
-        return False
+        return None
 
 
-def _spawn_background_continuation(path: str) -> bool:
+def _spawn_background_continuation(path: str, *, trigger: str = "analyse-budget") -> str | None:
     """Continue a budget-paused core index in a detached process."""
+    _, modules_with_ids, _ = _discover_modules(os.path.abspath(path))
+    project_id = modules_with_ids[0][1] if len(modules_with_ids) == 1 else None
     task_id = create_task(
         "indexing",
         "Background core indexing",
         path=path,
-        metadata={"trigger": "analyse-budget"},
+        project_id=project_id,
+        metadata={"trigger": trigger},
     )
     try:
         proc = subprocess.Popen(
@@ -117,11 +235,55 @@ def _spawn_background_continuation(path: str) -> bool:
             env=os.environ.copy(),
         )
         update_task(task_id, status="running", phase="spawned", pid=proc.pid)
-        return True
+        _set_project_states(
+            modules_with_ids,
+            core_state="indexing",
+            last_task_id=task_id,
+            repair_hint="",
+        )
+        return task_id
     except Exception as exc:  # noqa: BLE001
         finish_task(task_id, "failed", str(exc))
         LOGGER.warning("Unable to spawn background continuation: %s", exc)
-        return False
+        return None
+
+
+def _spawn_background_full_repair(path: str) -> str | None:
+    abs_path = os.path.abspath(path)
+    _, modules_with_ids, _ = _discover_modules(abs_path)
+    project_id = modules_with_ids[0][1] if len(modules_with_ids) == 1 else None
+    task_id = create_task(
+        "repair",
+        "Background full repair",
+        path=abs_path,
+        project_id=project_id,
+        metadata={"trigger": "repair", "mode": "full"},
+        repair_hint=repair_hint_for(path=abs_path, full=True),
+    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "codespine.cli", "repair-background", abs_path, "--mode", "full", "--task-id", task_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+        )
+        update_task(task_id, status="running", phase="spawned", pid=proc.pid)
+        _set_project_states(
+            modules_with_ids,
+            core_state="indexing",
+            deep_state="queued",
+            last_task_id=task_id,
+            repair_hint="",
+            last_error="",
+        )
+        return task_id
+    except Exception as exc:  # noqa: BLE001
+        finish_task(task_id, "failed", str(exc), repair_hint=repair_hint_for(path=abs_path, full=True))
+        LOGGER.warning("Unable to spawn background full repair: %s", exc)
+        return None
 
 
 def _db_size_bytes(path: str) -> int:
@@ -552,12 +714,17 @@ def main() -> None:
 @main.command()
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--full/--incremental", default=False, show_default=True)
-@click.option("--deep/--no-deep", default=False, show_default=True, help="Run expensive global analyses when used with --complete.")
 @click.option(
-    "--fast/--complete",
+    "--deep/--no-deep",
     default=True,
     show_default=True,
-    help="Fast mode returns after the core index is queryable; complete mode runs enrichment in the foreground.",
+    help="Enable expensive global analyses. By default they continue in the background after the core graph is ready; pass --complete --deep to wait for them.",
+)
+@click.option(
+    "--fast/--complete",
+    default=False,
+    show_default=True,
+    help="Fast mode allows a budgeted partial core index; complete mode waits for the full core graph to be validated before returning.",
 )
 @click.option(
     "--budget",
@@ -565,7 +732,7 @@ def main() -> None:
     default=90.0,
     show_default=True,
     type=float,
-    help="Foreground time budget in seconds for fast mode; use 0 to disable the resolver deadline.",
+    help="Foreground time budget in seconds for fast mode; use 0 to disable the budget.",
 )
 @click.option(
     "--incremental-deep",
@@ -580,7 +747,9 @@ def main() -> None:
     help="Generate vector embeddings. Off by default so analyse stays fast; rerun with --embed when semantic vectors are needed.",
 )
 @click.option("--allow-running", is_flag=True, hidden=True, help="Skip MCP running check (used by MCP analyse_project tool).")
+@click.pass_context
 def analyse(
+    ctx: click.Context,
     path: str,
     full: bool,
     deep: bool,
@@ -592,8 +761,10 @@ def analyse(
 ) -> None:
     """Index a local Java project (auto-detects workspace / Maven / Gradle layout).
 
-    Fast mode indexes the core Java graph and returns quickly. Use --complete
-    for foreground communities, flows, dead-code, and git-coupling enrichment.
+    By default CodeSpine completes the core graph in the foreground, publishes
+    a validated read replica, and continues deep enrichment in the background.
+    Use --fast for a budgeted partial core index, or --complete --deep to wait
+    for deep enrichment before returning.
     """
     if not allow_running and _is_running():
         click.secho("Stop MCP first ('codespine stop') to index.", fg="yellow")
@@ -601,10 +772,12 @@ def analyse(
 
     started = time.perf_counter()
     abs_path = os.path.abspath(path)
-
-    if fast and (deep or incremental_deep):
+    deep_explicit = ctx.get_parameter_source("deep") != ParameterSource.DEFAULT
+    deep_enabled = bool(deep or incremental_deep)
+    wait_for_deep = (not fast) and deep_enabled and deep_explicit
+    if fast and deep_enabled:
         click.secho(
-            "Fast mode runs deep analysis in the background. Use --complete --deep to wait for it.",
+            "Fast mode may return a partial core graph. Deep analysis will wait for core completion and continue in the background.",
             fg="yellow",
         )
 
@@ -649,6 +822,14 @@ def analyse(
         )
         try:
             sg.snapshot_all(background=False)
+            _record_snapshot_for_projects(modules_with_ids)
+            _set_project_states(
+                modules_with_ids,
+                core_state="partial",
+                deep_state="queued" if deep_enabled else "idle",
+                last_error="Indexing was interrupted before the core graph completed.",
+                repair_hint=repair_hint_for(path=abs_path),
+            )
             click.secho(
                 "✓ Partial index saved. Run 'codespine stats' to see what was indexed.",
                 fg="yellow",
@@ -664,8 +845,7 @@ def analyse(
 
     # --- Workspace → project → module detection ---
     # Level 1: workspace (e.g. ~/IdeaProjects/) may contain independent projects.
-    project_roots = JavaIndexer.detect_projects_in_workspace(abs_path)
-    is_workspace = not (len(project_roots) == 1 and project_roots[0] == abs_path)
+    project_roots, modules_with_ids, is_workspace = _discover_modules(abs_path)
     if is_workspace:
         click.secho(
             f"Detected workspace with {len(project_roots)} projects in {abs_path}: "
@@ -673,9 +853,6 @@ def analyse(
             fg="cyan",
         )
 
-    # Level 2: each project may be multi-module (Maven/Gradle).
-    # Build a flat list of (module_path, project_id) tuples.
-    modules_with_ids: list[tuple[str, str]] = []
     for proj_root in project_roots:
         proj_name = os.path.basename(proj_root)
         module_dirs = JavaIndexer.detect_modules(proj_root)
@@ -686,12 +863,16 @@ def analyse(
                 f"  {proj_name}: {len(module_dirs)} modules – {module_names}",
                 fg="cyan",
             )
-            for m in module_dirs:
-                modules_with_ids.append((m, f"{proj_name}::{os.path.basename(m)}"))
-        else:
-            modules_with_ids.append((proj_root, proj_name))
+            
 
     root_basename = os.path.basename(abs_path)
+    _set_project_states(
+        modules_with_ids,
+        core_state="indexing",
+        deep_state="queued" if deep_enabled else "idle",
+        last_error="",
+        repair_hint="",
+    )
 
     # ── Group modules by target shard ─────────────────────────────────
     # Modules that hash to different shards own separate KùzuDBs and can
@@ -790,73 +971,65 @@ def analyse(
     flows: list[dict] = []
     dead: list[dict] = []
     coupling_pairs: list[dict] = []
+    deep_error: Exception | None = None
 
-    should_run_deep = (not fast) and (deep or incremental_deep or total_files_found <= 3000)
+    should_run_deep = wait_for_deep
     if should_run_deep:
-        comm_label = "Detecting communities..."
-        _live_phase(comm_label, "running")
-        communities = detect_communities(
-            root_shard_store,
-            progress=lambda s: _live_phase(comm_label, s),
-        )
-        _finish_phase(comm_label, f"{len(communities)} clusters found")
+        try:
+            comm_label = "Detecting communities..."
+            _live_phase(comm_label, "running")
+            communities = detect_communities(
+                root_shard_store,
+                progress=lambda s: _live_phase(comm_label, s),
+            )
+            _finish_phase(comm_label, f"{len(communities)} clusters found")
 
-        flow_label = "Detecting execution flows..."
-        _live_phase(flow_label, "running")
-        flows = trace_execution_flows(
-            root_shard_store,
-            progress=lambda s: _live_phase(flow_label, s),
-        )
-        _finish_phase(flow_label, f"{len(flows)} processes found")
+            flow_label = "Detecting execution flows..."
+            _live_phase(flow_label, "running")
+            flows = trace_execution_flows(
+                root_shard_store,
+                progress=lambda s: _live_phase(flow_label, s),
+            )
+            _finish_phase(flow_label, f"{len(flows)} processes found")
 
-        dead_label = "Finding dead code..."
-        _live_phase(dead_label, "running")
-        dead = detect_dead_code(root_shard_store, limit=500)
-        _finish_phase(dead_label, f"{_dead_result_count(dead)} unreachable symbols")
+            dead_label = "Finding dead code..."
+            _live_phase(dead_label, "running")
+            dead = detect_dead_code(root_shard_store, limit=500)
+            _finish_phase(dead_label, f"{_dead_result_count(dead)} unreachable symbols")
 
-        coup_label = "Analyzing git history..."
-        _live_phase(coup_label, "running")
-        root_shard_store.clear_coupling()
-        coupling_root = abs_path
-        coupling_project = root_basename if is_multi else (last_result.project_id if last_result else root_basename)
-        coupling_pairs = compute_coupling(
-            root_shard_store,
-            coupling_root,
-            coupling_project,
-            days=SETTINGS.default_coupling_days,
-            min_strength=SETTINGS.default_min_coupling_strength,
-            min_cochanges=SETTINGS.default_min_cochanges,
-            progress=lambda s: _live_phase(coup_label, s),
-        )
-        _finish_phase(coup_label, f"{len(coupling_pairs)} coupled file pairs")
-    elif fast:
+            coup_label = "Analyzing git history..."
+            _live_phase(coup_label, "running")
+            root_shard_store.clear_coupling()
+            coupling_root = abs_path
+            coupling_project = root_basename if is_multi else (last_result.project_id if last_result else root_basename)
+            coupling_pairs = compute_coupling(
+                root_shard_store,
+                coupling_root,
+                coupling_project,
+                days=SETTINGS.default_coupling_days,
+                min_strength=SETTINGS.default_min_coupling_strength,
+                min_cochanges=SETTINGS.default_min_cochanges,
+                progress=lambda s: _live_phase(coup_label, s),
+            )
+            _finish_phase(coup_label, f"{len(coupling_pairs)} coupled file pairs")
+        except Exception as exc:  # noqa: BLE001
+            deep_error = exc
+            click.echo()
+            click.secho(
+                f"Deep enrichment...          failed ({str(exc)[:140]}); publishing the validated core graph and marking the project degraded.",
+                fg="yellow",
+            )
+            LOGGER.exception("Foreground deep enrichment failed for %s: %s", abs_path, exc)
+    elif deep_enabled:
         _phase("Detecting communities...", "queued in background")
         _phase("Detecting execution flows...", "queued in background")
         _phase("Finding dead code...", "queued in background")
         _phase("Analyzing git history...", "queued in background")
     else:
-        # Run lightweight versions of flow tracing and dead code from the call
-        # graph already built — no community detection or coupling (those are
-        # genuinely expensive).  This gives partial results without --deep.
-        _phase("Detecting communities...", "skipped (large repo; rerun with --deep)")
-
-        flow_label = "Detecting execution flows..."
-        _live_phase(flow_label, "running (lightweight)")
-        try:
-            flows = trace_execution_flows(root_shard_store, max_depth=3)
-        except Exception:
-            flows = []
-        _finish_phase(flow_label, f"{len(flows)} flows (lightweight; rerun with --deep for full)")
-
-        dead_label = "Finding dead code..."
-        _live_phase(dead_label, "running (lightweight)")
-        try:
-            dead = detect_dead_code(root_shard_store, limit=100)
-        except Exception:
-            dead = []
-        _finish_phase(dead_label, f"{_dead_result_count(dead)} candidates (lightweight; rerun with --deep for full)")
-
-        _phase("Analyzing git history...", "skipped (large repo; rerun with --deep)")
+        _phase("Detecting communities...", "disabled (--no-deep)")
+        _phase("Detecting execution flows...", "disabled (--no-deep)")
+        _phase("Finding dead code...", "disabled (--no-deep)")
+        _phase("Analyzing git history...", "disabled (--no-deep)")
 
     # Summary queries are best-effort: a translator miss or a transient
     # DB error must never throw away a successful index.
@@ -880,30 +1053,38 @@ def analyse(
 
     symbols = _safe_count("MATCH (s:Symbol) RETURN count(s) as count")
     edges = _safe_count("MATCH ()-[r]->() RETURN count(r) as count")
+    core_partial = any(bool(getattr(result, "partial", False)) for result in all_results)
 
-    self_test = smoke_test_index(root_shard_store)
-    if self_test.get("ok"):
-        _phase("Index self-test...", "passed")
+    if core_partial:
+        _phase("Index self-test...", "deferred (core index is partial)")
+        _phase("Index health...", "deferred (run 'codespine repair' after core completes)")
     else:
-        failed = [c.get("name", "unknown") for c in self_test.get("checks", []) if not c.get("ok")]
-        click.secho(f"Index self-test...          failed ({', '.join(failed)})", fg="yellow")
-
-    health_anomalies: list[dict] = []
-    try:
-        for _, pid in modules_with_ids:
-            health_anomalies.extend(project_health(sg.shard(pid), pid).get("anomalies", []))
-        critical = sum(1 for a in health_anomalies if a.get("severity") == "critical")
-        if critical:
+        self_test = smoke_test_index(root_shard_store)
+        if self_test.get("ok"):
+            _phase("Index self-test...", "passed")
+        else:
+            failed = [c.get("name", "unknown") for c in self_test.get("checks", []) if not c.get("ok")]
             click.secho(
-                f"Index health...             {critical} critical anomaly(s); run 'codespine health'",
+                f"Index self-test...          failed ({', '.join(failed)})",
                 fg="yellow",
             )
-        elif health_anomalies:
-            _phase("Index health...", f"{len(health_anomalies)} warning(s); run 'codespine health'")
-        else:
-            _phase("Index health...", "no anomalies")
-    except Exception as exc:  # noqa: BLE001 - post-index diagnostics are best-effort
-        click.secho(f"Index health...             unavailable ({exc})", fg="yellow")
+
+        health_anomalies: list[dict] = []
+        try:
+            for _, pid in modules_with_ids:
+                health_anomalies.extend(project_health(sg.shard(pid), pid).get("anomalies", []))
+            critical = sum(1 for a in health_anomalies if a.get("severity") == "critical")
+            if critical:
+                click.secho(
+                    f"Index health...             {critical} critical anomaly(s); run 'codespine health'",
+                    fg="yellow",
+                )
+            elif health_anomalies:
+                _phase("Index health...", f"{len(health_anomalies)} warning(s); run 'codespine health'")
+            else:
+                _phase("Index health...", "no anomalies")
+        except Exception as exc:  # noqa: BLE001 - post-index diagnostics are best-effort
+            click.secho(f"Index health...             unavailable ({exc})", fg="yellow")
 
     elapsed = time.perf_counter() - started
 
@@ -914,10 +1095,11 @@ def analyse(
     else:
         embed_note = ""
     module_info = f"{len(modules_with_ids)} modules/projects, " if is_multi else ""
+    outcome_prefix = "Partial core snapshot" if core_partial else "Done"
     click.echo()
     click.secho(
-        f"Done in {elapsed:.1f}s - {module_info}{symbols} symbols, {edges} edges, {len(communities)} clusters, {len(flows)} flows{embed_note}",
-        fg="green",
+        f"{outcome_prefix} in {elapsed:.1f}s - {module_info}{symbols} symbols, {edges} edges, {len(communities)} clusters, {len(flows)} flows{embed_note}",
+        fg="yellow" if core_partial else "green",
     )
 
     # Detect unresolved imports → hint about unindexed sibling projects.
@@ -942,21 +1124,47 @@ def analyse(
         recycle = getattr(store, "_recycle_conn", None)
         if callable(recycle):
             recycle()
-    core_partial = any(bool(getattr(result, "partial", False)) for result in all_results)
     if fast and core_partial:
         _live_phase(snap_label, "copying partial core")
         sg.snapshot_all(background=False)
         _finish_phase(snap_label, "partial index visible")
+        _record_snapshot_for_projects(modules_with_ids)
+        _set_project_states(
+            modules_with_ids,
+            core_state="partial",
+            deep_state="queued" if deep_enabled else "idle",
+            last_error="Foreground budget exhausted before the core graph completed.",
+            repair_hint=repair_hint_for(path=abs_path),
+        )
         if _spawn_background_continuation(abs_path):
             _phase("Background indexing...", "core indexing continues; run 'codespine background'")
         else:
             _phase("Background indexing...", "not started; rerun 'codespine analyse' to continue")
-    elif fast and _spawn_background_enrichment(abs_path):
-        _phase(snap_label, "core snapshot now; enrichment continues in background")
     else:
         _live_phase(snap_label, "copying")
         sg.snapshot_all(background=False)
         _finish_phase(snap_label, "MCP will reload automatically")
+        _record_snapshot_for_projects(modules_with_ids)
+        _set_project_states(
+            modules_with_ids,
+            core_state="ready",
+            deep_state="failed" if deep_error else ("ready" if should_run_deep else ("running" if deep_enabled else "idle")),
+            last_error=str(deep_error) if deep_error else "",
+            repair_hint=repair_hint_for(path=abs_path) if deep_error else "",
+        )
+        if deep_error:
+            _phase("Repair hint...", repair_hint_for(path=abs_path))
+        elif deep_enabled and not should_run_deep:
+            if _spawn_background_enrichment(abs_path):
+                _phase("Background enrichment...", "deep analysis continues; run 'codespine background'")
+            else:
+                _set_project_states(
+                    modules_with_ids,
+                    deep_state="failed",
+                    last_error="Unable to start background enrichment.",
+                    repair_hint=repair_hint_for(path=abs_path),
+                )
+                _phase("Background enrichment...", "not started; run 'codespine repair'")
 
     # Restore original SIGINT handler now that we've finished cleanly.
     signal.signal(signal.SIGINT, _old_sigint_handler)
@@ -976,32 +1184,35 @@ def enrich_background(path: str, task_id: str | None) -> None:
     """Run expensive post-index graph enrichment outside the analyse foreground."""
     abs_path = os.path.abspath(path)
     LOGGER.info("Background enrichment starting for %s", abs_path)
+    _, modules_with_ids, _ = _discover_modules(abs_path)
+    project_id = modules_with_ids[0][1] if len(modules_with_ids) == 1 else None
     if task_id is None:
-        task_id = create_task("enrichment", "Background graph enrichment", path=abs_path)
+        task_id = create_task(
+            "enrichment",
+            "Background graph enrichment",
+            path=abs_path,
+            project_id=project_id,
+        )
     update_task(
         task_id,
         status="running",
         phase="starting",
         pid=os.getpid(),
         detail="Preparing background enrichment",
+        project_id=project_id,
+    )
+    _set_project_states(
+        modules_with_ids,
+        deep_state="running",
+        last_task_id=task_id,
+        last_error="",
+        repair_hint="",
     )
 
     def _task_phase(phase: str, detail: str = "", progress: float | None = None) -> None:
         update_task(task_id, status="running", phase=phase, detail=detail, progress=progress)
         if detail:
             LOGGER.info("%s: %s", phase, detail)
-
-    project_roots = JavaIndexer.detect_projects_in_workspace(abs_path)
-    modules_with_ids: list[tuple[str, str]] = []
-    for proj_root in project_roots:
-        proj_name = os.path.basename(proj_root)
-        module_dirs = JavaIndexer.detect_modules(proj_root)
-        is_multi_module = not (len(module_dirs) == 1 and module_dirs[0] == proj_root)
-        if is_multi_module:
-            for m in module_dirs:
-                modules_with_ids.append((m, f"{proj_name}::{os.path.basename(m)}"))
-        else:
-            modules_with_ids.append((proj_root, proj_name))
 
     root_basename = os.path.basename(abs_path)
     root_project_id = modules_with_ids[-1][1] if modules_with_ids else root_basename
@@ -1016,6 +1227,7 @@ def enrich_background(path: str, task_id: str | None) -> None:
         # more expensive enrichment keeps working.
         _task_phase("publishing core snapshot", "Making the fast index visible", 0.05)
         sg.snapshot_all(background=False)
+        _record_snapshot_for_projects(modules_with_ids)
 
         if is_multi and len(xmod_pids) > 1:
             _task_phase("cross-module linking", "Linking calls across indexed modules", 0.20)
@@ -1060,10 +1272,42 @@ def enrich_background(path: str, task_id: str | None) -> None:
 
         _task_phase("publishing enriched snapshot", "Publishing enriched graph", 0.95)
         sg.snapshot_all(background=False)
+        _record_snapshot_for_projects(modules_with_ids)
+        _set_project_states(
+            modules_with_ids,
+            core_state="ready",
+            deep_state="ready",
+            last_error="",
+            repair_hint="",
+            last_task_id=task_id,
+        )
         finish_task(task_id, "succeeded", "Background enrichment complete")
         LOGGER.info("Background enrichment finished for %s", abs_path)
     except Exception as exc:  # noqa: BLE001
-        finish_task(task_id, "failed", str(exc))
+        repair_hint = repair_hint_for(path=abs_path)
+        has_core_snapshot = any(
+            bool(load_project_state(pid).get("last_good_snapshot_at")) or snapshot_info(pid).get("write_db_valid")
+            for _, pid in modules_with_ids
+        )
+        if has_core_snapshot:
+            _set_project_states(
+                modules_with_ids,
+                core_state="ready",
+                deep_state="failed",
+                last_error=str(exc),
+                repair_hint=repair_hint,
+                last_task_id=task_id,
+            )
+        else:
+            _set_project_states(
+                modules_with_ids,
+                core_state="repair_required",
+                deep_state="failed",
+                last_error=str(exc),
+                repair_hint=repair_hint,
+                last_task_id=task_id,
+            )
+        finish_task(task_id, "failed", str(exc), repair_hint=repair_hint)
         LOGGER.exception("Background enrichment failed for %s: %s", abs_path, exc)
         raise
 
@@ -1074,8 +1318,15 @@ def enrich_background(path: str, task_id: str | None) -> None:
 def continue_background(path: str, task_id: str | None) -> None:
     """Continue core indexing after a foreground budget pause."""
     abs_path = os.path.abspath(path)
+    _, modules_with_ids, _ = _discover_modules(abs_path)
+    project_id = modules_with_ids[0][1] if len(modules_with_ids) == 1 else None
     if task_id is None:
-        task_id = create_task("indexing", "Background core indexing", path=abs_path)
+        task_id = create_task(
+            "indexing",
+            "Background core indexing",
+            path=abs_path,
+            project_id=project_id,
+        )
     update_task(
         task_id,
         status="running",
@@ -1083,6 +1334,13 @@ def continue_background(path: str, task_id: str | None) -> None:
         pid=os.getpid(),
         progress=0.10,
         detail="Continuing analyse without the foreground budget",
+        project_id=project_id,
+    )
+    _set_project_states(
+        modules_with_ids,
+        core_state="indexing",
+        last_task_id=task_id,
+        repair_hint="",
     )
     try:
         with open(SETTINGS.log_file, "a", encoding="utf-8") as log:
@@ -1093,8 +1351,6 @@ def continue_background(path: str, task_id: str | None) -> None:
                     "codespine.cli",
                     "analyse",
                     abs_path,
-                    "--budget",
-                    "0",
                     "--allow-running",
                 ],
                 cwd=os.getcwd(),
@@ -1105,11 +1361,135 @@ def continue_background(path: str, task_id: str | None) -> None:
         if proc.returncode == 0:
             finish_task(task_id, "succeeded", "Background core indexing complete")
             return
-        finish_task(task_id, "failed", f"Background analyse exited with code {proc.returncode}")
+        repair_hint = repair_hint_for(path=abs_path)
+        next_state = "partial" if any(load_project_state(pid).get("last_good_snapshot_at") for _, pid in modules_with_ids) else "repair_required"
+        _set_project_states(
+            modules_with_ids,
+            core_state=next_state,
+            last_error=f"Background analyse exited with code {proc.returncode}",
+            repair_hint=repair_hint,
+            last_task_id=task_id,
+        )
+        finish_task(
+            task_id,
+            "failed",
+            f"Background analyse exited with code {proc.returncode}",
+            repair_hint=repair_hint,
+        )
         raise click.ClickException(f"Background analyse exited with code {proc.returncode}")
     except Exception as exc:  # noqa: BLE001
-        finish_task(task_id, "failed", str(exc))
+        repair_hint = repair_hint_for(path=abs_path)
+        next_state = "partial" if any(load_project_state(pid).get("last_good_snapshot_at") for _, pid in modules_with_ids) else "repair_required"
+        _set_project_states(
+            modules_with_ids,
+            core_state=next_state,
+            last_error=str(exc),
+            repair_hint=repair_hint,
+            last_task_id=task_id,
+        )
+        finish_task(task_id, "failed", str(exc), repair_hint=repair_hint)
         raise
+
+
+@main.command("repair-background", hidden=True)
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--mode", type=click.Choice(["full"]), default="full", hidden=True)
+@click.option("--task-id", default=None, hidden=True)
+def repair_background(path: str, mode: str, task_id: str | None) -> None:
+    """Run a full repair in the background."""
+    abs_path = os.path.abspath(path)
+    _, modules_with_ids, _ = _discover_modules(abs_path)
+    project_id = modules_with_ids[0][1] if len(modules_with_ids) == 1 else None
+    repair_hint = repair_hint_for(path=abs_path, full=True)
+    if task_id is None:
+        task_id = create_task(
+            "repair",
+            "Background full repair",
+            path=abs_path,
+            project_id=project_id,
+            repair_hint=repair_hint,
+        )
+    update_task(
+        task_id,
+        status="running",
+        phase="full repair",
+        pid=os.getpid(),
+        progress=0.10,
+        detail="Rebuilding the core graph and republishing a validated snapshot",
+        project_id=project_id,
+    )
+    _set_project_states(
+        modules_with_ids,
+        core_state="indexing",
+        deep_state="queued",
+        last_task_id=task_id,
+        repair_hint="",
+        last_error="",
+    )
+    try:
+        with open(SETTINGS.log_file, "a", encoding="utf-8") as log:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "codespine.cli",
+                    "analyse",
+                    abs_path,
+                    "--full",
+                    "--allow-running",
+                ],
+                cwd=os.getcwd(),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if proc.returncode == 0:
+            finish_task(task_id, "succeeded", "Background full repair complete")
+            return
+        _set_project_states(
+            modules_with_ids,
+            core_state="repair_required",
+            deep_state="failed",
+            last_task_id=task_id,
+            last_error=f"Background full repair exited with code {proc.returncode}",
+            repair_hint=repair_hint,
+        )
+        finish_task(
+            task_id,
+            "failed",
+            f"Background full repair exited with code {proc.returncode}",
+            repair_hint=repair_hint,
+        )
+        raise click.ClickException(f"Background full repair exited with code {proc.returncode}")
+    except Exception as exc:  # noqa: BLE001
+        _set_project_states(
+            modules_with_ids,
+            core_state="repair_required",
+            deep_state="failed",
+            last_task_id=task_id,
+            last_error=str(exc),
+            repair_hint=repair_hint,
+        )
+        finish_task(task_id, "failed", str(exc), repair_hint=repair_hint)
+        raise
+
+
+@main.command("repair")
+@click.argument("target")
+@click.option("--full", "force_full", is_flag=True, help="Force a full core re-index instead of retrying only the failed phase.")
+@click.option("--json", "as_json", is_flag=True)
+def repair_cmd(target: str, force_full: bool, as_json: bool) -> None:
+    """Repair a degraded, partial, or missing project snapshot."""
+    payload = _start_repair(target, force_full=force_full)
+    if as_json:
+        _echo_json(payload, True)
+        return
+    if payload.get("task_id"):
+        click.secho(f"Started {payload.get('mode')} repair for {payload.get('path')}", fg="green")
+        click.echo(f"Task: {payload.get('task_id')}")
+        click.echo("Use 'codespine background' to watch progress.")
+    else:
+        click.echo(str(payload.get("note") or payload.get("status") or "No repair needed."))
 
 
 @main.command()
@@ -1245,105 +1625,38 @@ def stats(as_json: bool, show_shards: bool) -> None:
     if show_shards:
         _show_shard_topology(as_json)
         return
-
-    # Fan-out across all shards so stats covers every project in the cluster.
-    sg = ShardedGraphStore(read_only=True)
-    all_projects_meta = sg.list_project_metadata()
-
-    # For detailed stats we need the per-project shard store.
-    def _project_store(pid: str):
-        return sg.shard(pid)
-
-    if not all_projects_meta:
+    summaries = _project_summaries()
+    if not summaries:
         click.secho("No projects indexed yet. Run 'codespine analyse <path>'.", fg="yellow")
         return
 
-    def _stat_count(store, query: str, params: dict) -> int:
-        """Run a stats count query — returns 0 on any failure."""
-        try:
-            rows = store.query_records(query, params)
-            return int(rows[0]["n"]) if rows else 0
-        except Exception as exc:  # noqa: BLE001
-            click.secho(f"   (stat unavailable: {exc})", fg="yellow")
-            return 0
-
-    rows = []
-    for p in all_projects_meta:
-        pid = p["id"]
-        # Route each query to the project's owning shard.
-        ps = _project_store(pid)
-        n_files = _stat_count(
-            ps,
-            "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n",
-            {"pid": pid},
-        )
-        n_classes = _stat_count(
-            ps,
-            """
-            MATCH (f:File) WHERE f.project_id = $pid
-            WITH f
-            MATCH (c:Class) WHERE c.file_id = f.id
-            RETURN count(c) as n
-            """,
-            {"pid": pid},
-        )
-        n_methods = _stat_count(
-            ps,
-            """
-            MATCH (f:File) WHERE f.project_id = $pid
-            WITH f
-            MATCH (c:Class) WHERE c.file_id = f.id
-            WITH c
-            MATCH (c)-[:HAS_METHOD]->(m:Method)
-            RETURN count(m) as n
-            """,
-            {"pid": pid},
-        )
-        n_calls = _stat_count(
-            ps,
-            """
-            MATCH (f:File) WHERE f.project_id = $pid
-            WITH f
-            MATCH (c:Class) WHERE c.file_id = f.id
-            WITH c
-            MATCH (c)-[:HAS_METHOD]->(m:Method)-[:CALLS]->()
-            RETURN count(*) as n
-            """,
-            {"pid": pid},
-        )
-        n_emb = _stat_count(
-            ps,
-            """
-            MATCH (f:File) WHERE f.project_id = $pid
-            WITH f
-            MATCH (s:Symbol) WHERE s.file_id = f.id AND s.embedding IS NOT NULL
-            RETURN count(s) as n
-            """,
-            {"pid": pid},
-        )
-        rows.append({
-            "project": pid,
-            "path": p["path"],
-            "shard": sg.router.shard_for(pid),
-            "files": n_files,
-            "classes": n_classes,
-            "methods": n_methods,
-            "calls_out": n_calls,
-            "embeddings": n_emb,
-        })
+    rows = [
+        {
+            "project": item["id"],
+            "path": item.get("path"),
+            "shard": item.get("shard"),
+            "files": item.get("files", 0),
+            "classes": item.get("classes", 0),
+            "methods": item.get("methods", 0),
+            "calls_out": item.get("calls", 0),
+            "embeddings": item.get("embeddings", 0),
+            "project_state": item.get("project_state"),
+        }
+        for item in summaries
+    ]
 
     if as_json:
         _echo_json(rows, as_json=True)
         return
 
     col_w = max(len(r["project"]) for r in rows)
-    header = f"{'Project':<{col_w}}  {'Shard':>5}  {'Files':>6}  {'Classes':>8}  {'Methods':>8}  {'Calls':>7}  {'Emb':>6}  Path"
+    header = f"{'Project':<{col_w}}  {'State':<15}  {'Shard':>5}  {'Files':>6}  {'Classes':>8}  {'Methods':>8}  {'Calls':>7}  {'Emb':>6}  Path"
     click.secho(header, fg="cyan")
     click.echo("-" * len(header))
     total_files = total_classes = total_methods = total_calls = total_emb = 0
     for r in rows:
         click.echo(
-            f"{r['project']:<{col_w}}  {r.get('shard', 0):>5}  {r['files']:>6}  {r['classes']:>8}  {r['methods']:>8}  {r['calls_out']:>7}  {r['embeddings']:>6}  {r['path']}"
+            f"{r['project']:<{col_w}}  {str(r.get('project_state') or '-'): <15}  {r.get('shard', 0):>5}  {r['files']:>6}  {r['classes']:>8}  {r['methods']:>8}  {r['calls_out']:>7}  {r['embeddings']:>6}  {r['path']}"
         )
         total_files += r["files"]
         total_classes += r["classes"]
@@ -1353,7 +1666,7 @@ def stats(as_json: bool, show_shards: bool) -> None:
     if len(rows) > 1:
         click.echo("-" * len(header))
         click.secho(
-            f"{'TOTAL':<{col_w}}  {'':>5}  {total_files:>6}  {total_classes:>8}  {total_methods:>8}  {total_calls:>7}  {total_emb:>6}",
+            f"{'TOTAL':<{col_w}}  {'':<15}  {'':>5}  {total_files:>6}  {total_classes:>8}  {total_methods:>8}  {total_calls:>7}  {total_emb:>6}",
             fg="green",
         )
 
@@ -1437,8 +1750,16 @@ def self_test_cmd(ctx: click.Context, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def list_projects(as_json: bool) -> None:
     """List indexed projects."""
-    store = _open_store(read_only=True)
-    projects = store.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path, p.language as language ORDER BY p.id")
+    projects = [
+        {
+            "id": item.get("id"),
+            "path": item.get("path"),
+            "state": item.get("project_state"),
+            "core_state": item.get("core_state"),
+            "deep_state": item.get("deep_state"),
+        }
+        for item in _project_summaries()
+    ]
     _echo_json(projects, as_json)
 
 
@@ -1478,14 +1799,15 @@ def _show_background_tasks(include_finished: bool, limit: int, as_json: bool) ->
             click.echo("No running background tasks.")
         return
     now = time.time()
-    header = f"{'ID':<12}  {'Status':<10}  {'Progress':>8}  {'Phase':<26}  {'Age':>7}  Path"
+    header = f"{'ID':<12}  {'Status':<10}  {'Result':<10}  {'Progress':>8}  {'Phase':<24}  {'Age':>7}  Path"
     click.secho(header, fg="cyan")
     click.echo("-" * len(header))
     for task in tasks:
         started = task.get("started_at")
         age = _format_elapsed(now - float(started)) if started else "-"
         path = task.get("path") or ""
-        phase = str(task.get("phase") or "")[:26]
+        phase = str(task.get("last_phase") or task.get("phase") or "")[:24]
+        result_status = str(task.get("result_status") or "-")
         progress = task.get("progress")
         if isinstance(progress, (int, float)):
             progress_str = f"{min(max(float(progress), 0.0), 1.0) * 100:.0f}%"
@@ -1494,21 +1816,30 @@ def _show_background_tasks(include_finished: bool, limit: int, as_json: bool) ->
         click.echo(
             f"{str(task.get('id', '')):<12}  "
             f"{str(task.get('status', '')):<10}  "
+            f"{result_status:<10}  "
             f"{progress_str:>8}  "
-            f"{phase:<26}  "
+            f"{phase:<24}  "
             f"{age:>7}  "
             f"{path}"
         )
         detail = task.get("detail")
         if detail:
-            click.echo(f"{'':<12}  {'':<10}  {'':>8}  {str(detail)[:80]}")
+            click.echo(f"{'':<12}  {'':<10}  {'':<10}  {'':>8}  {str(detail)[:80]}")
+        repair_hint = task.get("repair_hint")
+        if repair_hint and str(task.get("status")) == "failed":
+            click.echo(f"{'':<12}  {'':<10}  {'':<10}  {'':>8}  repair: {repair_hint}")
 
 
 def _project_summaries() -> list[dict]:
     sg = ShardedGraphStore(read_only=True)
+    meta_by_id = {project.get("id", ""): project for project in sg.list_project_metadata() if project.get("id")}
+    state_by_id = {item.get("project_id", ""): item for item in list_project_states() if item.get("project_id")}
+    project_ids = sorted({pid for pid in list(meta_by_id) + list(state_by_id) if pid})
     out: list[dict] = []
-    for project in sg.list_project_metadata():
-        pid = project.get("id", "")
+    for pid in project_ids:
+        project = meta_by_id.get(pid, {})
+        state = state_by_id.get(pid) or synthetic_project_state(pid, path=project.get("path", ""))
+        snap = snapshot_info(pid, sg.router)
         shard_store = sg.shard(pid)
 
         def _count(query: str) -> int:
@@ -1520,7 +1851,8 @@ def _project_summaries() -> list[dict]:
 
         out.append(
             {
-                **project,
+                "id": pid,
+                "path": state.get("path") or project.get("path"),
                 "shard": sg.router.shard_for(pid),
                 "files": _count("MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as n"),
                 "classes": _count(
@@ -1534,6 +1866,18 @@ def _project_summaries() -> list[dict]:
                     "MATCH (ma:Method)-[:CALLS]->(mb:Method), (ca:Class), (fa:File) "
                     "WHERE ma.class_id = ca.id AND ca.file_id = fa.id AND fa.project_id = $pid RETURN count(*) as n"
                 ),
+                "embeddings": _count(
+                    "MATCH (s:Symbol), (f:File) "
+                    "WHERE s.file_id = f.id AND f.project_id = $pid AND s.embedding IS NOT NULL RETURN count(s) as n"
+                ),
+                "project_state": derive_project_status(state, snap),
+                "core_state": state.get("core_state"),
+                "deep_state": state.get("deep_state"),
+                "last_error": state.get("last_error"),
+                "repair_hint": state.get("repair_hint"),
+                "last_good_snapshot_at": state.get("last_good_snapshot_at"),
+                "snapshot_valid": snap.get("snapshot_valid"),
+                "write_db_valid": snap.get("write_db_valid"),
             }
         )
     return out
@@ -1565,6 +1909,8 @@ def _ui_html() -> str:
     .panel h2 { margin: 0 0 10px; font-size: 18px; letter-spacing: 0; }
     .task { border-top: 1px solid #e7edf3; padding: 10px 0; }
     .task:first-of-type { border-top: 0; }
+    .task-actions { display: flex; gap: 8px; margin-top: 8px; }
+    .task-actions button { padding: 7px 10px; font-size: 13px; }
     .metric { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 7px 0; border-top: 1px solid #e7edf3; }
     .metric:first-of-type { border-top: 0; }
     .status { display: inline-block; padding: 2px 8px; border-radius: 6px; background: #e7f4ea; color: #137333; font-size: 12px; }
@@ -1572,13 +1918,19 @@ def _ui_html() -> str:
     .status.running, .status.queued { background: #e8f0fe; color: #174ea6; }
     .status.warning { background: #fef7e0; color: #b06000; }
     .status.critical { background: #fce8e6; color: #a50e0e; }
+    .status.partial, .status.degraded { background: #fef7e0; color: #b06000; }
+    .status.repair_required { background: #fce8e6; color: #a50e0e; }
+    .status.ready, .status.succeeded { background: #e7f4ea; color: #137333; }
+    .status.enriching { background: #e8f0fe; color: #174ea6; }
+    .actions { display: flex; gap: 8px; }
+    .secondary { background: white; color: #1b6f79; }
     @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 14px; } header { padding: 18px 14px; } }
   </style>
 </head>
 <body>
   <header>
     <h1>CodeSpine Index Explorer</h1>
-    <div class="muted">Local read-only view of indexed projects and background enrichment tasks.</div>
+    <div class="muted">Local view of core readiness, repair state, and background work.</div>
   </header>
   <main>
     <section>
@@ -1587,8 +1939,8 @@ def _ui_html() -> str:
         <button id="refresh">Refresh</button>
       </div>
       <table>
-        <thead><tr><th>Project</th><th>Shard</th><th>Files</th><th>Classes</th><th>Methods</th><th>Calls</th><th>Path</th></tr></thead>
-        <tbody id="projects"><tr><td colspan="7" class="muted">Loading...</td></tr></tbody>
+        <thead><tr><th>Project</th><th>State</th><th>Shard</th><th>Files</th><th>Classes</th><th>Methods</th><th>Calls</th><th>Path</th><th>Actions</th></tr></thead>
+        <tbody id="projects"><tr><td colspan="9" class="muted">Loading...</td></tr></tbody>
       </table>
     </section>
     <aside class="stack">
@@ -1602,29 +1954,56 @@ def _ui_html() -> str:
       </section>
       <section class="panel">
         <h2>Install</h2>
-        <div class="muted">Use <code>codespine background</code> for the same task state in the terminal. A richer add-on UI can build on these endpoints.</div>
+        <div class="muted">Use <code>codespine background</code> for the same task state in the terminal. Repair actions here call the same local CLI flows.</div>
       </section>
     </aside>
   </main>
   <script>
     let projects = [];
     async function getJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(url); return await r.json(); }
+    async function postJSON(url, body) {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (!r.ok) throw new Error(await r.text());
+      return await r.json();
+    }
     function renderProjects() {
       const q = document.getElementById('filter').value.toLowerCase();
       const rows = projects.filter(p => (`${p.id || ''} ${p.path || ''}`).toLowerCase().includes(q));
       document.getElementById('projects').innerHTML = rows.length ? rows.map(p => `
-        <tr><td>${p.id || ''}</td><td>${p.shard}</td><td>${p.files}</td><td>${p.classes}</td><td>${p.methods}</td><td>${p.calls}</td><td class="muted">${p.path || ''}</td></tr>
-      `).join('') : '<tr><td colspan="7" class="muted">No projects found.</td></tr>';
+        <tr>
+          <td>${p.id || ''}</td>
+          <td><span class="status ${p.project_state || ''}">${p.project_state || '-'}</span></td>
+          <td>${p.shard}</td>
+          <td>${p.files}</td>
+          <td>${p.classes}</td>
+          <td>${p.methods}</td>
+          <td>${p.calls}</td>
+          <td class="muted">${p.path || ''}${p.last_error ? `<div>${p.last_error}</div>` : ''}</td>
+          <td>
+            <div class="actions">
+              <button class="secondary" onclick="repairProject('${p.id || p.path || ''}', 'auto')">Repair</button>
+              <button onclick="repairProject('${p.id || p.path || ''}', 'full')">Reindex</button>
+            </div>
+          </td>
+        </tr>
+      `).join('') : '<tr><td colspan="9" class="muted">No projects found.</td></tr>';
     }
     function renderTasks(tasks) {
       const el = document.getElementById('tasks');
       if (!tasks.length) { el.innerHTML = 'No background tasks.'; return; }
       el.innerHTML = tasks.map(t => `
         <div class="task">
-          <div><span class="status ${t.status}">${t.status}</span> <strong>${t.phase || t.kind}</strong></div>
+          <div><span class="status ${t.status}">${t.status}</span> <span class="status ${t.result_status || ''}">${t.result_status || 'pending'}</span> <strong>${t.last_phase || t.phase || t.kind}</strong></div>
           <div class="muted">${t.label || ''}</div>
           <div class="muted">${t.path || ''}</div>
+          <div class="muted">Progress: ${typeof t.progress === 'number' ? Math.round(t.progress * 100) + '%' : '-'}</div>
           ${t.detail ? `<div>${t.detail}</div>` : ''}
+          ${t.repair_hint ? `<div class="muted">Repair: ${t.repair_hint}</div>` : ''}
+          ${t.status === 'failed' ? `<div class="task-actions"><button class="secondary" onclick="repairProject('${t.project_id || t.path || ''}', 'auto')">Repair</button><button onclick="repairProject('${t.project_id || t.path || ''}', 'full')">Reindex</button></div>` : ''}
         </div>
       `).join('');
     }
@@ -1645,6 +2024,12 @@ def _ui_html() -> str:
         <div class="metric"><span>Lowest call coverage</span><strong>${coverage}</strong></div>
         ${projects.flatMap(p => (p.anomalies || []).map(a => `<div class="task"><strong>${p.project_id}</strong><div>${a.message || ''}</div></div>`)).join('')}
       `;
+    }
+    async function repairProject(target, mode) {
+      if (!target) return;
+      const payload = await postJSON('/api/repair', { project_id: target, mode });
+      alert(`Started ${payload.mode} repair\\nTask: ${payload.task_id}`);
+      await refresh();
     }
     async function refresh() {
       const [p, t, h] = await Promise.all([getJSON('/api/projects'), getJSON('/api/tasks'), getJSON('/api/health')]);
@@ -1702,6 +2087,24 @@ def ui(host: str, port: int, open_browser: bool) -> None:
                 return
             self._send(b"not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
 
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path != "/api/repair":
+                self._send(b"not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+                body = json.loads(raw_body.decode("utf-8") or "{}")
+                target = str(body.get("project_id") or body.get("path") or "").strip()
+                mode = str(body.get("mode") or "auto").strip().lower()
+                if not target:
+                    raise click.ClickException("repair target is required")
+                self._json(_start_repair(target, force_full=(mode == "full")))
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": str(exc)[:300]})
+
     server = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}"
     click.secho(f"CodeSpine UI running at {url}", fg="green")
@@ -1740,6 +2143,7 @@ def status(as_json: bool) -> None:
     except Exception:
         overlay = []
     tasks = active_tasks(limit=10)
+    project_rows = _project_summaries()
     try:
         health_summary = index_health(store).get("summary", {})
     except Exception:
@@ -1762,6 +2166,7 @@ def status(as_json: bool) -> None:
         "overlay_dir": SETTINGS.overlay_dir,
         "overlay_projects": overlay,
         "background_tasks": tasks,
+        "projects": project_rows,
         "health_summary": health_summary,
     }
     if as_json:
@@ -1780,7 +2185,14 @@ def status(as_json: bool) -> None:
             for task in tasks:
                 click.echo(
                     f"  {task.get('id')}  {task.get('status')}  "
-                    f"{task.get('phase')}  {task.get('path') or ''}"
+                    f"{task.get('last_phase') or task.get('phase')}  {task.get('path') or ''}"
+                )
+        if project_rows:
+            click.echo("\nProjects:")
+            for project in project_rows[:10]:
+                click.echo(
+                    f"  {project.get('id')}  {project.get('project_state')}  "
+                    f"{project.get('path') or ''}"
                 )
         if health_summary:
             click.echo(

@@ -174,6 +174,8 @@ def _split_clauses(q: str) -> list[tuple[str, str]]:
             for kw in _TOP_KEYWORDS:
                 kl = len(kw)
                 if q[i : i + kl].upper() == kw:
+                    if i > 0 and (q[i - 1].isalnum() or q[i - 1] in {"_", "$"}):
+                        continue
                     end_pos = i + kl
                     # Require word boundary: end-of-string or non-word char
                     if end_pos < n and (q[end_pos].isalnum() or q[end_pos] == "_"):
