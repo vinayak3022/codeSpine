@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
+from itertools import product
 
 from codespine.overlay.merge import merged_symbol_records
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
 from codespine.search.rrf import reciprocal_rank_fusion
 from codespine.search.vector import _load_model, rank_semantic
+
+LOGGER = logging.getLogger(__name__)
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
@@ -27,6 +31,46 @@ def _read_snippet(file_path: str, line: int, context: int = _SNIPPET_CONTEXT_LIN
         return "".join(snippet_lines).rstrip("\n")
     except Exception:
         return None
+
+
+def _context_entry(
+    community: dict | None = None,
+    flow: dict | None = None,
+) -> dict[str, object]:
+    return {
+        "community_id": community.get("community_id") if community else None,
+        "community_label": community.get("community_label") if community else None,
+        "flow_id": flow.get("flow_id") if flow else None,
+        "flow_kind": flow.get("flow_kind") if flow else None,
+        "flow_depth": flow.get("flow_depth") if flow else None,
+    }
+
+
+def _load_symbol_context(store, symbol_id: str) -> list[dict[str, object]]:
+    community_rows = store.query_records(
+        """
+        MATCH (s:Symbol {id: $sid})-[:IN_COMMUNITY]->(c:Community)
+        RETURN c.id as community_id, c.label as community_label
+        LIMIT 3
+        """,
+        {"sid": symbol_id},
+    )
+    flow_rows = store.query_records(
+        """
+        MATCH (s:Symbol {id: $sid})-[f:IN_FLOW]->(fl:Flow)
+        RETURN fl.id as flow_id, fl.kind as flow_kind, f.depth as flow_depth
+        LIMIT 3
+        """,
+        {"sid": symbol_id},
+    )
+
+    if community_rows and flow_rows:
+        return [_context_entry(community, flow) for community, flow in product(community_rows, flow_rows)][:3]
+    if community_rows:
+        return [_context_entry(community=community) for community in community_rows][:3]
+    if flow_rows:
+        return [_context_entry(flow=flow) for flow in flow_rows][:3]
+    return []
 
 
 def hybrid_search(store, query: str, k: int = 20, project: str | None = None) -> list[dict]:
@@ -105,19 +149,15 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
     results.sort(key=lambda x: x["score"], reverse=True)
     top_k = results[:k]
 
-    # Attach architectural context in same response.
+    # Attach architectural context in the same response. This is best-effort:
+    # a context query failure must not hide ranked symbol results.
     for item in top_k:
-        ctx = store.query_records(
-            """
-            MATCH (s:Symbol {id: $sid})-[:IN_COMMUNITY]->(c:Community)
-            OPTIONAL MATCH (s)-[f:IN_FLOW]->(fl:Flow)
-            RETURN c.id as community_id, c.label as community_label,
-                   fl.id as flow_id, fl.kind as flow_kind, f.depth as flow_depth
-            LIMIT 3
-            """,
-            {"sid": item["id"]},
-        )
-        item["context"] = ctx
+        try:
+            item["context"] = _load_symbol_context(store, item["id"])
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Unable to load architectural context for %s: %s", item.get("id"), exc)
+            item["context"] = []
+            item["context_warning"] = "Architectural context unavailable for this result."
 
     # Attach source code snippets (3–5 lines around the declaration) to the
     # top results so agents have immediate context without reading the file.
