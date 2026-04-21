@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v1.0.12** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.0.13** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 

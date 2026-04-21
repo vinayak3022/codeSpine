@@ -7,6 +7,17 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+## [1.0.13] - 2026-04-21
+
+### Changed
+
+- The PyPI publish workflow now triggers on every push to `main` in addition to tags and releases, then checks `pyproject.toml` against PyPI and skips duplicate-version uploads automatically. This keeps package publication live without duplicate-release failures.
+
+### Fixed
+
+- Split `search_hybrid` architectural context loading into separate community and flow lookups so DuckDB-backed searches no longer fail on `f.depth` relationship properties.
+- Made hybrid-search context enrichment best-effort: ranked symbol results still return with `context=[]` and `context_warning` when context lookup fails.
+
 ## [1.0.12] - 2026-04-21
 
 ### Added

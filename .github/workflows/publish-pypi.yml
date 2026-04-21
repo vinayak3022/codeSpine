@@ -2,15 +2,25 @@ name: Publish to PyPI
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   release:
     types: [published]
   workflow_dispatch:
 
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.meta.outputs.package_version }}
+      should_publish: ${{ steps.meta.outputs.should_publish }}
+      publish_reason: ${{ steps.meta.outputs.publish_reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,6 +29,46 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Resolve package version and PyPI publish plan
+        id: meta
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          should_publish = True
+          reason = "new-version"
+
+          try:
+              with urllib.request.urlopen("https://pypi.org/pypi/codespine/json", timeout=10) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+              payload = {"releases": {}}
+
+          existing_versions = payload.get("releases", {})
+          if version in existing_versions:
+              should_publish = False
+              reason = "version-already-on-pypi"
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as fh:
+              fh.write(f"package_version={version}\n")
+              fh.write(f"should_publish={'true' if should_publish else 'false'}\n")
+              fh.write(f"publish_reason={reason}\n")
+          PY
+
+      - name: Publish plan summary
+        run: |
+          echo "Package version: ${{ steps.meta.outputs.package_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Publish reason: ${{ steps.meta.outputs.publish_reason }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Will publish: ${{ steps.meta.outputs.should_publish }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build distributions
         run: |
@@ -34,6 +84,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    if: needs.build.outputs.should_publish == 'true'
     permissions:
       id-token: write
     environment:

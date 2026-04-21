@@ -27,6 +27,7 @@ python -m codespine.cli --help
 - Include a clear description of what changed and why.
 - Update `README.md` and `CHANGELOG.md` for user-visible changes.
 - Add tests when behavior changes.
+- `main` pushes always trigger the PyPI workflow. To publish a new package, bump the version in `pyproject.toml`; the workflow skips upload automatically when that version is already on PyPI.
 
 ## Commit Message Guidance
 
