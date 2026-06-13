@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-from itertools import product
 
 from codespine.overlay.merge import merged_symbol_records
 from codespine.search.bm25 import rank_bm25
@@ -14,6 +13,52 @@ LOGGER = logging.getLogger(__name__)
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
+
+
+def _rank_trace_map(ranking: list[tuple[str, float]], limit: int) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
+    trace_by_id: dict[str, dict[str, object]] = {}
+    traces: list[dict[str, object]] = []
+    for rank, (doc_id, score) in enumerate(ranking[:limit], start=1):
+        entry = {"id": doc_id, "rank": rank, "score": score}
+        trace_by_id[doc_id] = entry
+        traces.append(entry)
+    return trace_by_id, traces
+
+
+def _match_reasons(query_lower: str, rec: dict, rank_traces: dict[str, dict[str, object]]) -> list[str]:
+    reasons: list[str] = []
+    name_lower = (rec.get("name") or "").lower()
+    fqname_lower = (rec.get("fqname") or "").lower()
+
+    if name_lower == query_lower or fqname_lower == query_lower:
+        reasons.append("exact name match")
+    else:
+        if query_lower and query_lower in name_lower:
+            reasons.append("substring name match")
+        if query_lower and query_lower in fqname_lower:
+            reasons.append("substring fqname match")
+
+    for ranker, trace in rank_traces.items():
+        reasons.append(f"{ranker} rank {trace['rank']}")
+
+    if rec.get("is_test"):
+        reasons.append("test symbol penalty")
+    if rec.get("kind") in {"method", "class"}:
+        reasons.append("method/class boost")
+
+    return reasons
+
+
+def _confidence_reason(query_lower: str, rec: dict, rank_traces: dict[str, dict[str, object]]) -> str:
+    name_lower = (rec.get("name") or "").lower()
+    fqname_lower = (rec.get("fqname") or "").lower()
+    if name_lower == query_lower or fqname_lower == query_lower:
+        return "Exact name match"
+    if query_lower and (query_lower in name_lower or query_lower in fqname_lower):
+        return "Partial lexical match"
+    if rank_traces:
+        return "Retrieved by combined lexical, fuzzy, and semantic signals"
+    return "Weak lexical overlap"
 
 
 def _read_snippet(file_path: str, line: int, context: int = _SNIPPET_CONTEXT_LINES) -> str | None:
@@ -64,16 +109,12 @@ def _load_symbol_context(store, symbol_id: str) -> list[dict[str, object]]:
         {"sid": symbol_id},
     )
 
-    if community_rows and flow_rows:
-        return [_context_entry(community, flow) for community, flow in product(community_rows, flow_rows)][:3]
-    if community_rows:
-        return [_context_entry(community=community) for community in community_rows][:3]
-    if flow_rows:
-        return [_context_entry(flow=flow) for flow in flow_rows][:3]
-    return []
+    context = [_context_entry(community=community) for community in community_rows]
+    context.extend(_context_entry(flow=flow) for flow in flow_rows)
+    return context[:3]
 
 
-def hybrid_search(store, query: str, k: int = 20, project: str | None = None) -> list[dict]:
+def hybrid_search(store, query: str, k: int = 20, project: str | None = None, explain: bool = False) -> list[dict] | dict:
     overlay_store = getattr(store, "overlay_store", None)
     if overlay_store is not None:
         recs = merged_symbol_records(store, overlay_store, project=project)
@@ -113,6 +154,11 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
     fuzzy_rank = rank_fuzzy(query, fuzzy_docs)
     semantic_rank = rank_semantic(query, vector_docs)
 
+    trace_limit = max(k, 1)
+    bm25_trace_by_id, bm25_traces = _rank_trace_map(bm25_rank, trace_limit)
+    fuzzy_trace_by_id, fuzzy_traces = _rank_trace_map(fuzzy_rank, trace_limit)
+    semantic_trace_by_id, semantic_traces = _rank_trace_map(semantic_rank, trace_limit)
+
     fused = reciprocal_rank_fusion([bm25_rank, semantic_rank, fuzzy_rank])
     rec_by_id = {r["id"]: r for r in recs}
 
@@ -134,17 +180,30 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
         if name_lower == query_lower or fqname_lower == query_lower:
             multiplier *= 5.0
 
-        results.append(
-            {
-                "id": doc_id,
-                "kind": rec.get("kind"),
-                "name": rec.get("name"),
-                "fqname": rec.get("fqname"),
-                "file_path": rec.get("file_path"),
-                "line": rec.get("line"),
-                "score": score * multiplier,
-            }
-        )
+        rank_traces = {
+            ranker: trace
+            for ranker, trace in (
+                ("bm25", bm25_trace_by_id.get(doc_id)),
+                ("semantic", semantic_trace_by_id.get(doc_id)),
+                ("fuzzy", fuzzy_trace_by_id.get(doc_id)),
+            )
+            if trace is not None
+        }
+
+        item = {
+            "id": doc_id,
+            "kind": rec.get("kind"),
+            "name": rec.get("name"),
+            "fqname": rec.get("fqname"),
+            "file_path": rec.get("file_path"),
+            "line": rec.get("line"),
+            "score": score * multiplier,
+        }
+        if explain:
+            item["retrieval_traces"] = rank_traces
+            item["match_reasons"] = _match_reasons(query_lower, rec, rank_traces)
+            item["confidence_reason"] = _confidence_reason(query_lower, rec, rank_traces)
+        results.append(item)
 
     results.sort(key=lambda x: x["score"], reverse=True)
     top_k = results[:k]
@@ -185,6 +244,8 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
         else:
             item["confidence"] = "low"
 
+    low_confidence_note: str | None = None
+
     # Only add low-confidence warning when there are no exact matches AND all
     # RRF scores are below the noise threshold.
     if not has_exact_match and top_k and isinstance(top_k[0], dict) and top_k[0].get("score", 1.0) < _LOW_CONFIDENCE_THRESHOLD:
@@ -193,17 +254,33 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None) ->
             if isinstance(item, dict) and "score" in item:
                 item["low_confidence"] = True
         if has_model:
-            note = (
+            low_confidence_note = (
                 "Low confidence results — all scores below threshold. "
                 "If searching for an exact class or method name, use find_symbol instead."
             )
         else:
-            note = (
+            low_confidence_note = (
                 "Low confidence results — scores are lower in BM25/fuzzy-only mode "
                 "(no embedding model detected). "
                 "This is expected without 'codespine[ml]' installed; results may still be correct. "
                 "For exact name matches, use find_symbol instead."
             )
-        top_k.append({"note": note})
 
-    return top_k
+    if not explain:
+        return top_k
+
+    payload = {
+        "retrieval_mode": "hybrid",
+        "query": query,
+        "results": top_k,
+        "provenance": {
+            "rankers": {
+                "bm25": {"traces": bm25_traces},
+                "semantic": {"traces": semantic_traces},
+                "fuzzy": {"traces": fuzzy_traces},
+            }
+        },
+    }
+    if low_confidence_note:
+        payload["note"] = low_confidence_note
+    return payload

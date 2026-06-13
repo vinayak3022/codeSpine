@@ -1495,11 +1495,13 @@ def repair_cmd(target: str, force_full: bool, as_json: bool) -> None:
 @main.command()
 @click.argument("query")
 @click.option("--k", default=20, show_default=True, type=int)
+@click.option("--project", default=None)
+@click.option("--explain", is_flag=True, help="Return retrieval provenance and match reasons.")
 @click.option("--json", "as_json", is_flag=True)
-def search(query: str, k: int, as_json: bool) -> None:
+def search(query: str, k: int, project: str | None, explain: bool, as_json: bool) -> None:
     """Hybrid search (BM25 + vector + fuzzy + RRF)."""
     store = _open_store(read_only=True)
-    results = hybrid_search(store, query, k=k)
+    results = hybrid_search(store, query, k=k, project=project, explain=explain)
     _echo_json(results, as_json)
 
 

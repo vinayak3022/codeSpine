@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "codespine-mcp-stdio",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "codespine.cli", "mcp"],
+      "port": 0
+    },
+    {
+      "name": "codespine-mcp-background",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "codespine.cli", "start"],
+      "port": 0
+    }
+  ]
+}

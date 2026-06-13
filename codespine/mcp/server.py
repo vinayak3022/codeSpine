@@ -581,16 +581,18 @@ def build_mcp_server(store, repo_path_provider):
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def search_hybrid(query: str, k: int = 20, project: str | None = None):
+    def search_hybrid(query: str, k: int = 20, project: str | None = None, explain: bool = False):
         """
         Hybrid symbol search (BM25 + vector + fuzzy, fused with RRF).
         Pass project=<project_id> to scope results to a single indexed project.
+        Pass explain=True to include retrieval traces, match reasons, and confidence notes.
         Use list_projects to see available project IDs.
         """
-        results = hybrid_search(store, query, k=k, project=project)
+        results = hybrid_search(store, query, k=k, project=project, explain=explain)
         if not results:
             return _no_symbols_response()
-        return _staleness_meta(store, {"available": True, "results": results}, project, overlay_store=overlay_store)
+        payload = {"available": True, **results} if explain and isinstance(results, dict) else {"available": True, "results": results}
+        return _staleness_meta(store, payload, project, overlay_store=overlay_store)
 
     @mcp.tool()
     def get_impact(symbol: str, max_depth: int = 4, project: str | None = None):

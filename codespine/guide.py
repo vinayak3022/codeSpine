@@ -10,7 +10,7 @@ GUIDE_SECTIONS: list[dict] = [
         "title": "What is CodeSpine?",
         "body": (
             "CodeSpine is a Java code-intelligence engine. It parses Java source "
-            "into a graph database (Kuzu) and exposes hybrid search, impact analysis, "
+            "into a graph database (DuckDB by default, Kuzu as an alternate backend) and exposes hybrid search, impact analysis, "
             "dead-code detection, execution-flow tracing, community detection, and "
             "git change-coupling -- all via MCP tools or CLI commands.\n"
             "Language: Java. Layouts: single-module, multi-module (Maven/Gradle), workspaces."
@@ -23,7 +23,7 @@ GUIDE_SECTIONS: list[dict] = [
             "1. Call get_capabilities() to see what is indexed and which features are ready.\n"
             "2. If nothing is indexed: call analyse_project(path) with the Java project root.\n"
             "   Poll with get_analyse_status() until it finishes.\n"
-            "3. Once indexed: use search_hybrid(query) to find symbols, then drill in with\n"
+            "3. Once indexed: use search_hybrid(query, project=..., explain=True) to find symbols, then drill in with\n"
             "   get_impact(), get_symbol_context(), or get_neighborhood().\n"
             "4. For active development: call start_watch(path) to keep the index fresh\n"
             "   as files change on disk."
@@ -45,7 +45,7 @@ GUIDE_SECTIONS: list[dict] = [
         "id": "tools_search",
         "title": "Search & Lookup",
         "tools": [
-            {"name": "search_hybrid", "one_liner": "Ranked symbol search (BM25 + vector + fuzzy via RRF). Start here."},
+            {"name": "search_hybrid", "one_liner": "Ranked symbol search (BM25 + vector + fuzzy via RRF). Pass project= or explain=True for scoped, provenance-aware retrieval."},
             {"name": "find_symbol", "one_liner": "Exact/prefix name lookup. Use to resolve ambiguity or list overloads."},
             {"name": "get_symbol_context", "one_liner": "One-shot deep context: search + impact + community + flows in one call."},
             {"name": "get_neighborhood", "one_liner": "Callers, callees, siblings, and override/implements for a symbol."},
@@ -146,6 +146,8 @@ GUIDE_SECTIONS: list[dict] = [
             "- For git tools, pass project= so the correct repo root is resolved.\n"
             "- BM25 + fuzzy search works without embeddings. Semantic search needs\n"
             "  'pip install codespine[ml]' and 'analyse_project(path, embed=True)'.\n"
+            "- Use search_hybrid(query, project=..., explain=True) when you want ranker\n"
+            "  traces, match reasons, and confidence explanations.\n"
             "- If community/flow/coupling data is missing, re-run:\n"
             "  analyse_project(path, deep=True)"
         ),

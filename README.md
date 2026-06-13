@@ -173,7 +173,7 @@ codespine guide --json   # structured JSON for tooling
 
 | Tool | Description |
 |------|-------------|
-| `search_hybrid(query, k, project)` | Ranked symbol search (BM25 + vector + fuzzy via RRF) with `high/medium/low` confidence scores. |
+| `search_hybrid(query, k, project, explain)` | Ranked symbol search (BM25 + vector + fuzzy via RRF) with `high/medium/low` confidence scores; `explain=True` adds provenance, retrieval traces, and match reasons. |
 | `find_symbol(name, kind, project, limit)` | Exact/prefix name lookup; returns `primary_match` flag and disambiguated overloads. |
 | `get_symbol_context(query, max_depth, project)` | One-shot deep context: search + impact + community + flows. |
 | `get_neighborhood(symbol, project)` | Callers (same project), `cross_project_callers` (other projects), callees, siblings, and override/implements links. |
@@ -279,7 +279,8 @@ codespine watch --path . --install-hook      # also install post-commit git hook
 codespine watch --path . --uninstall-hook    # remove git hook
 
 # Search & Analysis (CLI)
-codespine search "query"                     # hybrid search
+codespine search "query" --project app       # scoped hybrid search
+codespine search "query" --explain           # provenance-aware hybrid search
 codespine context "symbol"                   # one-shot deep context
 codespine impact "symbol"                    # caller-tree impact (includes DI consumers)
 codespine deadcode                           # dead code candidates
