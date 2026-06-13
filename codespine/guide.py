@@ -46,7 +46,7 @@ GUIDE_SECTIONS: list[dict] = [
         "title": "Search & Lookup",
         "tools": [
             {"name": "search_hybrid", "one_liner": "Ranked symbol search (BM25 + vector + fuzzy via RRF). Pass project= or explain=True for scoped, provenance-aware retrieval."},
-            {"name": "answer", "one_liner": "GraphRAG answer surface with evidence, citations, confidence, and observability contracts."},
+            {"name": "answer", "one_liner": "GraphRAG answer surface with reranked evidence, citations, confidence, and observability contracts."},
             {"name": "find_symbol", "one_liner": "Exact/prefix name lookup. Use to resolve ambiguity or list overloads."},
             {"name": "get_symbol_context", "one_liner": "One-shot deep context: search + impact + community + flows in one call."},
             {"name": "get_neighborhood", "one_liner": "Callers, callees, siblings, and override/implements for a symbol."},
@@ -152,7 +152,7 @@ GUIDE_SECTIONS: list[dict] = [
             "  'pip install codespine[ml]' and 'analyse_project(path, embed=True)'.\n"
             "- Use search_hybrid(query, project=..., explain=True) when you want ranker\n"
             "  traces, match reasons, and confidence explanations.\n"
-            "- Use answer(question, project=...) for a GraphRAG response with evidence,\n"
+            "- Use answer(question, project=...) for a GraphRAG response with reranked evidence,\n"
             "  citations, confidence, and observability metadata.\n"
             "- If community/flow/coupling data is missing, re-run:\n"
             "  analyse_project(path, deep=True)"

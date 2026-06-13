@@ -12,6 +12,27 @@ _OBSERVABILITY_PRIMITIVES = [
     "trace_execution_flows",
 ]
 
+_EVIDENCE_KIND_WEIGHTS = {
+    "impact": 3.0,
+    "search_result": 2.7,
+    "community": 2.2,
+    "flow": 2.0,
+}
+
+
+def _pretty_evidence_kind(kind: str) -> str:
+    return {"search_result": "search", "impact": "impact", "community": "community", "flow": "flow"}.get(kind, kind)
+
+
+def _unique_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
 
 def _add_citation(
     citations: list[dict[str, object]],
@@ -46,7 +67,10 @@ def _add_citation(
     return citation_id
 
 
-def _confidence_payload(focus: dict[str, object], evidence_count: int, impact_summary: dict[str, object]) -> dict[str, object]:
+def _confidence_payload(
+    focus: dict[str, object], evidence: list[dict[str, object]], impact_summary: dict[str, object]
+) -> dict[str, object]:
+    evidence_count = len(evidence)
     label = str(focus.get("confidence") or "low")
     base_scores = {"high": 0.92, "medium": 0.72, "low": 0.48}
     score = base_scores.get(label, 0.6)
@@ -61,13 +85,28 @@ def _confidence_payload(focus: dict[str, object], evidence_count: int, impact_su
         label = "medium"
     else:
         label = "low"
-    reason = focus.get("confidence_reason") or "Combined graph evidence from search and impact analysis."
-    if not focus.get("confidence_reason") and evidence_count > 1:
-        reason = "Combined graph evidence from search, impact, and architectural context."
-    return {"label": label, "score": round(score, 3), "reason": reason}
+    evidence_kinds = [str(item.get("kind") or "evidence") for item in evidence]
+    evidence_sources = _unique_preserve_order([str(item.get("source") or item.get("kind") or "evidence") for item in evidence])
+    reason = focus.get("confidence_reason")
+    if not reason:
+        if evidence_count == 0:
+            reason = "No supporting evidence selected; confidence comes from the focus match alone."
+        else:
+            pretty_kinds = _unique_preserve_order([_pretty_evidence_kind(kind) for kind in evidence_kinds])
+            reason = f"Combined graph evidence from {', '.join(pretty_kinds)} via {', '.join(evidence_sources)}."
+    return {
+        "label": label,
+        "score": round(score, 3),
+        "reason": reason,
+        "evidence_count": evidence_count,
+        "evidence_kinds": evidence_kinds,
+        "supporting_signals": evidence_sources,
+    }
 
 
-def _summarize_answer(focus: dict[str, object], impact_summary: dict[str, object], community: dict | None, flows: list[dict]) -> str:
+def _summarize_answer(
+    focus: dict[str, object], impact_summary: dict[str, object], community: dict | None, flows: list[dict], evidence: list[dict[str, object]]
+) -> str:
     name = focus.get("fqname") or focus.get("name") or focus.get("id") or "the best-matching symbol"
     parts = [f"Best match: {name}."]
     direct = int(impact_summary.get("direct") or 0)
@@ -82,6 +121,9 @@ def _summarize_answer(focus: dict[str, object], impact_summary: dict[str, object
         parts.append(f"Community: {community_label}.")
     if flows:
         parts.append(f"Flow coverage: {len(flows)} path(s) found.")
+    evidence_kinds = sorted({_pretty_evidence_kind(str(item.get("kind") or "evidence")) for item in evidence})
+    if evidence_kinds:
+        parts.append(f"Evidence: {', '.join(evidence_kinds)}.")
     return " ".join(parts)
 
 
@@ -222,28 +264,82 @@ def _build_evidence(
     flows: list[dict],
     max_evidence: int,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    evidence: list[dict[str, object]] = []
-    citations: list[dict[str, object]] = []
-    citation_index: dict[tuple[object, ...], str] = {}
     limit = max(0, int(max_evidence))
-
-    def add_evidence(entry: dict[str, object]) -> bool:
-        if len(evidence) >= limit:
-            return False
-        entry["id"] = f"e{len(evidence) + 1}"
-        evidence.append(entry)
-        return True
-
     if limit <= 0:
-        return evidence, citations
+        return [], []
+
+    candidates: list[dict[str, object]] = []
+    candidate_counts = {"search_result": 0, "impact": 0, "community": 0, "flow": 0}
+    citation_counter = 0
+
+    def add_candidate(entry: dict[str, object]) -> None:
+        candidates.append(entry)
+        kind = str(entry.get("kind") or "")
+        if kind in candidate_counts:
+            candidate_counts[kind] += 1
+
+    def make_citation(**kwargs: object) -> tuple[str, dict[str, object]]:
+        nonlocal citation_counter
+        citation_counter += 1
+        citation_id = f"c{citation_counter}"
+        citation: dict[str, object] = {"id": citation_id, "kind": str(kwargs["kind"]), "title": str(kwargs["title"]), "source": str(kwargs["source"])}
+        for field in ("file_path", "line", "symbol_id", "community_id", "flow_id"):
+            value = kwargs.get(field)
+            if value is not None:
+                citation[field] = value
+        return citation_id, citation
+
+    def _search_candidate_score(candidate: dict[str, object]) -> float:
+        score = _EVIDENCE_KIND_WEIGHTS["search_result"]
+        candidate_score = candidate.get("score")
+        if isinstance(candidate_score, (int, float)):
+            score += min(max(float(candidate_score), 0.0), 1.0) * 0.15
+        confidence = str(candidate.get("confidence") or "low")
+        score += {"high": 0.25, "medium": 0.12, "low": 0.0}.get(confidence, 0.0)
+        exact_anchor = False
+        if str(candidate.get("symbol_id") or "") == str(focus.get("id") or ""):
+            score += 0.35
+            exact_anchor = True
+        if str(candidate.get("fqname") or "") == str(focus.get("fqname") or ""):
+            score += 0.2
+            exact_anchor = True
+        if exact_anchor:
+            score += 1.0
+        return score
+
+    def _impact_candidate_score(candidate: dict[str, object]) -> float:
+        score = _EVIDENCE_KIND_WEIGHTS["impact"]
+        depth = candidate.get("depth")
+        if depth == 1:
+            score += 0.35
+        elif depth == 2:
+            score += 0.2
+        elif depth:
+            score += 0.1
+        confidence = candidate.get("confidence")
+        if isinstance(confidence, (int, float)):
+            score += min(max(float(confidence), 0.0), 1.0) * 0.2
+        return score
+
+    def _community_candidate_score(candidate: dict[str, object]) -> float:
+        score = _EVIDENCE_KIND_WEIGHTS["community"]
+        cohesion = candidate.get("cohesion")
+        if isinstance(cohesion, (int, float)):
+            score += min(max(float(cohesion), 0.0), 1.0) * 0.25
+        return score
+
+    def _flow_candidate_score(candidate: dict[str, object]) -> float:
+        score = _EVIDENCE_KIND_WEIGHTS["flow"]
+        depth = candidate.get("flow_depth")
+        if depth == 0:
+            score += 0.25
+        elif isinstance(depth, int) and depth > 0:
+            score += max(0.05, 0.2 - depth * 0.03)
+        return score
 
     for candidate in search_candidates:
-        if len(evidence) >= limit:
-            break
         title = str(candidate.get("fqname") or candidate.get("name") or candidate.get("id") or "search result")
-        citation_id = _add_citation(
-            citations,
-            citation_index,
+        citation_id, citation = make_citation(
             kind="symbol",
             title=title,
             source="hybrid_search",
@@ -251,10 +347,11 @@ def _build_evidence(
             line=candidate.get("line"),
             symbol_id=str(candidate.get("id") or "") or None,
         )
-        add_evidence(
+        add_candidate(
             {
                 "kind": "search_result",
                 "citation_id": citation_id,
+                "citation": citation,
                 "source": "hybrid_search",
                 "symbol_id": candidate.get("id"),
                 "title": title,
@@ -263,6 +360,8 @@ def _build_evidence(
                 "confidence": candidate.get("confidence"),
                 "score": candidate.get("score"),
                 "snippet": candidate.get("snippet"),
+                "is_focus_anchor": str(candidate.get("id") or "") == str(focus.get("id") or "")
+                or str(candidate.get("fqname") or "") == str(focus.get("fqname") or ""),
                 "subgraph": {
                     "nodes": [
                         {
@@ -283,20 +382,15 @@ def _build_evidence(
                         }
                     ],
                 },
+                "rerank_score": _search_candidate_score(candidate),
             }
         )
 
     impact_groups = impact.get("impacted_callers") or {}
     for depth_key in ("1", "2", "3+"):
-        if len(evidence) >= limit:
-            break
         for caller in (impact_groups.get(depth_key) or [])[:2]:
-            if len(evidence) >= limit:
-                break
             title = str(caller.get("fqname") or caller.get("name") or caller.get("symbol") or "impact caller")
-            citation_id = _add_citation(
-                citations,
-                citation_index,
+            citation_id, citation = make_citation(
                 kind="method",
                 title=title,
                 source="analyze_impact",
@@ -304,10 +398,11 @@ def _build_evidence(
                 line=caller.get("line"),
                 symbol_id=str(caller.get("symbol") or "") or None,
             )
-            add_evidence(
+            add_candidate(
                 {
                     "kind": "impact",
                     "citation_id": citation_id,
+                    "citation": citation,
                     "source": "analyze_impact",
                     "symbol_id": caller.get("symbol"),
                     "title": title,
@@ -337,26 +432,24 @@ def _build_evidence(
                             }
                         ],
                     },
+                    "rerank_score": _impact_candidate_score(caller),
                 }
             )
-    
+
     for community_match in _community_matches(community)[:2]:
-        if len(evidence) >= limit:
-            break
         title = str(community_match.get("community_label") or community_match.get("label") or community_match.get("community_id") or "community")
-        citation_id = _add_citation(
-            citations,
-            citation_index,
+        citation_id, citation = make_citation(
             kind="community",
             title=title,
             source="symbol_community",
             symbol_id=str(focus.get("id") or "") or None,
             community_id=str(community_match.get("community_id") or "") or None,
         )
-        add_evidence(
+        add_candidate(
             {
                 "kind": "community",
                 "citation_id": citation_id,
+                "citation": citation,
                 "source": "symbol_community",
                 "title": title,
                 "community_id": community_match.get("community_id"),
@@ -381,25 +474,23 @@ def _build_evidence(
                         }
                     ],
                 },
+                "rerank_score": _community_candidate_score(community_match),
             }
         )
 
     for flow in flows[:2]:
-        if len(evidence) >= limit:
-            break
         title = str(flow.get("flow_kind") or flow.get("flow_id") or "flow")
-        citation_id = _add_citation(
-            citations,
-            citation_index,
+        citation_id, citation = make_citation(
             kind="flow",
             title=title,
             source="trace_execution_flows",
             flow_id=str(flow.get("flow_id") or "") or None,
         )
-        add_evidence(
+        add_candidate(
             {
                 "kind": "flow",
                 "citation_id": citation_id,
+                "citation": citation,
                 "source": "trace_execution_flows",
                 "title": title,
                 "flow_id": flow.get("flow_id"),
@@ -424,8 +515,29 @@ def _build_evidence(
                         }
                     ],
                 },
+                "rerank_score": _flow_candidate_score(flow),
             }
         )
+
+    selected_candidates = sorted(
+        candidates,
+        key=lambda item: (
+            float(item.get("rerank_score") or 0.0),
+            item.get("kind") == "impact",
+            item.get("kind") == "search_result",
+            str(item.get("title") or "").lower(),
+            str(item.get("citation_id") or ""),
+        ),
+        reverse=True,
+    )[:limit]
+
+    evidence: list[dict[str, object]] = []
+    citations: list[dict[str, object]] = []
+    for index, candidate in enumerate(selected_candidates, start=1):
+        evidence_item = {k: v for k, v in candidate.items() if k != "citation"}
+        evidence_item["id"] = f"e{index}"
+        evidence.append(evidence_item)
+        citations.append(candidate["citation"])
 
     return evidence, citations
 
@@ -437,10 +549,18 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
     evidence_limit = max(0, int(k))
 
     focus = context.get("focus") or {}
-    search_candidates = list(context.get("search_candidates") or [])[:evidence_limit]
+    search_candidates = list(context.get("search_candidates") or [])
     impact = context.get("impact") or {}
     community = context.get("community")
     flows = [_normalize_flow(flow) for flow in (context.get("flows") or [])]
+
+    impact_groups = impact.get("impacted_callers") or {}
+    candidate_counts = {
+        "search_result": len(search_candidates),
+        "impact": sum(len((impact_groups.get(depth_key) or [])[:2]) for depth_key in ("1", "2", "3+")),
+        "community": len(_community_matches(community)[:2]),
+        "flow": len(flows[:2]),
+    }
 
     if not focus:
         return {
@@ -457,19 +577,20 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
                 "search_candidates": len(search_candidates),
                 "evidence_count": 0,
                 "citation_count": 0,
+                "evidence_rerank": {"strategy": "utility_ranked", "candidate_counts": candidate_counts, "selected": []},
             },
         }
 
     impact_summary = impact.get("summary") or {}
     evidence, citations = _build_evidence(focus, search_candidates, impact, community, flows, evidence_limit)
     evidence_subgraph = _build_evidence_subgraph(focus, evidence)
-    confidence = _confidence_payload(focus, len(evidence), impact_summary)
+    confidence = _confidence_payload(focus, evidence, impact_summary)
 
     return {
         "available": True,
         "question": question,
         "focus": focus,
-        "answer": _summarize_answer(focus, impact_summary, community, flows),
+        "answer": _summarize_answer(focus, impact_summary, community, flows, evidence),
         "confidence": confidence,
         "evidence": evidence,
         "citations": citations,
@@ -480,6 +601,8 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             "flow_count": len(flows),
             "search_candidate_count": len(search_candidates),
             "community_label": _community_label(community),
+            "evidence_kinds": [str(item.get("kind") or "evidence") for item in evidence],
+            "evidence_sources": sorted({str(item.get("source") or item.get("kind") or "evidence") for item in evidence}),
             "evidence_subgraph_nodes": len(evidence_subgraph["nodes"]),
             "evidence_subgraph_edges": len(evidence_subgraph["edges"]),
         },
@@ -493,5 +616,23 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             "search_candidates": len(search_candidates),
             "evidence_count": len(evidence),
             "citation_count": len(citations),
+                "evidence_rerank": {
+                    "strategy": "utility_ranked",
+                    "candidate_counts": candidate_counts,
+                    "selected": [
+                        {
+                            "id": item["id"],
+                            "kind": item.get("kind"),
+                            "source": item.get("source"),
+                            "title": item.get("title"),
+                            "citation_id": item.get("citation_id"),
+                            "confidence": item.get("confidence"),
+                            "score": item.get("score"),
+                            "rerank_score": item.get("rerank_score"),
+                            "is_focus_anchor": item.get("is_focus_anchor"),
+                        }
+                        for item in evidence
+                    ],
+            },
         },
     }

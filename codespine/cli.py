@@ -1535,7 +1535,7 @@ def impact(symbol: str, max_depth: int, as_json: bool) -> None:
 @click.option("--k", default=5, show_default=True, type=int)
 @click.option("--json", "as_json", is_flag=True)
 def answer(question: str, project: str | None, max_depth: int, k: int, as_json: bool) -> None:
-    """GraphRAG answer surface with evidence, citations, confidence, and observability."""
+    """GraphRAG answer surface with reranked evidence, citations, confidence, and observability."""
     store = _open_store(read_only=True)
     result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
     _echo_json(result, as_json)

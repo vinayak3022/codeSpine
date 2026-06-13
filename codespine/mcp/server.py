@@ -38,7 +38,7 @@ from codespine.watch.watcher import (
 from codespine.cache.result_cache import ResultCache
 
 
-def _json(data: dict) -> str:
+def _json(data: dict, *, preserve_empty_keys: set[str] | frozenset[str] = frozenset()) -> str:
     """Serialize response dict to a JSON string.
 
     FastMCP double-serialises dict return values on many transports (SSE,
@@ -47,7 +47,11 @@ def _json(data: dict) -> str:
 
     Strips None values and empty containers to keep payloads compact.
     """
-    cleaned = {k: v for k, v in data.items() if v is not None and v != [] and v != {}}
+    cleaned = {
+        k: v
+        for k, v in data.items()
+        if v is not None and (k in preserve_empty_keys or (v != [] and v != {}))
+    }
     return _json_mod.dumps(cleaned, separators=(",", ":"))
 
 
@@ -133,6 +137,7 @@ def _staleness_meta(
     overlay_store=None,
     deep_scope: bool = False,
     compact: bool = True,
+    preserve_empty_keys: set[str] | frozenset[str] = frozenset(),
 ) -> str:
     """Inject index staleness metadata into every tool response and serialise.
 
@@ -197,7 +202,7 @@ def _staleness_meta(
 
     # Merge prefix (stale warning first) with the rest of the response.
     final = {**prefix, **response}
-    return _json(final)
+    return _json(final, preserve_empty_keys=preserve_empty_keys)
 
 
 def _project_inventory(store) -> list[dict]:
@@ -897,13 +902,20 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def answer(question: str, project: str | None = None, max_depth: int = 3, k: int = 5):
         """
-        GraphRAG answer surface with evidence, citations, confidence, and observability.
+        GraphRAG answer surface with reranked evidence, citations, confidence, and observability.
         """
         try:
             result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
             if not result.get("available"):
                 return _json(result)
-            return _staleness_meta(store, result, project, overlay_store=overlay_store, deep_scope=True)
+            return _staleness_meta(
+                store,
+                result,
+                project,
+                overlay_store=overlay_store,
+                deep_scope=True,
+                preserve_empty_keys={"evidence", "citations"},
+            )
         except Exception as exc:
             return _safe_tool_response("answer", exc)
 

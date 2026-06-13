@@ -86,8 +86,14 @@ def test_graph_rag_answer_builds_contracts(monkeypatch):
     assert flow_citation["flow_id"] == "f1"
     assert result["observability"]["retrieval_mode"] == "graph_rag"
     assert result["observability"]["k"] == 5
+    assert result["observability"]["evidence_rerank"]["strategy"] == "utility_ranked"
+    assert result["observability"]["evidence_rerank"]["selected"][0]["title"] == "com.example.PaymentService#processPayment"
+    assert result["observability"]["evidence_rerank"]["selected"][0]["citation_id"] == "c1"
+    assert result["observability"]["evidence_rerank"]["selected"][0]["score"] is not None
     assert result["supporting_context"]["impact_summary"]["direct"] == 1
     assert result["supporting_context"]["evidence_subgraph_nodes"] >= 1
+    assert result["confidence"]["evidence_count"] == 4
+    assert "analyze_impact" in result["confidence"]["supporting_signals"]
 
 
 def test_graph_rag_answer_normalizes_real_flow_shape_and_keeps_citations_unique(monkeypatch):
@@ -160,10 +166,50 @@ def test_graph_rag_answer_honors_k_as_evidence_budget(monkeypatch):
 
     assert len(result["evidence"]) == 2
     assert len(result["citations"]) == 2
-    assert [item["kind"] for item in result["evidence"]] == ["search_result", "search_result"]
+    assert [item["kind"] for item in result["evidence"]] == ["search_result", "impact"]
     assert result["observability"]["k"] == 2
     assert result["observability"]["evidence_count"] == 2
     assert result["observability"]["citation_count"] == 2
+    assert result["observability"]["evidence_rerank"]["candidate_counts"]["impact"] == 3
+    assert result["supporting_context"]["evidence_kinds"] == ["search_result", "impact"]
+
+
+def test_graph_rag_answer_confidence_fallback_reflects_selected_evidence(monkeypatch):
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {
+            "id": "m1",
+            "kind": "method",
+            "name": "processPayment",
+            "fqname": "com.example.PaymentService#processPayment",
+            "file_path": "/tmp/PaymentService.java",
+            "line": 12,
+            "score": 0.97,
+            "confidence": "high",
+            "snippet": "public void processPayment() {}",
+        },
+        "search_candidates": [
+            {"id": "m1", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"},
+        ],
+        "impact": {
+            "impacted_callers": {
+                "1": [{"symbol": "m2", "name": "checkout", "fqname": "com.example.OrderController#checkout", "file_path": "/tmp/OrderController.java", "depth": 1, "edge_type": "CALLS", "confidence": 0.9}],
+                "2": [],
+                "3+": [],
+            },
+            "summary": {"direct": 1, "indirect": 0, "transitive": 0, "self_callers": 0},
+        },
+        "community": {"community_id": "c1", "community_label": "Payments", "cohesion": 0.87},
+        "flows": [{"flow_id": "f1", "flow_kind": "entry", "flow_depth": 0}],
+    }
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: context)
+
+    result = graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app", k=4)
+
+    reason = result["confidence"]["reason"]
+    assert "search" in reason and "impact" in reason and "community" in reason and "flow" in reason
+    assert "hybrid_search" in reason and "analyze_impact" in reason and "symbol_community" in reason and "trace_execution_flows" in reason
+    assert "search and impact analysis" not in reason
 
 
 def test_graph_rag_answer_preserves_focus_anchor_when_focus_is_evidence(monkeypatch):
@@ -272,5 +318,28 @@ def test_mcp_answer_tool_returns_unavailable_result_unchanged(monkeypatch):
         result = await mcp.call_tool("answer", {"question": "unknown", "project": "app"})
         payload = json.loads(result.content[0].text)
         assert payload == {"available": False, "note": "No symbol match found for a GraphRAG answer."}
+
+    asyncio.run(_run())
+
+
+def test_mcp_answer_tool_preserves_empty_evidence_shape(monkeypatch):
+    monkeypatch.setattr(
+        "codespine.mcp.server.graph_rag_answer",
+        lambda *args, **kwargs: {
+            "available": True,
+            "answer": "ok",
+            "confidence": {"label": "high", "score": 0.9, "reason": "x"},
+            "evidence": [],
+            "citations": [],
+            "observability": {"retrieval_mode": "graph_rag"},
+        },
+    )
+
+    async def _run():
+        mcp = build_mcp_server(_NoopStore(), lambda: ".")
+        result = await mcp.call_tool("answer", {"question": "what breaks if I change Foo?", "project": "app"})
+        payload = json.loads(result.content[0].text)
+        assert payload["evidence"] == []
+        assert payload["citations"] == []
 
     asyncio.run(_run())
