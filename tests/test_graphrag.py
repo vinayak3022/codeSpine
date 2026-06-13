@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 from click.testing import CliRunner
 
 from codespine.cli import main
-from codespine.graphrag import graph_rag_answer
+from codespine.graphrag import _GRAPH_RAG_CACHE, graph_rag_answer
 from codespine.mcp.server import build_mcp_server
 
 
@@ -94,6 +95,150 @@ def test_graph_rag_answer_builds_contracts(monkeypatch):
     assert result["supporting_context"]["evidence_subgraph_nodes"] >= 1
     assert result["confidence"]["evidence_count"] == 4
     assert "analyze_impact" in result["confidence"]["supporting_signals"]
+
+
+def test_graph_rag_answer_caches_by_snapshot_and_reports_latency(monkeypatch):
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {
+            "id": "m1",
+            "kind": "method",
+            "name": "processPayment",
+            "fqname": "com.example.PaymentService#processPayment",
+            "file_path": "/tmp/PaymentService.java",
+            "line": 12,
+            "score": 0.97,
+            "confidence": "high",
+        },
+        "search_candidates": [
+            {"id": "m1", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"},
+        ],
+        "impact": {"impacted_callers": {"1": [{"symbol": "m2", "name": "checkout", "fqname": "com.example.OrderController#checkout", "file_path": "/tmp/OrderController.java", "depth": 1, "edge_type": "CALLS", "confidence": 0.9}], "2": [], "3+": []}, "summary": {"direct": 1, "indirect": 0, "transitive": 0, "self_callers": 0}},
+        "community": {"community_id": "c1", "community_label": "Payments", "cohesion": 0.87},
+        "flows": [{"flow_id": "f1", "flow_kind": "entry", "flow_depth": 0}],
+        "timings_ms": {"search": 1, "impact": 2, "community": 3, "flows": 4, "total": 10},
+    }
+    calls = {"count": 0}
+
+    _GRAPH_RAG_CACHE.invalidate()
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
+
+    first = graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+    second = graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+
+    assert calls["count"] == 1
+    assert first["observability"]["cache"]["hit"] is False
+    assert first["observability"]["latency_ms"]["cache_lookup"] == 0
+    assert second["observability"]["cache"]["hit"] is True
+    assert second["observability"]["latency_ms"]["context"]["search"] == 1
+    assert second["observability"]["latency_ms"]["cache_lookup"] >= 0
+
+
+def test_graph_rag_answer_cache_invalidates_on_overlay_change(monkeypatch, tmp_path):
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {
+            "id": "m1",
+            "kind": "method",
+            "name": "processPayment",
+            "fqname": "com.example.PaymentService#processPayment",
+            "file_path": "/tmp/PaymentService.java",
+            "line": 12,
+            "score": 0.97,
+            "confidence": "high",
+        },
+        "search_candidates": [{"id": "m1", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"}],
+        "impact": {"impacted_callers": {"1": [], "2": [], "3+": []}, "summary": {}},
+        "community": None,
+        "flows": [],
+        "timings_ms": {"search": 1, "impact": 0, "community": 0, "flows": 0, "total": 1},
+    }
+    calls = {"count": 0}
+    overlay_path = tmp_path / "overlay" / "app.json"
+    overlay_path.parent.mkdir(parents=True)
+    overlay_path.write_text("{}", encoding="utf-8")
+
+    class _OverlayStore:
+        def project_path(self, project: str):
+            return str(overlay_path)
+
+    class _Store:
+        overlay_store = _OverlayStore()
+
+    _GRAPH_RAG_CACHE.invalidate()
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
+
+    graph_rag_answer(_Store(), "what breaks if I change Foo?", project="app")
+    os.utime(overlay_path, (11.1, 11.1))
+    graph_rag_answer(_Store(), "what breaks if I change Foo?", project="app")
+
+    assert calls["count"] == 2
+
+
+def test_graph_rag_answer_cache_invalidates_on_rapid_snapshot_updates(monkeypatch):
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {
+            "id": "m1",
+            "kind": "method",
+            "name": "processPayment",
+            "fqname": "com.example.PaymentService#processPayment",
+            "file_path": "/tmp/PaymentService.java",
+            "line": 12,
+            "score": 0.97,
+            "confidence": "high",
+        },
+        "search_candidates": [{"id": "m1", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"}],
+        "impact": {"impacted_callers": {"1": [], "2": [], "3+": []}, "summary": {}},
+        "community": None,
+        "flows": [],
+        "timings_ms": {"search": 1, "impact": 0, "community": 0, "flows": 0, "total": 1},
+    }
+    calls = {"count": 0}
+    snapshot_mtimes = iter([11.1, 11.2])
+
+    _GRAPH_RAG_CACHE.invalidate()
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: next(snapshot_mtimes))
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
+
+    graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+    graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+
+    assert calls["count"] == 2
+
+
+def test_graph_rag_answer_cache_invalidates_on_snapshot_change(monkeypatch):
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {
+            "id": "m1",
+            "kind": "method",
+            "name": "processPayment",
+            "fqname": "com.example.PaymentService#processPayment",
+            "file_path": "/tmp/PaymentService.java",
+            "line": 12,
+            "score": 0.97,
+            "confidence": "high",
+        },
+        "search_candidates": [{"id": "m1", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"}],
+        "impact": {"impacted_callers": {"1": [], "2": [], "3+": []}, "summary": {}},
+        "community": None,
+        "flows": [],
+        "timings_ms": {"search": 1, "impact": 0, "community": 0, "flows": 0, "total": 1},
+    }
+    calls = {"count": 0}
+    snapshot_mtimes = iter([11.0, 12.0])
+
+    _GRAPH_RAG_CACHE.invalidate()
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: next(snapshot_mtimes))
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
+
+    graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+    graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+
+    assert calls["count"] == 2
 
 
 def test_graph_rag_answer_normalizes_real_flow_shape_and_keeps_citations_unique(monkeypatch):

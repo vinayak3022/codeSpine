@@ -46,7 +46,7 @@ GUIDE_SECTIONS: list[dict] = [
         "title": "Search & Lookup",
         "tools": [
             {"name": "search_hybrid", "one_liner": "Ranked symbol search (BM25 + vector + fuzzy via RRF). Pass project= or explain=True for scoped, provenance-aware retrieval."},
-            {"name": "answer", "one_liner": "GraphRAG answer surface with reranked evidence, citations, confidence, observability contracts, and safe abstention on ambiguity or weak grounding."},
+            {"name": "answer", "one_liner": "GraphRAG answer surface with reranked evidence, citations, confidence, latency observability, cache-aware execution, and safe abstention on ambiguity or weak grounding."},
             {"name": "find_symbol", "one_liner": "Exact/prefix name lookup. Use to resolve ambiguity or list overloads."},
             {"name": "get_symbol_context", "one_liner": "One-shot deep context: search + impact + community + flows in one call."},
             {"name": "get_neighborhood", "one_liner": "Callers, callees, siblings, and override/implements for a symbol."},

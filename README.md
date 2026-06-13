@@ -195,7 +195,7 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 
 | Tool | Description |
 |------|-------------|
-| `answer(question, project)` | GraphRAG answer surface with reranked evidence, evidence subgraph, citations, confidence, observability contracts, and safe abstention on ambiguity or weak grounding. |
+| `answer(question, project)` | GraphRAG answer surface with reranked evidence, evidence subgraph, citations, confidence, latency observability, cache-aware execution, and safe abstention on ambiguity or weak grounding. |
 | `ask(question, project)` | Keyword-based natural language dispatcher: routes "who calls X", "what breaks if Y", "explain Z", "find methods named …" to the right tool automatically. |
 | `what_breaks(symbol, project)` | Plain-English blast-radius summary with `risk_level` (low / medium / high). |
 | `explain(symbol, project)` | What a class or method does and how it fits in the architecture. |
@@ -488,11 +488,11 @@ sg = ShardedGraphStore(backend="duckdb", num_shards=4)  # DuckDB (default)
 
 Expensive analysis tools cache their results for 5 minutes. The cache is keyed by `(tool_name, arguments, snapshot_mtime)` so a new index snapshot automatically invalidates stale entries.
 
-**Cached tools:** `get_impact`, `detect_dead_code`.
+**Cached tools:** `get_impact`, `detect_dead_code`, `answer`.
 
 The cache is per MCP server instance (in-memory, not persisted across restarts). It is invalidated automatically when `reindex_file` or `analyse_project` completes.
 
-**Cache stats** are visible via `get_capabilities()`.
+**Cache stats** are visible via `get_capabilities()`. `answer` also exposes per-stage latency timing in its observability payload.
 
 ---
 

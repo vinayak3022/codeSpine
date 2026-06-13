@@ -902,7 +902,7 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def answer(question: str, project: str | None = None, max_depth: int = 3, k: int = 5):
         """
-        GraphRAG answer surface with reranked evidence, citations, confidence, and observability.
+        GraphRAG answer surface with reranked evidence, citations, confidence, latency observability, and cache-aware execution.
         """
         try:
             result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)

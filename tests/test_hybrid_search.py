@@ -132,6 +132,22 @@ def test_build_symbol_context_degrades_for_overlay_dirty_focus(monkeypatch):
     assert "Overlay-dirty" in result["note"]
 
 
+def test_build_symbol_context_skips_deep_analysis_without_focus(monkeypatch):
+    monkeypatch.setattr("codespine.analysis.context.hybrid_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr("codespine.analysis.context.analyze_impact", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deep impact analysis should be skipped")))
+    monkeypatch.setattr("codespine.analysis.context.symbol_community", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deep community analysis should be skipped")))
+    monkeypatch.setattr("codespine.analysis.context.trace_execution_flows", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deep flow analysis should be skipped")))
+
+    result = build_symbol_context(_FailingContextStore(), "Foo")
+
+    assert result["focus"] is None
+    assert result["search_candidates"] == []
+    assert result["impact"]["depth_groups"] == {"1": [], "2": [], "3+": []}
+    assert result["community"]["matches"] == []
+    assert result["flows"] == []
+    assert "No usable focus" in result["note"]
+
+
 def test_hybrid_search_degrades_context_for_overlay_dirty_symbols(monkeypatch):
     class _OverlayStore:
         def load_project(self, project: str):

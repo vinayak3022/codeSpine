@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from difflib import SequenceMatcher
 
+from codespine.cache.result_cache import ResultCache
 from codespine.analysis.context import build_symbol_context
 
 _OBSERVABILITY_PRIMITIVES = [
@@ -20,6 +23,8 @@ _EVIDENCE_KIND_WEIGHTS = {
     "flow": 2.0,
 }
 
+_GRAPH_RAG_CACHE = ResultCache(maxsize=128, ttl_s=300.0)
+
 
 def _pretty_evidence_kind(kind: str) -> str:
     return {"search_result": "search", "impact": "impact", "community": "community", "flow": "flow"}.get(kind, kind)
@@ -33,6 +38,67 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
             seen.add(value)
             ordered.append(value)
     return ordered
+
+
+def _snapshot_mtime_for_path(path: str) -> float:
+    try:
+        if path and os.path.exists(path):
+            return os.stat(path).st_mtime_ns / 1_000_000_000
+    except OSError:
+        pass
+    return 0.0
+
+
+def _store_snapshot_mtime(store, project: str | None = None) -> float:
+    try:
+        router = getattr(store, "router", None)
+        if router is not None and hasattr(router, "all_shards") and hasattr(router, "snapshot_path"):
+            shard_ids = list(router.all_shards())
+            mtimes = [_snapshot_mtime_for_path(router.snapshot_path(idx) + ".updated") for idx in shard_ids]
+            return max(mtimes, default=0.0)
+        snapshot_path = getattr(store, "_snapshot_path", "")
+        return _snapshot_mtime_for_path(snapshot_path + ".updated")
+    except Exception:
+        return 0.0
+
+
+def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
+    overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is None:
+        return 0.0
+    try:
+        if project:
+            return _snapshot_mtime_for_path(overlay_store.project_path(project))
+        mtimes = []
+        for doc in overlay_store.list_projects():
+            project_id = doc.get("project_id")
+            if project_id:
+                mtimes.append(_snapshot_mtime_for_path(overlay_store.project_path(project_id)))
+        return max(mtimes, default=0.0)
+    except Exception:
+        return 0.0
+
+
+def _graph_rag_cache_key(
+    question: str,
+    project: str | None,
+    max_depth: int,
+    k: int,
+    snapshot_mtime: float,
+    overlay_mtime: float,
+) -> tuple:
+    return ResultCache.make_key(
+        "graph_rag_answer",
+        {
+            "question": question,
+            "project": project,
+            "max_depth": max_depth,
+            "k": k,
+            "snapshot_mtime": snapshot_mtime,
+            "overlay_mtime": overlay_mtime,
+        },
+        0.0,
+    )
 
 
 def _candidate_snapshot(candidate: dict[str, object], *, rank: int | None = None) -> dict[str, object]:
@@ -693,9 +759,25 @@ def _build_evidence(
 
 def graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5) -> dict:
     started = time.perf_counter()
-    context = build_symbol_context(store, question, max_depth=max_depth, project=project)
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    snapshot_mtime = _store_snapshot_mtime(store, project)
+    overlay_mtime = _overlay_snapshot_mtime(store, project)
     evidence_limit = max(0, int(k))
+    cache_key = _graph_rag_cache_key(question, project, max_depth, evidence_limit, snapshot_mtime, overlay_mtime)
+    cached = _GRAPH_RAG_CACHE.get(cache_key)
+    if cached is not None:
+        result = json.loads(cached)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        observability = dict(result.get("observability") or {})
+        observability["elapsed_ms"] = elapsed_ms
+        observability["cache"] = {"hit": True, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
+        latency_ms = dict(observability.get("latency_ms") or {})
+        latency_ms.update({"cache_lookup": elapsed_ms, "total": elapsed_ms})
+        observability["latency_ms"] = latency_ms
+        result["observability"] = observability
+        return result
+
+    context = build_symbol_context(store, question, max_depth=max_depth, project=project)
+    context_ms = int((time.perf_counter() - started) * 1000)
 
     focus = context.get("focus") or {}
     search_candidates = list(context.get("search_candidates") or [])
@@ -714,51 +796,85 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
 
     ambiguity = _detect_ambiguity(search_candidates)
     if ambiguity:
-        return _abstain_response(
+        result = _abstain_response(
             question,
             project=project,
             max_depth=max_depth,
             k=evidence_limit,
-            elapsed_ms=elapsed_ms,
+            elapsed_ms=context_ms,
             search_candidates=search_candidates,
             candidate_counts=candidate_counts,
             note=f"Ambiguous symbol resolution for GraphRAG answer: {ambiguity['reason']}",
             ambiguity=ambiguity,
             context_note=str(context_note) if context_note else None,
         )
+        result.setdefault("observability", {})
+        result["observability"]["latency_ms"] = {
+            "total": context_ms,
+            "cache_lookup": 0,
+            "context": dict(context.get("timings_ms") or {}),
+        }
+        result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
+        result["observability"]["elapsed_ms"] = context_ms
+        _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
+        return result
 
     if not focus:
-        return _abstain_response(
+        result = _abstain_response(
             question,
             project=project,
             max_depth=max_depth,
             k=evidence_limit,
-            elapsed_ms=elapsed_ms,
+            elapsed_ms=context_ms,
             search_candidates=search_candidates,
             candidate_counts=candidate_counts,
             note="No symbol match found for a GraphRAG answer.",
             context_note=str(context_note) if context_note else None,
         )
+        result.setdefault("observability", {})
+        result["observability"]["latency_ms"] = {
+            "total": context_ms,
+            "cache_lookup": 0,
+            "context": dict(context.get("timings_ms") or {}),
+        }
+        result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
+        result["observability"]["elapsed_ms"] = context_ms
+        _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
+        return result
 
     impact_summary = impact.get("summary") or {}
+    evidence_started = time.perf_counter()
     evidence, citations = _build_evidence(focus, search_candidates, impact, community, flows, evidence_limit)
+    evidence_ms = int((time.perf_counter() - evidence_started) * 1000)
     if not evidence:
-        return _abstain_response(
+        result = _abstain_response(
             question,
             project=project,
             max_depth=max_depth,
             k=evidence_limit,
-            elapsed_ms=elapsed_ms,
+            elapsed_ms=context_ms,
             search_candidates=search_candidates,
             candidate_counts=candidate_counts,
             note="GraphRAG could not assemble enough grounded evidence to answer safely.",
             context_note=str(context_note) if context_note else None,
         )
+        result.setdefault("observability", {})
+        total_ms = int((time.perf_counter() - started) * 1000)
+        result["observability"]["latency_ms"] = {
+            "total": total_ms,
+            "cache_lookup": 0,
+            "context": dict(context.get("timings_ms") or {}),
+            "evidence_build": evidence_ms,
+        }
+        result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
+        result["observability"]["elapsed_ms"] = total_ms
+        _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
+        return result
 
     evidence_subgraph = _build_evidence_subgraph(focus, evidence)
     confidence = _confidence_payload(focus, evidence, impact_summary)
 
-    return {
+    result = {
         "available": True,
         "abstained": False,
         "question": question,
@@ -791,7 +907,7 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         "observability": {
             "retrieval_mode": "graph_rag",
             "primitives": _OBSERVABILITY_PRIMITIVES,
-            "elapsed_ms": elapsed_ms,
+            "elapsed_ms": context_ms,
             "project": project,
             "max_depth": max_depth,
             "k": evidence_limit,
@@ -816,5 +932,19 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
                     for item in evidence
                 ],
             },
+            "latency_ms": {
+                "total": 0,
+                "cache_lookup": 0,
+                "context": dict(context.get("timings_ms") or {}),
+                "evidence_build": evidence_ms,
+                "serialization": 0,
+            },
+            "cache": {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime},
         },
     }
+    total_ms = int((time.perf_counter() - started) * 1000)
+    result["observability"]["elapsed_ms"] = total_ms
+    result["observability"]["latency_ms"]["total"] = total_ms
+    result["observability"]["latency_ms"]["cache_lookup"] = 0
+    _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
+    return result
