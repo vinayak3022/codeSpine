@@ -7,7 +7,7 @@ import os
 from click.testing import CliRunner
 
 from codespine.cli import main
-from codespine.graphrag import _GRAPH_RAG_CACHE, graph_rag_answer
+from codespine.graphrag import _GRAPH_RAG_CACHE, evaluate_graph_rag_suite, graph_rag_answer, score_graph_rag_answer
 from codespine.mcp.server import build_mcp_server
 
 
@@ -422,6 +422,130 @@ def test_graph_rag_answer_returns_unavailable_when_no_focus(monkeypatch):
     assert result["observability"]["citation_count"] == 0
 
 
+def test_graph_rag_scoring_uses_expected_contract_and_signal_quality():
+    result = {
+        "available": True,
+        "abstained": False,
+        "focus": {"id": "m1", "fqname": "com.example.PaymentService#processPayment"},
+        "answer": "Best match: com.example.PaymentService#processPayment. Impact: 1 direct callers. Evidence: search, impact.",
+        "confidence": {"label": "high", "score": 0.92},
+        "evidence": [
+            {"kind": "search_result", "source": "hybrid_search"},
+            {"kind": "impact", "source": "analyze_impact"},
+        ],
+        "citations": [{"id": "c1"}, {"id": "c2"}],
+    }
+
+    report = score_graph_rag_answer(
+        result,
+        {
+            "available": True,
+            "abstained": False,
+            "focus_id": "m1",
+            "min_evidence_count": 2,
+            "min_citation_count": 2,
+            "requires_evidence_kinds": ["search_result", "impact"],
+            "must_include_terms": ["Best match", "Impact"],
+            "min_confidence": "medium",
+        },
+    )
+
+    assert report["passed"] is True
+    assert report["score"] >= 90
+    assert report["observed"]["evidence_count"] == 2
+    assert report["observed"]["citation_count"] == 2
+    assert any(check["name"] == "focus" and check["passed"] for check in report["checks"])
+
+
+def test_graph_rag_evaluation_suite_scores_cases_and_applies_gates():
+    responses = {
+        "grounded": {
+            "available": True,
+            "abstained": False,
+            "focus": {"id": "m1", "fqname": "com.example.PaymentService#processPayment"},
+            "answer": "Best match: com.example.PaymentService#processPayment. Impact: 1 direct callers. Evidence: search, impact.",
+            "confidence": {"label": "high", "score": 0.92},
+            "evidence": [{"kind": "search_result", "source": "hybrid_search"}, {"kind": "impact", "source": "analyze_impact"}],
+            "citations": [{"id": "c1"}, {"id": "c2"}],
+        },
+        "abstain": {
+            "available": False,
+            "abstained": True,
+            "focus": {},
+            "answer": "",
+            "confidence": {"label": "low", "score": 0.0},
+            "evidence": [],
+            "citations": [],
+        },
+    }
+
+    def fake_answer(_store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5):
+        return responses[question]
+
+    report = evaluate_graph_rag_suite(
+        object(),
+        {
+            "name": "demo",
+            "cases": [
+                {"name": "grounded", "question": "grounded", "expect": {"available": True, "focus_id": "m1", "min_evidence_count": 2, "min_citation_count": 2, "requires_evidence_kinds": ["search_result", "impact"], "must_include_terms": ["Best match", "Impact"], "min_confidence": "medium"}},
+                {"name": "abstain", "question": "abstain", "expect": {"available": False, "abstained": True, "min_score": 70}},
+            ],
+            "gates": {"min_average_score": 80.0, "min_case_score": 70.0, "min_pass_rate": 1.0},
+        },
+        answer_fn=fake_answer,
+    )
+
+    assert report["suite"] == "demo"
+    assert report["summary"]["case_count"] == 2
+    assert report["summary"]["passed_count"] == 2
+    assert report["quality_gates"]["passed"] is True
+    assert all(case["passed"] for case in report["cases"])
+
+
+def test_graph_rag_evaluation_suite_honors_explicit_zero_case_settings():
+    captured: list[dict[str, int]] = []
+
+    def fake_answer(_store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5):
+        captured.append({"max_depth": max_depth, "k": k})
+        return {
+            "available": True,
+            "abstained": False,
+            "focus": {},
+            "answer": "ok",
+            "confidence": {"label": "high", "score": 0.9},
+            "evidence": [{"kind": "search_result", "source": "hybrid_search"}],
+            "citations": [{"id": "c1"}],
+        }
+
+    report = evaluate_graph_rag_suite(
+        object(),
+        {"cases": [{"question": "zero", "max_depth": 0, "k": 0, "expect": {"available": True}}]},
+        answer_fn=fake_answer,
+    )
+
+    assert captured == [{"max_depth": 0, "k": 0}]
+    assert report["cases"][0]["max_depth"] == 0
+    assert report["cases"][0]["k"] == 0
+
+
+def test_graph_rag_score_terms_require_whole_term_matches():
+    result = {
+        "available": True,
+        "abstained": False,
+        "focus": {},
+        "answer": "Best match: com.example.PaymentService#processPayment. Impact: 1 direct callers.",
+        "confidence": {"label": "high", "score": 0.92},
+        "evidence": [{"kind": "search_result", "source": "hybrid_search"}],
+        "citations": [{"id": "c1"}],
+    }
+
+    assert score_graph_rag_answer(result, {"must_include_terms": ["processPayment"]})["passed"] is True
+
+    report = score_graph_rag_answer(result, {"must_include_terms": ["process"]})
+    assert report["passed"] is False
+    assert any(check["name"] == "answer_terms" and check["passed"] is False for check in report["checks"])
+
+
 def test_graph_rag_answer_abstains_on_near_competing_symbol_candidates(monkeypatch):
     context = {
         "query": "loadAccount",
@@ -498,6 +622,71 @@ def test_cli_answer_forwards_question_and_contract(monkeypatch):
     assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5}
     payload = json.loads(result.output)
     assert payload["answer"] == "ok"
+
+
+def test_cli_answer_eval_forwards_suite_and_thresholds(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+    suite_path = tmp_path / "suite.json"
+    suite_path.write_text(json.dumps({"name": "demo", "cases": []}), encoding="utf-8")
+
+    monkeypatch.setattr("codespine.cli._open_store", lambda read_only=True: object())
+
+    def fake_evaluate(store, suite_payload, *, project: str | None = None, max_depth: int = 3, k: int = 5, gates: dict | None = None):
+        captured.update({"suite": suite_payload, "project": project, "max_depth": max_depth, "k": k, "gates": gates})
+        return {"summary": {"case_count": 0, "passed_count": 0, "failed_count": 0, "average_score": 0.0, "min_score": 0.0, "pass_rate": 0.0}, "quality_gates": {"passed": True, "thresholds": gates or {}, "violations": []}, "cases": []}
+
+    monkeypatch.setattr("codespine.cli.evaluate_graph_rag_suite", fake_evaluate)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "answer-eval",
+            "--suite",
+            str(suite_path),
+            "--project",
+            "app",
+            "--max-depth",
+            "4",
+            "--k",
+            "3",
+            "--min-average-score",
+            "88",
+            "--min-case-score",
+            "70",
+            "--min-pass-rate",
+            "1.0",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["project"] == "app"
+    assert captured["max_depth"] == 4
+    assert captured["k"] == 3
+    assert captured["gates"] == {"min_average_score": 88.0, "min_case_score": 70.0, "min_pass_rate": 1.0}
+    payload = json.loads(result.output)
+    assert payload["quality_gates"]["passed"] is True
+
+
+def test_cli_answer_eval_preserves_suite_gates_without_overrides(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+    suite_path = tmp_path / "suite.json"
+    suite_path.write_text(json.dumps({"name": "demo", "gates": {"min_average_score": 91.0, "min_case_score": 82.0, "min_pass_rate": 0.5}, "cases": []}), encoding="utf-8")
+
+    monkeypatch.setattr("codespine.cli._open_store", lambda read_only=True: object())
+
+    def fake_evaluate(store, suite_payload, *, project: str | None = None, max_depth: int = 3, k: int = 5, gates: dict | None = None):
+        captured.update({"suite": suite_payload, "project": project, "max_depth": max_depth, "k": k, "gates": gates})
+        return {"summary": {"case_count": 0, "passed_count": 0, "failed_count": 0, "average_score": 0.0, "min_score": 0.0, "pass_rate": 0.0}, "quality_gates": {"passed": True, "thresholds": suite_payload.get("gates", {}), "violations": []}, "cases": []}
+
+    monkeypatch.setattr("codespine.cli.evaluate_graph_rag_suite", fake_evaluate)
+
+    result = CliRunner().invoke(main, ["answer-eval", "--suite", str(suite_path), "--json"])
+
+    assert result.exit_code == 0
+    assert captured["gates"] == {}
+    payload = json.loads(result.output)
+    assert payload["quality_gates"]["thresholds"] == {"min_average_score": 91.0, "min_case_score": 82.0, "min_pass_rate": 0.5}
 
 
 def test_mcp_answer_tool_is_exposed_and_forwarded(monkeypatch):

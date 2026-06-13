@@ -27,7 +27,7 @@ from codespine.analysis.deadcode import detect_dead_code
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
 from codespine.config import SETTINGS
-from codespine.graphrag import graph_rag_answer
+from codespine.graphrag import evaluate_graph_rag_suite, graph_rag_answer
 from codespine.sharding import ShardedGraphStore, ShardRouter
 from codespine.diff.branch_diff import compare_branches
 from codespine.health import index_health, project_health, smoke_test_index
@@ -1539,6 +1539,65 @@ def answer(question: str, project: str | None, max_depth: int, k: int, as_json: 
     store = _open_store(read_only=True)
     result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
     _echo_json(result, as_json)
+
+
+@main.command("answer-eval")
+@click.pass_context
+@click.option("--suite", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--project", default=None)
+@click.option("--max-depth", default=3, show_default=True, type=int)
+@click.option("--k", default=5, show_default=True, type=int)
+@click.option("--min-average-score", default=80.0, show_default=True, type=float)
+@click.option("--min-case-score", default=70.0, show_default=True, type=float)
+@click.option("--min-pass-rate", default=1.0, show_default=True, type=float)
+@click.option("--json", "as_json", is_flag=True)
+def answer_eval_cmd(
+    ctx: click.Context,
+    suite: str,
+    project: str | None,
+    max_depth: int,
+    k: int,
+    min_average_score: float,
+    min_case_score: float,
+    min_pass_rate: float,
+    as_json: bool,
+) -> None:
+    """Run GraphRAG regression cases and enforce quality gates."""
+    with open(suite, "r", encoding="utf-8") as handle:
+        suite_payload = json.load(handle)
+    store = _open_store(read_only=True)
+    gates: dict[str, object] = {}
+    if ctx.get_parameter_source("min_average_score") == click.core.ParameterSource.COMMANDLINE:
+        gates["min_average_score"] = min_average_score
+    if ctx.get_parameter_source("min_case_score") == click.core.ParameterSource.COMMANDLINE:
+        gates["min_case_score"] = min_case_score
+    if ctx.get_parameter_source("min_pass_rate") == click.core.ParameterSource.COMMANDLINE:
+        gates["min_pass_rate"] = min_pass_rate
+    result = evaluate_graph_rag_suite(
+        store,
+        suite_payload,
+        project=project,
+        max_depth=max_depth,
+        k=k,
+        gates=gates,
+    )
+    if as_json:
+        _echo_json(result, True)
+    else:
+        summary = result.get("summary", {})
+        gates = result.get("quality_gates", {})
+        click.echo(
+            f"GraphRAG regression suite: {summary.get('passed_count', 0)}/{summary.get('case_count', 0)} passed, "
+            f"average score {float(summary.get('average_score', 0.0)):.2f}, min score {float(summary.get('min_score', 0.0)):.2f}"
+        )
+        if gates.get("passed"):
+            click.secho("Quality gates passed.", fg="green")
+        else:
+            click.secho("Quality gates failed.", fg="red")
+            for violation in gates.get("violations", []):
+                click.echo(f"  - {violation.get('message', '')}")
+    if not result.get("quality_gates", {}).get("passed"):
+        raise SystemExit(1)
 
 
 @main.command()

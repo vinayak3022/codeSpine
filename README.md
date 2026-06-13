@@ -196,6 +196,7 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 | Tool | Description |
 |------|-------------|
 | `answer(question, project)` | GraphRAG answer surface with reranked evidence, evidence subgraph, citations, confidence, latency observability, cache-aware execution, and safe abstention on ambiguity or weak grounding. |
+| `answer-eval(suite, project)` | Run a GraphRAG regression suite, score answers against expectations, and enforce quality gates in CI. |
 | `ask(question, project)` | Keyword-based natural language dispatcher: routes "who calls X", "what breaks if Y", "explain Z", "find methods named …" to the right tool automatically. |
 | `what_breaks(symbol, project)` | Plain-English blast-radius summary with `risk_level` (low / medium / high). |
 | `explain(symbol, project)` | What a class or method does and how it fits in the architecture. |
@@ -281,6 +282,7 @@ codespine watch --path . --uninstall-hook    # remove git hook
 
 # Search & Analysis (CLI)
 codespine answer "question" --project app    # GraphRAG answer with evidence subgraph/citations/confidence
+codespine answer-eval --suite graphrag-suite.json --project app  # GraphRAG regression scoring + quality gates
 codespine search "query" --project app       # scoped hybrid search
 codespine search "query" --explain           # provenance-aware hybrid search
 codespine context "symbol"                   # one-shot deep context
@@ -322,6 +324,8 @@ codespine force-reset                        # emergency: delete all data files
 `analyse` defaults to incremental mode. Repeat runs only process changed files and are fast.
 
 `analyse` is trust-first by default: it completes the core graph in the foreground, validates and publishes the read replica, then keeps deep enrichment moving in the background. Use `--fast` only when you want a budgeted partial core index. Use `codespine background`, `codespine ui`, or `codespine repair` to inspect and recover incomplete or degraded work.
+
+GraphRAG regression suites are JSON objects with `cases` and optional `gates` thresholds. Each case can assert availability, abstention, focus, evidence kinds, citations, and confidence.
 
 ---
 

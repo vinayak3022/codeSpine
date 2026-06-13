@@ -7,6 +7,10 @@ Semantic Versioning where practical.
 
 ## [Unreleased]
 
+### Added
+
+- Added `codespine answer-eval` plus reusable GraphRAG regression scoring and quality-gate helpers so CI can continuously evaluate answer quality without touching the index schema or indexer pipeline.
+
 ## [1.0.13] - 2026-04-21
 
 ### Changed

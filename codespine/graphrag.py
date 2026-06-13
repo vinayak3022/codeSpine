@@ -948,3 +948,279 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
     result["observability"]["latency_ms"]["cache_lookup"] = 0
     _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
     return result
+
+
+def _confidence_label_rank(value: object) -> int:
+    label = str(value or "").strip().lower()
+    return {"low": 0, "medium": 1, "high": 2}.get(label, -1)
+
+
+def _confidence_score(result: dict[str, object]) -> float:
+    confidence = result.get("confidence")
+    if isinstance(confidence, dict):
+        score = confidence.get("score")
+        if isinstance(score, (int, float)):
+            return max(0.0, min(float(score), 1.0))
+        return float(max(_confidence_label_rank(confidence.get("label")), 0)) / 2.0
+    if isinstance(confidence, (int, float)):
+        return max(0.0, min(float(confidence), 1.0))
+    return 0.0
+
+
+def _normalized_term_tokens(text: str) -> list[str]:
+    normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+    return [token for token in normalized.split() if token]
+
+
+def _term_matches(text: str, term: str) -> bool:
+    text_tokens = _normalized_term_tokens(text)
+    term_tokens = _normalized_term_tokens(term)
+    if not text_tokens or not term_tokens:
+        return False
+    if len(term_tokens) == 1:
+        return term_tokens[0] in text_tokens
+    window = len(term_tokens)
+    return any(text_tokens[index : index + window] == term_tokens for index in range(len(text_tokens) - window + 1))
+
+
+def score_graph_rag_answer(result: dict[str, object], expectation: dict[str, object] | None = None) -> dict[str, object]:
+    """Score a GraphRAG response against an expected contract."""
+    expectation = expectation or {}
+    evidence = list(result.get("evidence") or [])
+    citations = list(result.get("citations") or [])
+    focus = result.get("focus") or {}
+    answer = str(result.get("answer") or "")
+    evidence_kinds = [str(item.get("kind") or "") for item in evidence]
+    evidence_sources = [str(item.get("source") or item.get("kind") or "") for item in evidence]
+    checks: list[dict[str, object]] = []
+    score = 40.0
+
+    def add_check(name: str, passed: bool, delta: float, message: str) -> None:
+        nonlocal score
+        score += delta
+        checks.append({"name": name, "passed": passed, "delta": round(delta, 2), "message": message})
+
+    available_expected = expectation.get("available")
+    if available_expected is not None:
+        matches = bool(result.get("available")) == bool(available_expected)
+        add_check("available", matches, 10.0 if matches else -20.0, "availability matches expectation" if matches else "availability mismatch")
+    else:
+        if result.get("available"):
+            add_check("available", True, 8.0, "response is available")
+
+    abstained_expected = expectation.get("abstained")
+    if abstained_expected is not None:
+        matches = bool(result.get("abstained")) == bool(abstained_expected)
+        add_check("abstained", matches, 20.0 if matches else -20.0, "abstention matches expectation" if matches else "abstention mismatch")
+
+    expected_focus = str(expectation.get("focus_id") or expectation.get("focus_fqname") or expectation.get("focus_name") or "").strip()
+    if expected_focus:
+        actual_focus = str(focus.get("id") or focus.get("symbol_id") or focus.get("fqname") or focus.get("name") or "").strip()
+        matches = actual_focus == expected_focus
+        if not matches and actual_focus and expected_focus:
+            matches = expected_focus in actual_focus or actual_focus in expected_focus
+        add_check("focus", matches, 15.0 if matches else -18.0, "focus matches expectation" if matches else "focus mismatch")
+
+    min_evidence_count = expectation.get("min_evidence_count")
+    if isinstance(min_evidence_count, int):
+        matches = len(evidence) >= min_evidence_count
+        delta = 10.0 if matches else max(-10.0, -4.0 * float(min_evidence_count - len(evidence)))
+        add_check("evidence_count", matches, delta, f"evidence count >= {min_evidence_count}" if matches else f"evidence count below {min_evidence_count}")
+    else:
+        add_check("evidence_count", len(evidence) > 0, min(10.0, len(evidence) * 2.0), f"{len(evidence)} evidence item(s) selected")
+
+    min_citation_count = expectation.get("min_citation_count")
+    if isinstance(min_citation_count, int):
+        matches = len(citations) >= min_citation_count
+        delta = 8.0 if matches else max(-8.0, -4.0 * float(min_citation_count - len(citations)))
+        add_check("citation_count", matches, delta, f"citation count >= {min_citation_count}" if matches else f"citation count below {min_citation_count}")
+    else:
+        add_check("citation_count", len(citations) > 0, min(8.0, len(citations) * 2.0), f"{len(citations)} citation(s) selected")
+
+    required_kinds = {str(kind) for kind in expectation.get("requires_evidence_kinds") or [] if str(kind)}
+    if required_kinds:
+        present = set(evidence_kinds)
+        missing = sorted(required_kinds - present)
+        matches = not missing
+        delta = 12.0 if matches else -6.0 * float(len(missing))
+        add_check("evidence_kinds", matches, delta, "required evidence kinds present" if matches else f"missing evidence kinds: {', '.join(missing)}")
+
+    expected_terms = [str(term).strip() for term in expectation.get("must_include_terms") or [] if str(term).strip()]
+    if expected_terms:
+        missing_terms = [term for term in expected_terms if not _term_matches(answer, term)]
+        matches = not missing_terms
+        delta = 8.0 if matches else -4.0 * float(len(missing_terms))
+        add_check("answer_terms", matches, delta, "required answer terms present" if matches else f"missing answer terms: {', '.join(missing_terms)}")
+
+    forbidden_terms = [str(term).strip() for term in expectation.get("must_not_include_terms") or [] if str(term).strip()]
+    if forbidden_terms:
+        present_terms = [term for term in forbidden_terms if _term_matches(answer, term)]
+        matches = not present_terms
+        delta = 6.0 if matches else -6.0 * float(len(present_terms))
+        add_check("forbidden_terms", matches, delta, "forbidden terms absent" if matches else f"forbidden terms present: {', '.join(present_terms)}")
+
+    min_confidence = expectation.get("min_confidence")
+    if min_confidence is not None:
+        actual_confidence = result.get("confidence") or {}
+        actual_score = _confidence_score(result)
+        if isinstance(min_confidence, (int, float)):
+            threshold = float(min_confidence)
+            matches = actual_score >= threshold
+            delta = 10.0 if matches else -10.0
+            add_check("confidence", matches, delta, f"confidence score >= {threshold:.2f}" if matches else f"confidence score below {threshold:.2f}")
+        else:
+            threshold_rank = _confidence_label_rank(min_confidence)
+            actual_rank = _confidence_label_rank(actual_confidence.get("label") if isinstance(actual_confidence, dict) else actual_confidence)
+            matches = actual_rank >= threshold_rank >= 0
+            delta = 10.0 if matches else -10.0
+            add_check("confidence", matches, delta, f"confidence label >= {min_confidence}" if matches else f"confidence label below {min_confidence}")
+    else:
+        score = min(100.0, score + _confidence_score(result) * 10.0)
+
+    if result.get("available") and not answer.strip():
+        add_check("answer_non_empty", False, -20.0, "available answer should not be empty")
+    elif answer.strip():
+        add_check("answer_non_empty", True, 6.0, "answer text is populated")
+
+    if evidence:
+        add_check("signal_mix", True, min(8.0, len(set(evidence_sources)) * 2.0), f"{len(set(evidence_sources))} supporting signal(s)")
+
+    score = max(0.0, min(100.0, score))
+    passed = score >= float(expectation.get("min_score", 75.0))
+    if expectation.get("available") is not None and bool(result.get("available")) != bool(expectation.get("available")):
+        passed = False
+    if expectation.get("abstained") is not None and bool(result.get("abstained")) != bool(expectation.get("abstained")):
+        passed = False
+    if expected_focus:
+        actual_focus = str(focus.get("id") or focus.get("symbol_id") or focus.get("fqname") or focus.get("name") or "").strip()
+        if actual_focus and actual_focus != expected_focus and expected_focus not in actual_focus and actual_focus not in expected_focus:
+            passed = False
+    if required_kinds and not required_kinds.issubset(set(evidence_kinds)):
+        passed = False
+    if expected_terms and any(not _term_matches(answer, term) for term in expected_terms):
+        passed = False
+    if forbidden_terms and any(_term_matches(answer, term) for term in forbidden_terms):
+        passed = False
+
+    return {
+        "score": round(score, 2),
+        "passed": passed,
+        "checks": checks,
+        "expected": expectation,
+        "observed": {
+            "available": bool(result.get("available")),
+            "abstained": bool(result.get("abstained")),
+            "focus_id": str(focus.get("id") or focus.get("symbol_id") or focus.get("fqname") or focus.get("name") or ""),
+            "evidence_count": len(evidence),
+            "citation_count": len(citations),
+            "evidence_kinds": evidence_kinds,
+            "confidence": result.get("confidence"),
+        },
+    }
+
+
+def evaluate_graph_rag_suite(
+    store,
+    suite: dict[str, object] | list[dict[str, object]],
+    *,
+    project: str | None = None,
+    max_depth: int = 3,
+    k: int = 5,
+    answer_fn=graph_rag_answer,
+    gates: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Run a GraphRAG regression suite and apply quality gates."""
+    suite_name = "graph_rag_suite"
+    suite_gates: dict[str, object] = {}
+    if isinstance(suite, dict):
+        suite_name = str(suite.get("name") or suite_name)
+        suite_gates = dict(suite.get("gates") or {})
+        cases = list(suite.get("cases") or [])
+    else:
+        cases = list(suite)
+    effective_gates = {
+        "min_average_score": 80.0,
+        "min_case_score": 70.0,
+        "min_pass_rate": 1.0,
+    }
+    effective_gates.update({k: v for k, v in suite_gates.items() if v is not None})
+    if gates:
+        effective_gates.update({k: v for k, v in gates.items() if v is not None})
+
+    case_reports: list[dict[str, object]] = []
+    for index, case in enumerate(cases, start=1):
+        if not isinstance(case, dict):
+            continue
+        question = str(case.get("question") or case.get("query") or "")
+        case_project = case.get("project") if case.get("project") is not None else project
+        case_max_depth = int(case.get("max_depth") if case.get("max_depth") is not None else max_depth)
+        case_k = int(case.get("k") if case.get("k") is not None else k)
+        result = answer_fn(store, question, project=case_project, max_depth=case_max_depth, k=case_k)
+        score_report = score_graph_rag_answer(result, dict(case.get("expect") or case.get("expected") or {}))
+        case_score = float(score_report["score"])
+        case_reports.append(
+            {
+                "name": str(case.get("name") or f"case-{index}"),
+                "question": question,
+                "project": case_project,
+                "max_depth": case_max_depth,
+                "k": case_k,
+                "regression_score": case_score,
+                "passed": bool(score_report["passed"]),
+                "checks": score_report["checks"],
+                "observed": score_report["observed"],
+                "note": result.get("note"),
+            }
+        )
+
+    case_count = len(case_reports)
+    passed_count = sum(1 for case in case_reports if case["passed"])
+    failed_count = case_count - passed_count
+    scores = [float(case["regression_score"]) for case in case_reports]
+    average_score = round(sum(scores) / case_count, 2) if case_count else 0.0
+    min_score = round(min(scores), 2) if case_count else 0.0
+    pass_rate = round(passed_count / case_count, 4) if case_count else 0.0
+
+    violations: list[dict[str, object]] = []
+    if case_count == 0:
+        violations.append({"code": "empty_suite", "message": "No GraphRAG regression cases were supplied."})
+    if case_count and average_score < float(effective_gates["min_average_score"]):
+        violations.append(
+            {
+                "code": "average_score",
+                "message": f"Average regression score {average_score:.2f} is below {float(effective_gates['min_average_score']):.2f}.",
+            }
+        )
+    if case_count and min_score < float(effective_gates["min_case_score"]):
+        violations.append(
+            {
+                "code": "case_score",
+                "message": f"Lowest regression score {min_score:.2f} is below {float(effective_gates['min_case_score']):.2f}.",
+            }
+        )
+    if case_count and pass_rate < float(effective_gates["min_pass_rate"]):
+        violations.append(
+            {
+                "code": "pass_rate",
+                "message": f"Pass rate {pass_rate:.4f} is below {float(effective_gates['min_pass_rate']):.4f}.",
+            }
+        )
+
+    return {
+        "available": True,
+        "suite": suite_name,
+        "cases": case_reports,
+        "summary": {
+            "case_count": case_count,
+            "passed_count": passed_count,
+            "failed_count": failed_count,
+            "average_score": average_score,
+            "min_score": min_score,
+            "pass_rate": pass_rate,
+        },
+        "quality_gates": {
+            "passed": not violations,
+            "thresholds": effective_gates,
+            "violations": violations,
+        },
+    }
