@@ -1740,6 +1740,15 @@ def health_cmd(as_json: bool) -> None:
                 fg="yellow" if anomaly.get("severity") != "critical" else "red",
             )
 
+    integrity = result.get("graph_integrity", {})
+    issues = integrity.get("issues", []) if isinstance(integrity, dict) else []
+    if issues:
+        click.echo()
+        click.secho("Graph integrity:", fg="cyan")
+        for issue in issues:
+            fg = "red" if issue.get("severity") == "critical" else "yellow"
+            click.secho(f"  - {issue.get('severity', 'warning')}: {issue.get('message', '')}", fg=fg)
+
 
 @main.command("self-test")
 @click.option("--json", "as_json", is_flag=True)

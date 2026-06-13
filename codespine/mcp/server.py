@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json as _json_mod
+import inspect
 import logging
 import os
 import subprocess
@@ -231,6 +232,66 @@ def _project_inventory(store) -> list[dict]:
     return out
 
 
+def _sum_count_rows(rows: list[dict]) -> int:
+    total = 0
+    for row in rows or []:
+        if "count" in row:
+            total += int(row["count"] or 0)
+        elif "n" in row:
+            total += int(row["n"] or 0)
+        elif "total" in row:
+            total += int(row["total"] or 0)
+        elif "linked" in row:
+            total += int(row["linked"] or 0)
+        else:
+            total += int(next(iter(row.values()), 0) or 0)
+    return total
+
+
+def _snapshot_mtime_for_path(path: str) -> float:
+    try:
+        if path and os.path.exists(path):
+            return os.path.getmtime(path)
+    except OSError:
+        pass
+    return 0.0
+
+
+def _store_snapshot_mtime(store, project: str | None = None) -> float:
+    try:
+        router = getattr(store, "router", None)
+        if router is not None and hasattr(router, "all_shards") and hasattr(router, "snapshot_path"):
+            shard_ids = list(router.all_shards())
+            mtimes = [
+                _snapshot_mtime_for_path(router.snapshot_path(idx) + ".updated")
+                for idx in shard_ids
+            ]
+            return max(mtimes, default=0.0)
+        snapshot_path = getattr(store, "_snapshot_path", "")
+        return _snapshot_mtime_for_path(snapshot_path + ".updated")
+    except Exception:
+        return 0.0
+
+
+def _reload_store_instance(store):
+    cls = type(store)
+    params = inspect.signature(cls).parameters
+    kwargs = {}
+    if "read_only" in params:
+        kwargs["read_only"] = True
+    if "backend" in params and hasattr(store, "backend"):
+        kwargs["backend"] = getattr(store, "backend")
+    if "db_path_override" in params and hasattr(store, "_db_path"):
+        kwargs["db_path_override"] = getattr(store, "_db_path")
+    if "snapshot_path_override" in params and hasattr(store, "_snapshot_path"):
+        kwargs["snapshot_path_override"] = getattr(store, "_snapshot_path")
+    if "num_shards" in params and hasattr(store, "router"):
+        kwargs["num_shards"] = getattr(store.router, "num_shards", None)
+    if "shards_dir" in params and hasattr(store, "router"):
+        kwargs["shards_dir"] = getattr(store.router, "shards_dir", None)
+    return cls(**kwargs)
+
+
 class _StoreProxy:
     """Wraps a GraphStore and hot-reloads from the read replica when the
     post-analyse sentinel file is touched.
@@ -256,12 +317,11 @@ class _StoreProxy:
     def _maybe_reload(self) -> None:
         current = self._sentinel_mtime()
         if current > object.__getattribute__(self, "_last_mtime"):
-            from codespine.db.store import GraphStore as _GS
             try:
-                new_store = _GS(read_only=True)
+                new_store = _reload_store_instance(object.__getattribute__(self, "_store"))
                 object.__setattr__(self, "_store", new_store)
                 object.__setattr__(self, "_last_mtime", current)
-                _LOGGER.info("MCP: hot-reloaded GraphStore from updated snapshot")
+                _LOGGER.info("MCP: hot-reloaded %s from updated snapshot", type(new_store).__name__)
             except Exception as exc:
                 _LOGGER.warning("MCP: hot-reload failed: %s", exc)
 
@@ -314,11 +374,7 @@ def build_mcp_server(store, repo_path_provider):
 
     def _cache_key(tool_name: str, **kwargs):
         """Build a cache key using current snapshot mtime."""
-        try:
-            sentinel = getattr(store, "_snapshot_path", "") + ".updated"
-            mtime = os.path.getmtime(sentinel) if os.path.exists(sentinel) else 0.0
-        except OSError:
-            mtime = 0.0
+        mtime = _store_snapshot_mtime(store, kwargs.get("project"))
         return ResultCache.make_key(tool_name, kwargs, mtime)
 
     # FR-03: Auto-start watch if indexed projects exist and watch is not running.
@@ -389,10 +445,10 @@ def build_mcp_server(store, repo_path_provider):
                     git_ok = True
                     break
 
-        n_sym = sym_q[0]["count"] if sym_q else 0
-        n_comm = comm_q[0]["count"] if comm_q else 0
-        n_flows = flow_q[0]["count"] if flow_q else 0
-        n_coup = coup_q[0]["count"] if coup_q else 0
+        n_sym = _sum_count_rows(sym_q)
+        n_comm = _sum_count_rows(comm_q)
+        n_flows = _sum_count_rows(flow_q)
+        n_coup = _sum_count_rows(coup_q)
         queryable_projects = [p for p in projects if p.get("project_state") in {"ready", "enriching", "degraded"}]
         partial_projects = [p for p in projects if p.get("project_state") == "partial"]
         search_ready = bool(queryable_projects and n_sym > 0)
@@ -401,7 +457,7 @@ def build_mcp_server(store, repo_path_provider):
         emb_q = store.query_records(
             "MATCH (s:Symbol) WHERE s.embedding IS NOT NULL RETURN count(s) as count"
         )
-        has_stored_embeddings = (emb_q[0]["count"] if emb_q else 0) > 0
+        has_stored_embeddings = _sum_count_rows(emb_q) > 0
 
         watch_running = _watch["proc"] is not None and _watch["proc"].poll() is None
         analyse_running = _analyse["proc"] is not None and _analyse["proc"].poll() is None
@@ -411,9 +467,11 @@ def build_mcp_server(store, repo_path_provider):
             health = index_health(store)
             health_summary = health.get("summary", {})
             health_projects = health.get("projects", [])
+            health_integrity = health.get("graph_integrity", {})
         except Exception:
             health_summary = {}
             health_projects = []
+            health_integrity = {}
 
         now = int(time.time())
         stale_projects = []
@@ -509,6 +567,7 @@ def build_mcp_server(store, repo_path_provider):
             "index_health": {
                 "summary": health_summary,
                 "projects": health_projects,
+                "graph_integrity": health_integrity,
             },
             "overlay_projects": overlay_status,
             "notes": notes,
@@ -883,11 +942,11 @@ def build_mcp_server(store, repo_path_provider):
                 "MATCH (s:Symbol), (f:File) WHERE s.file_id = f.id AND f.project_id = $pid AND s.embedding IS NOT NULL RETURN count(s) as n",
                 {"pid": pid},
             )
-            n_files = files[0]["n"] if files else 0
-            n_classes = classes[0]["n"] if classes else 0
-            n_methods = methods[0]["n"] if methods else 0
-            n_calls = calls[0]["n"] if calls else 0
-            n_emb = emb[0]["n"] if emb else 0
+            n_files = _sum_count_rows(files)
+            n_classes = _sum_count_rows(classes)
+            n_methods = _sum_count_rows(methods)
+            n_calls = _sum_count_rows(calls)
+            n_emb = _sum_count_rows(emb)
             per_project.append({
                 "project_id": pid,
                 "path": p["path"],

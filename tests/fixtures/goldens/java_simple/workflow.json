@@ -1,0 +1,83 @@
+{
+  "search": {
+    "result_count": 3,
+    "top_result": {
+      "kind": "method",
+      "name": "processPayment",
+      "fqname": "com.example.Service#processPayment()",
+      "confidence": "low",
+      "file_path": "src/main/java/com/example/Service.java"
+    }
+  },
+  "impact": {
+    "resolved_to": [
+      "testProcessPayment",
+      "processPayment"
+    ],
+    "direct_callers": [
+      "main"
+    ],
+    "summary": {
+      "direct": 1,
+      "indirect": 0,
+      "transitive": 0,
+      "self_callers": 0
+    }
+  },
+  "flows": {
+    "count": 1,
+    "paths": [
+      [
+        "main",
+        "processPayment",
+        "helper"
+      ]
+    ]
+  },
+  "deadcode": {
+    "dead_methods": [
+      "main"
+    ],
+    "stats": {
+      "candidates_with_no_callers": 2,
+      "exempted": 1,
+      "dead_returned": 1,
+      "mode": "normal",
+      "note": "Exemptions cover: constructors, test methods, main(), toString/hashCode/equals/compareTo, public getters/setters, methods with DI/framework annotations, and direct method overrides. Use strict=True for minimal exemptions.",
+      "exemptions_breakdown": {
+        "test_method": 1
+      },
+      "exempted_sample": [
+        {
+          "name": "testProcessPayment",
+          "signature": "testProcessPayment()",
+          "class_fqcn": "com.example.ServiceTest",
+          "exemption_reason": "test_method"
+        }
+      ]
+    }
+  },
+  "health": {
+    "summary": {
+      "project_count": 1,
+      "anomaly_count": 0,
+      "critical_count": 0,
+      "state_counts": {
+        "ready": 1
+      }
+    },
+    "project": {
+      "project_id": "java_simple",
+      "project_state": "ready",
+      "files": 3,
+      "classes": 3,
+      "methods": 4,
+      "calls": 3,
+      "call_edge_coverage": 0.75
+    },
+    "graph_integrity": {
+      "issue_count": 0,
+      "issue_codes": []
+    }
+  }
+}

@@ -15,12 +15,72 @@ def _count(store, query: str, params: dict[str, Any] | None = None) -> int:
     rows = store.query_records(query, params or {})
     if not rows:
         return 0
-    row = rows[0]
-    if "n" in row:
-        return int(row["n"])
-    if "count" in row:
-        return int(row["count"])
-    return int(next(iter(row.values()), 0))
+    total = 0
+    for row in rows:
+        if "n" in row:
+            total += int(row["n"] or 0)
+        elif "count" in row:
+            total += int(row["count"] or 0)
+        elif "total" in row:
+            total += int(row["total"] or 0)
+        elif "linked" in row:
+            total += int(row["linked"] or 0)
+        else:
+            total += int(next(iter(row.values()), 0) or 0)
+    return total
+
+
+def graph_integrity_checks(store) -> dict[str, Any]:
+    """Return graph-shape checks for dangling nodes and links."""
+    checks = [
+        (
+            "files_without_project",
+            "MATCH (f:File) RETURN count(f) as total",
+            "MATCH (f:File), (p:Project) WHERE f.project_id = p.id RETURN count(f) as linked",
+            "critical",
+            "File nodes with missing project links",
+        ),
+        (
+            "classes_without_file",
+            "MATCH (c:Class) RETURN count(c) as total",
+            "MATCH (c:Class), (f:File) WHERE c.file_id = f.id RETURN count(c) as linked",
+            "critical",
+            "Class nodes with missing file links",
+        ),
+        (
+            "methods_without_class",
+            "MATCH (m:Method) RETURN count(m) as total",
+            "MATCH (m:Method), (c:Class) WHERE m.class_id = c.id RETURN count(m) as linked",
+            "critical",
+            "Method nodes with missing class links",
+        ),
+        (
+            "symbols_without_file",
+            "MATCH (s:Symbol) RETURN count(s) as total",
+            "MATCH (s:Symbol), (f:File) WHERE s.file_id = f.id RETURN count(s) as linked",
+            "warning",
+            "Symbol nodes with missing file links",
+        ),
+    ]
+
+    coverage: dict[str, Any] = {}
+    issues: list[dict[str, Any]] = []
+    for code, total_query, linked_query, severity, label in checks:
+        total = _count(store, total_query)
+        linked = _count(store, linked_query)
+        dangling = max(0, total - linked)
+        coverage[code] = {"total": total, "linked": linked, "dangling": dangling}
+        if dangling:
+            issues.append(
+                {
+                    "severity": severity,
+                    "code": code,
+                    "count": dangling,
+                    "message": f"{dangling} {label.lower()}.",
+                }
+            )
+
+    return {"checks": coverage, "issues": issues, "issue_count": len(issues)}
 
 
 def project_health(
@@ -140,12 +200,14 @@ def index_health(store) -> dict[str, Any]:
         item["shard"] = snap.get("shard") if snap.get("shard") is not None else (store.router.shard_for(pid) if hasattr(store, "router") else None)
         per_project.append(item)
     anomalies = [a for p in per_project for a in p.get("anomalies", [])]
+    graph_integrity = graph_integrity_checks(store)
     state_counts: dict[str, int] = {}
     for project in per_project:
         state = str(project.get("project_state") or "unknown")
         state_counts[state] = state_counts.get(state, 0) + 1
     return {
         "projects": per_project,
+        "graph_integrity": graph_integrity,
         "summary": {
             "project_count": len(per_project),
             "anomaly_count": len(anomalies),

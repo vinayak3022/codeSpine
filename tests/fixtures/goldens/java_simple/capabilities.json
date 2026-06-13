@@ -1,0 +1,101 @@
+{
+  "guide": {
+    "section_ids": [
+      "overview",
+      "quickstart",
+      "tools_discovery",
+      "tools_search",
+      "tools_analysis",
+      "tools_git",
+      "tools_indexing",
+      "tools_overlay",
+      "tools_reset",
+      "tools_advanced",
+      "workflows",
+      "tips"
+    ],
+    "tool_names": {
+      "tools_discovery": [
+        "get_capabilities",
+        "list_projects",
+        "get_codebase_stats",
+        "list_packages",
+        "ping"
+      ],
+      "tools_search": [
+        "search_hybrid",
+        "answer",
+        "find_symbol",
+        "get_symbol_context",
+        "get_neighborhood"
+      ],
+      "tools_analysis": [
+        "get_impact",
+        "detect_dead_code",
+        "trace_execution_flows",
+        "get_symbol_community",
+        "get_change_coupling"
+      ],
+      "tools_git": [
+        "git_log",
+        "git_diff",
+        "compare_branches"
+      ],
+      "tools_indexing": [
+        "analyse_project",
+        "get_analyse_status",
+        "reindex_file",
+        "start_watch",
+        "stop_watch",
+        "get_watch_status"
+      ],
+      "tools_overlay": [
+        "get_overlay_status",
+        "promote_overlay",
+        "clear_overlay"
+      ],
+      "tools_reset": [
+        "reset_project",
+        "reset_index",
+        "force_reset_index"
+      ],
+      "tools_advanced": [
+        "run_cypher"
+      ]
+    }
+  },
+  "capabilities": {
+    "available": true,
+    "project": {
+      "project_id": "java_simple",
+      "path": "java_simple",
+      "project_state": "ready",
+      "core_state": "ready",
+      "deep_state": "idle"
+    },
+    "symbol_count": 7,
+    "features": {
+      "search_hybrid": true,
+      "get_impact": true,
+      "get_symbol_context": true,
+      "detect_dead_code": true,
+      "trace_execution_flows": true,
+      "get_neighborhood": true,
+      "community_detection": false,
+      "execution_flows": false,
+      "change_coupling": false
+    },
+    "index_health": {
+      "summary": {
+        "project_count": 1,
+        "anomaly_count": 0,
+        "critical_count": 0,
+        "state_counts": {
+          "ready": 1
+        }
+      },
+      "project_count": 1,
+      "graph_integrity_issue_count": 0
+    }
+  }
+}

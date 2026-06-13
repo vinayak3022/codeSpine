@@ -96,7 +96,7 @@ def get_coupling(store, symbol: str | None = None, days: int = 5, min_strength: 
         recs = store.query_records(
             """
             MATCH (s:Symbol)-[:DECLARES]-(f:File)-[r:CO_CHANGED_WITH]-(f2:File)
-            WHERE s.id = $q OR lower(s.fqname) = lower($q) OR lower(s.name) = lower($q)
+            WHERE (s.id = $q OR lower(s.fqname) = lower($q) OR lower(s.name) = lower($q))
             AND r.strength >= $min_strength AND r.cochanges >= $min_cochanges
             RETURN f.path as file, f2.path as coupled_file, r.strength as strength, r.cochanges as cochanges
             ORDER BY strength DESC, cochanges DESC

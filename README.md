@@ -511,7 +511,7 @@ The deep analysis phase covers four passes that are expensive but optional:
 
 **Fast mode:** `codespine analyse --fast` keeps the old budgeted behavior for large repos. If the budget expires before the core graph is complete, CodeSpine publishes a partial snapshot, marks the project as partial, and tracks the background continuation until the core graph is repaired.
 
-**Health checks:** every analyse run now performs a small self-test query suite and reports index anomalies such as large projects with zero call edges. Use `codespine health` for the terminal dashboard or `codespine self-test --json` in CI.
+**Health checks:** every analyse run now performs a small self-test query suite and reports index anomalies such as large projects with zero call edges, plus graph integrity checks for dangling files/classes/methods/symbols. Use `codespine health` for the terminal dashboard or `codespine self-test --json` in CI.
 
 **Background visibility:** `codespine background` shows status, result, last phase, progress, and repair hints in the terminal, and `codespine tasks` remains available as the shorter registry view. `codespine ui` serves a local explorer with project state (`ready`, `enriching`, `partial`, `degraded`, `repair_required`), background tasks, and one-click Repair/Reindex actions at `http://127.0.0.1:8765`.
 
