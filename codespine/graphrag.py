@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from difflib import SequenceMatcher
 
 from codespine.analysis.context import build_symbol_context
 
@@ -32,6 +33,154 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
             seen.add(value)
             ordered.append(value)
     return ordered
+
+
+def _candidate_snapshot(candidate: dict[str, object], *, rank: int | None = None) -> dict[str, object]:
+    snapshot = {
+        "id": candidate.get("id"),
+        "name": candidate.get("name"),
+        "fqname": candidate.get("fqname"),
+        "file_path": candidate.get("file_path"),
+        "line": candidate.get("line"),
+        "score": candidate.get("score"),
+        "confidence": candidate.get("confidence"),
+    }
+    if rank is not None:
+        snapshot["rank"] = rank
+    return snapshot
+
+
+def _symbol_variants(candidate: dict[str, object]) -> list[str]:
+    variants: list[str] = []
+    for field in ("name", "fqname", "id"):
+        value = str(candidate.get(field) or "").strip().lower()
+        if not value:
+            continue
+        variants.append(value)
+        leaf = value.rsplit("#", 1)[-1].rsplit(".", 1)[-1].split("(", 1)[0]
+        if leaf and leaf not in variants:
+            variants.append(leaf)
+    return _unique_preserve_order(variants)
+
+
+def _detect_ambiguity(search_candidates: list[dict[str, object]]) -> dict[str, object] | None:
+    if len(search_candidates) < 2:
+        return None
+
+    top = search_candidates[0]
+    top_variants = _symbol_variants(top)
+    if not top_variants:
+        return None
+
+    top_score = float(top.get("score") or 0.0)
+    score_window = max(0.03, abs(top_score) * 0.05)
+
+    alternatives: list[dict[str, object]] = []
+    for rank, candidate in enumerate(search_candidates[1:5], start=2):
+        cand_variants = _symbol_variants(candidate)
+        if not cand_variants:
+            continue
+
+        cand_score = float(candidate.get("score") or 0.0)
+        same_symbol = any(left == right for left in top_variants for right in cand_variants)
+        if same_symbol:
+            alternatives.append(_candidate_snapshot(candidate, rank=rank))
+            continue
+
+        near_tie = cand_score >= top_score - score_window
+        if not near_tie:
+            continue
+
+        overlaps = any(left in right or right in left for left in top_variants for right in cand_variants)
+        similarity = max(SequenceMatcher(None, left, right).ratio() for left in top_variants for right in cand_variants)
+        if overlaps or similarity >= 0.8:
+            alternatives.append(_candidate_snapshot(candidate, rank=rank))
+
+    if not alternatives:
+        return None
+
+    return {
+        "status": "ambiguous",
+        "reason": "Multiple symbols match this query closely enough that guessing would be unsafe.",
+        "primary": _candidate_snapshot(top, rank=1),
+        "alternatives": alternatives,
+        "recommended_action": "Use find_symbol(name, project=..., limit=...) or qualify the package/class name.",
+    }
+
+
+def _abstain_response(
+    question: str,
+    *,
+    project: str | None,
+    max_depth: int,
+    k: int,
+    elapsed_ms: int,
+    search_candidates: list[dict[str, object]],
+    candidate_counts: dict[str, int],
+    note: str,
+    ambiguity: dict[str, object] | None = None,
+    context_note: str | None = None,
+) -> dict[str, object]:
+    response: dict[str, object] = {
+        "available": False,
+        "abstained": True,
+        "question": question,
+        "answer": "",
+        "focus": {},
+        "confidence": {
+            "label": "low",
+            "score": 0.0,
+            "reason": note,
+            "evidence_count": 0,
+            "evidence_kinds": [],
+            "supporting_signals": [],
+        },
+        "evidence": [],
+        "citations": [],
+        "evidence_subgraph": {"nodes": [], "edges": []},
+        "note": note,
+        "fallback": {
+            "recommended_tools": ["find_symbol", "search_hybrid"],
+            "reason": "The answer surface refused to guess without a unique, grounded symbol match.",
+        },
+        "answer_contract": {
+            "status": "abstained",
+            "grounded": False,
+            "requires_citations": True,
+            "fallback_mode": True,
+            "ambiguity": ambiguity,
+            "supported_by": [],
+        },
+        "supporting_context": {
+            "impact_summary": {},
+            "community": None,
+            "flow_count": 0,
+            "search_candidate_count": len(search_candidates),
+            "community_label": None,
+            "evidence_kinds": [],
+            "evidence_sources": [],
+            "evidence_subgraph_nodes": 0,
+            "evidence_subgraph_edges": 0,
+            "context_note": context_note,
+        },
+        "observability": {
+            "retrieval_mode": "graph_rag",
+            "primitives": _OBSERVABILITY_PRIMITIVES,
+            "elapsed_ms": elapsed_ms,
+            "project": project,
+            "max_depth": max_depth,
+            "k": k,
+            "search_candidates": len(search_candidates),
+            "evidence_count": 0,
+            "citation_count": 0,
+            "evidence_rerank": {"strategy": "utility_ranked", "candidate_counts": candidate_counts, "selected": []},
+        },
+    }
+    if ambiguity:
+        response["ambiguity"] = ambiguity
+    if context_note:
+        response["context_note"] = context_note
+    return response
 
 
 def _add_citation(
@@ -553,6 +702,7 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
     impact = context.get("impact") or {}
     community = context.get("community")
     flows = [_normalize_flow(flow) for flow in (context.get("flows") or [])]
+    context_note = context.get("note")
 
     impact_groups = impact.get("impacted_callers") or {}
     candidate_counts = {
@@ -562,32 +712,55 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         "flow": len(flows[:2]),
     }
 
+    ambiguity = _detect_ambiguity(search_candidates)
+    if ambiguity:
+        return _abstain_response(
+            question,
+            project=project,
+            max_depth=max_depth,
+            k=evidence_limit,
+            elapsed_ms=elapsed_ms,
+            search_candidates=search_candidates,
+            candidate_counts=candidate_counts,
+            note=f"Ambiguous symbol resolution for GraphRAG answer: {ambiguity['reason']}",
+            ambiguity=ambiguity,
+            context_note=str(context_note) if context_note else None,
+        )
+
     if not focus:
-        return {
-            "available": False,
-            "question": question,
-            "note": "No symbol match found for a GraphRAG answer.",
-            "observability": {
-                "retrieval_mode": "graph_rag",
-                "primitives": _OBSERVABILITY_PRIMITIVES,
-                "elapsed_ms": elapsed_ms,
-                "project": project,
-                "max_depth": max_depth,
-                "k": evidence_limit,
-                "search_candidates": len(search_candidates),
-                "evidence_count": 0,
-                "citation_count": 0,
-                "evidence_rerank": {"strategy": "utility_ranked", "candidate_counts": candidate_counts, "selected": []},
-            },
-        }
+        return _abstain_response(
+            question,
+            project=project,
+            max_depth=max_depth,
+            k=evidence_limit,
+            elapsed_ms=elapsed_ms,
+            search_candidates=search_candidates,
+            candidate_counts=candidate_counts,
+            note="No symbol match found for a GraphRAG answer.",
+            context_note=str(context_note) if context_note else None,
+        )
 
     impact_summary = impact.get("summary") or {}
     evidence, citations = _build_evidence(focus, search_candidates, impact, community, flows, evidence_limit)
+    if not evidence:
+        return _abstain_response(
+            question,
+            project=project,
+            max_depth=max_depth,
+            k=evidence_limit,
+            elapsed_ms=elapsed_ms,
+            search_candidates=search_candidates,
+            candidate_counts=candidate_counts,
+            note="GraphRAG could not assemble enough grounded evidence to answer safely.",
+            context_note=str(context_note) if context_note else None,
+        )
+
     evidence_subgraph = _build_evidence_subgraph(focus, evidence)
     confidence = _confidence_payload(focus, evidence, impact_summary)
 
     return {
         "available": True,
+        "abstained": False,
         "question": question,
         "focus": focus,
         "answer": _summarize_answer(focus, impact_summary, community, flows, evidence),
@@ -595,6 +768,14 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         "evidence": evidence,
         "citations": citations,
         "evidence_subgraph": evidence_subgraph,
+        "answer_contract": {
+            "status": "supported",
+            "grounded": True,
+            "requires_citations": True,
+            "fallback_mode": False,
+            "ambiguity": None,
+            "supported_by": _unique_preserve_order([str(item.get("source") or item.get("kind") or "evidence") for item in evidence]),
+        },
         "supporting_context": {
             "impact_summary": impact_summary,
             "community": community,
@@ -605,6 +786,7 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             "evidence_sources": sorted({str(item.get("source") or item.get("kind") or "evidence") for item in evidence}),
             "evidence_subgraph_nodes": len(evidence_subgraph["nodes"]),
             "evidence_subgraph_edges": len(evidence_subgraph["edges"]),
+            "context_note": str(context_note) if context_note else None,
         },
         "observability": {
             "retrieval_mode": "graph_rag",
@@ -616,23 +798,23 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             "search_candidates": len(search_candidates),
             "evidence_count": len(evidence),
             "citation_count": len(citations),
-                "evidence_rerank": {
-                    "strategy": "utility_ranked",
-                    "candidate_counts": candidate_counts,
-                    "selected": [
-                        {
-                            "id": item["id"],
-                            "kind": item.get("kind"),
-                            "source": item.get("source"),
-                            "title": item.get("title"),
-                            "citation_id": item.get("citation_id"),
-                            "confidence": item.get("confidence"),
-                            "score": item.get("score"),
-                            "rerank_score": item.get("rerank_score"),
-                            "is_focus_anchor": item.get("is_focus_anchor"),
-                        }
-                        for item in evidence
-                    ],
+            "evidence_rerank": {
+                "strategy": "utility_ranked",
+                "candidate_counts": candidate_counts,
+                "selected": [
+                    {
+                        "id": item["id"],
+                        "kind": item.get("kind"),
+                        "source": item.get("source"),
+                        "title": item.get("title"),
+                        "citation_id": item.get("citation_id"),
+                        "confidence": item.get("confidence"),
+                        "score": item.get("score"),
+                        "rerank_score": item.get("rerank_score"),
+                        "is_focus_anchor": item.get("is_focus_anchor"),
+                    }
+                    for item in evidence
+                ],
             },
         },
     }

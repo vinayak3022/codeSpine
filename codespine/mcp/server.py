@@ -907,7 +907,17 @@ def build_mcp_server(store, repo_path_provider):
         try:
             result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
             if not result.get("available"):
-                return _json(result)
+                return _json(
+                    result,
+                    preserve_empty_keys={
+                        "answer",
+                        "focus",
+                        "evidence",
+                        "citations",
+                        "evidence_subgraph",
+                        "confidence",
+                    },
+                )
             return _staleness_meta(
                 store,
                 result,

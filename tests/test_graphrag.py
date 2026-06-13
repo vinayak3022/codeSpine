@@ -262,9 +262,78 @@ def test_graph_rag_answer_returns_unavailable_when_no_focus(monkeypatch):
     result = graph_rag_answer(_NoopStore(), "unknown")
 
     assert result["available"] is False
+    assert result["abstained"] is True
     assert "GraphRAG answer" in result["note"]
+    assert result["fallback"]["recommended_tools"] == ["find_symbol", "search_hybrid"]
+    assert result["answer_contract"]["status"] == "abstained"
+    assert result["answer"] == ""
+    assert result["focus"] == {}
+    assert result["evidence"] == []
+    assert result["citations"] == []
+    assert result["evidence_subgraph"] == {"nodes": [], "edges": []}
+    assert result["supporting_context"]["search_candidate_count"] == 0
+    assert result["supporting_context"]["evidence_subgraph_nodes"] == 0
     assert result["observability"]["evidence_count"] == 0
     assert result["observability"]["citation_count"] == 0
+
+
+def test_graph_rag_answer_abstains_on_near_competing_symbol_candidates(monkeypatch):
+    context = {
+        "query": "loadAccount",
+        "focus": {
+            "id": "m1",
+            "kind": "method",
+            "name": "loadAccount",
+            "fqname": "com.example.alpha.AccountService#loadAccount",
+            "file_path": "/tmp/alpha/AccountService.java",
+            "line": 12,
+            "score": 0.98,
+            "confidence": "high",
+        },
+        "search_candidates": [
+            {"id": "m1", "name": "loadAccount", "fqname": "com.example.alpha.AccountService#loadAccount", "file_path": "/tmp/alpha/AccountService.java", "line": 12, "score": 0.98, "confidence": "high"},
+            {"id": "m2", "name": "loadAccounts", "fqname": "com.example.beta.AccountReader#loadAccounts", "file_path": "/tmp/beta/AccountReader.java", "line": 18, "score": 0.965, "confidence": "high"},
+        ],
+        "impact": {"impacted_callers": {"1": [], "2": [], "3+": []}, "summary": {}},
+        "community": None,
+        "flows": [],
+    }
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: context)
+
+    result = graph_rag_answer(_NoopStore(), "loadAccount")
+
+    assert result["available"] is False
+    assert result["abstained"] is True
+    assert result["ambiguity"]["status"] == "ambiguous"
+    assert result["ambiguity"]["alternatives"][0]["id"] == "m2"
+    assert "ambiguous" in result["note"].lower()
+    assert result["answer"] == ""
+    assert result["focus"] == {}
+    assert result["evidence"] == []
+    assert result["citations"] == []
+    assert result["supporting_context"]["search_candidate_count"] == 2
+    assert result["answer_contract"]["status"] == "abstained"
+
+
+def test_graph_rag_answer_abstains_on_weak_grounding_without_ambiguity(monkeypatch):
+    monkeypatch.setattr(
+        "codespine.graphrag.build_symbol_context",
+        lambda *args, **kwargs: {"query": "unknown", "focus": None, "search_candidates": [], "impact": {}, "community": None, "flows": []},
+    )
+
+    result = graph_rag_answer(_NoopStore(), "unknown")
+
+    assert result["available"] is False
+    assert result["abstained"] is True
+    assert "ambiguous" not in result
+    assert result.get("ambiguity") is None
+    assert result["answer_contract"]["status"] == "abstained"
+    assert result["answer_contract"]["ambiguity"] is None
+    assert result["answer"] == ""
+    assert result["focus"] == {}
+    assert result["evidence"] == []
+    assert result["citations"] == []
+    assert result["supporting_context"]["search_candidate_count"] == 0
 
 
 def test_cli_answer_forwards_question_and_contract(monkeypatch):
@@ -307,17 +376,38 @@ def test_mcp_answer_tool_is_exposed_and_forwarded(monkeypatch):
     assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5}
 
 
-def test_mcp_answer_tool_returns_unavailable_result_unchanged(monkeypatch):
+def test_mcp_answer_tool_preserves_unavailable_result_shape(monkeypatch):
     monkeypatch.setattr(
         "codespine.mcp.server.graph_rag_answer",
-        lambda *args, **kwargs: {"available": False, "note": "No symbol match found for a GraphRAG answer."},
+        lambda *args, **kwargs: {
+            "available": False,
+            "abstained": True,
+            "question": "unknown",
+            "answer": "",
+            "focus": {},
+            "confidence": {"label": "low", "score": 0.0, "reason": "No symbol match found for a GraphRAG answer.", "evidence_count": 0, "evidence_kinds": [], "supporting_signals": []},
+            "evidence": [],
+            "citations": [],
+            "evidence_subgraph": {"nodes": [], "edges": []},
+            "note": "No symbol match found for a GraphRAG answer.",
+            "fallback": {"recommended_tools": ["find_symbol", "search_hybrid"], "reason": "The answer surface refused to guess without a unique, grounded symbol match."},
+            "answer_contract": {"status": "abstained", "grounded": False, "requires_citations": True, "fallback_mode": True, "ambiguity": None, "supported_by": []},
+            "supporting_context": {"impact_summary": {}, "community": None, "flow_count": 0, "search_candidate_count": 0, "community_label": None, "evidence_kinds": [], "evidence_sources": [], "evidence_subgraph_nodes": 0, "evidence_subgraph_edges": 0, "context_note": None},
+            "observability": {"retrieval_mode": "graph_rag"},
+        },
     )
 
     async def _run():
         mcp = build_mcp_server(_NoopStore(), lambda: ".")
         result = await mcp.call_tool("answer", {"question": "unknown", "project": "app"})
         payload = json.loads(result.content[0].text)
-        assert payload == {"available": False, "note": "No symbol match found for a GraphRAG answer."}
+        assert payload["available"] is False
+        assert payload["abstained"] is True
+        assert payload["answer"] == ""
+        assert payload["focus"] == {}
+        assert payload["evidence"] == []
+        assert payload["citations"] == []
+        assert payload["evidence_subgraph"] == {"nodes": [], "edges": []}
 
     asyncio.run(_run())
 
