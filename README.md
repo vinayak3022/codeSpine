@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v1.0.13** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.0.14** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 
@@ -106,6 +106,70 @@ Each analysis phase streams live progress. The final step publishes a read repli
 
 ---
 
+## GraphRAG Answer Surface
+
+CodeSpine includes a full graph-augmented generation (`answer`) tool that synthesizes indexed graph data into grounded, citable answers — no external LLM required for the retrieval/reranking pipeline.
+
+When an agent calls `answer(question, project=...)`, the system:
+
+1. **Resolves the focus symbol** via hybrid search (BM25 + vector + fuzzy) scoped to the project.
+2. **Builds deep context** — impact caller tree, community cluster, and execution flows.
+3. **Assembles evidence candidates** from search results, impact callers, community matches, and flow entries — each with a quality-adjusted `rerank_score`.
+4. **Applies graph-aware diversity reranking** — a greedy MMR-style selection that prefers underrepresented evidence kinds, producing a broader evidence mix than pure utility ranking.
+5. **Generates an evidence subgraph** linking the focus symbol to each selected evidence item with typed edges.
+6. **Computes confidence** from evidence count, kind diversity, and impact depth.
+7. **Returns citations** mapping every evidence item back to its source (hybrid_search, analyze_impact, symbol_community, or trace_execution_flows).
+
+### Safe Abstention
+
+The system **refuses to guess** when it cannot ground an answer:
+
+| Abstention trigger | Behaviour |
+|-------------------|-----------|
+| **Ambiguous focus** — multiple symbols match the query closely (lexical similarity + score proximity) | Returns `abstained=True` with the ambiguity details and recommended disambiguation tools (`find_symbol`, `search_hybrid`) |
+| **No focus found** — hybrid search returned zero matches | Returns `abstained=True` with `note` explaining no symbol was matched |
+| **Insufficient evidence** — focus resolved but no evidence candidates passed the quality threshold | Returns `abstained=True` with `note` explaining the grounding failure |
+
+In all three cases the response includes:
+- `answer_contract.status = "abstained"`
+- `fallback.recommended_tools` — actionable suggestions for the agent
+- Full `provenance` and `observability` metadata (same shape as a supported answer)
+
+### Evidence Reranking
+
+Each evidence candidate receives a `rerank_score` based on:
+
+| Evidence kind | Base weight | Additional signals |
+|--------------|-------------|-------------------|
+| `search_result` | 2.7 | BM25/vector/fuzzy score, confidence label, exact focus-anchor match (+1.55) |
+| `impact` | 3.0 | Call depth (direct=+0.35, indirect=+0.2, transitive=+0.1), edge confidence |
+| `community` | 2.2 | Community cohesion (+0.25 per point), **high-cohesion bonus** (+0.15 if cohesion > 0.7) |
+| `flow` | 2.0 | Flow depth (entry level=+0.25, deeper=+0.05 to +0.2) |
+
+The **graph-aware diversity reranker** (Tranche 9) then applies a greedy diverse-selection pass: each evidence kind already represented in the selected set receives a diversity penalty (`1.0 - 0.3 × kind_ratio`), encouraging the system to pick from under-represented kinds. This produces answers with broader architectural coverage.
+
+### Answer Caching
+
+GraphRAG answers are cached in-memory for 5 minutes (TTL, max 128 entries). Cache keys include:
+
+- **Provenance version** — cache invalidates automatically when the response contract changes
+- **Question text** and **project scope**
+- **Snapshot mtime** — base index timestamp
+- **Overlay mtime** — active overlay/dirty-file timestamp
+
+A change to either the base snapshot or the overlay immediately produces a cache miss and a fresh answer. Each cached response includes `observability.cache.hit` and the mtime values that produced it.
+
+### Latency Observability
+
+Every answer includes `observability.latency_ms` with per-stage breakdown:
+- `context` — `build_symbol_context()` timings (search + impact + community + flows)
+- `evidence_build` — evidence candidate assembly and reranking
+- `cache_lookup` — cache read time
+- `serialization` — JSON serialization
+- `total` — wall-clock elapsed time
+
+---
+
 ## MCP Configuration
 
 Foreground server:
@@ -173,7 +237,7 @@ codespine guide --json   # structured JSON for tooling
 
 | Tool | Description |
 |------|-------------|
-| `search_hybrid(query, k, project, explain)` | Ranked symbol search (BM25 + vector + fuzzy via RRF) with `high/medium/low` confidence scores; `explain=True` adds versioned provenance, index fingerprint, retrieval traces, match reasons, and a retrieval contract for reranking. |
+| `search_hybrid(query, k, project, explain)` | Ranked symbol search (BM25 + vector + fuzzy via RRF) with `high/medium/low` confidence scores; `explain=True` adds versioned provenance, index fingerprint, per-ranker traces, match reasons, confidence explanations, and a retrieval contract (`candidate_pool_size`, `returned`, `supports_rerank`). |
 | `find_symbol(name, kind, project, limit)` | Exact/prefix name lookup; returns `primary_match` flag and disambiguated overloads. |
 | `get_symbol_context(query, max_depth, project)` | One-shot deep context: search + impact + community + flows. |
 | `get_neighborhood(symbol, project)` | Callers (same project), `cross_project_callers` (other projects), callees, siblings, and override/implements links. |
@@ -195,8 +259,8 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 
 | Tool | Description |
 |------|-------------|
-| `answer(question, project)` | GraphRAG answer surface with graph-aware diverse reranking, evidence subgraph, citations, confidence, latency observability, versioned provenance, index fingerprint, cache-aware execution, and safe abstention on ambiguity or weak grounding. |
-| `answer-eval(suite, project)` | Run a GraphRAG regression suite, score answers against expectations, and enforce quality gates in CI. |
+| `answer(question, project)` | **GraphRAG answer surface.** Resolves the focus symbol, builds deep context (impact + community + flows), applies graph-aware diverse evidence reranking, returns evidence subgraph with typed edges, per-item citations, confidence score, per-stage latency, provenance/envelope, index fingerprint, and safe abstention on ambiguity or weak grounding. Answers are cached with overlay-aware invalidation. |
+| `answer-eval(suite, project)` | Run a GraphRAG regression suite: score each answer against expected contracts (availability, abstention, focus, evidence kinds, citations, confidence, term inclusion/exclusion), enforce quality gates (`min_average_score`, `min_case_score`, `min_pass_rate`), and produce a structured JSON report for CI. |
 | `ask(question, project)` | Keyword-based natural language dispatcher: routes "who calls X", "what breaks if Y", "explain Z", "find methods named …" to the right tool automatically. |
 | `what_breaks(symbol, project)` | Plain-English blast-radius summary with `risk_level` (low / medium / high). |
 | `explain(symbol, project)` | What a class or method does and how it fits in the architecture. |
@@ -281,10 +345,15 @@ codespine watch --path . --install-hook      # also install post-commit git hook
 codespine watch --path . --uninstall-hook    # remove git hook
 
 # Search & Analysis (CLI)
-codespine answer "question" --project app    # GraphRAG answer with evidence subgraph/citations/confidence
-codespine answer-eval --suite graphrag-suite.json --project app  # GraphRAG regression scoring + quality gates
+codespine answer "question" --project app                                         # GraphRAG answer (evidence subgraph, citations, confidence, provenance)
+codespine answer-eval --suite suite.json --project app                            # GraphRAG regression scoring + quality gates
+codespine answer-eval --suite suite.json --project app --json                     # structured JSON output for CI
+codespine answer-eval --suite suite.json --project app --min-average-score 90      # override suite gates
+codespine answer-eval --suite suite.json --project app --min-case-score 70         # per-case minimum
+codespine answer-eval --suite suite.json --project app --min-pass-rate 1.0         # strict pass rate
+codespine answer-eval --suite suite.json --project app --max-depth 4 --k 3         # override retrieval params
 codespine search "query" --project app       # scoped hybrid search
-codespine search "query" --explain           # provenance-aware hybrid search
+codespine search "query" --explain           # provenance-aware hybrid search with index fingerprint
 codespine context "symbol"                   # one-shot deep context
 codespine impact "symbol"                    # caller-tree impact (includes DI consumers)
 codespine deadcode                           # dead code candidates
@@ -325,7 +394,7 @@ codespine force-reset                        # emergency: delete all data files
 
 `analyse` is trust-first by default: it completes the core graph in the foreground, validates and publishes the read replica, then keeps deep enrichment moving in the background. Use `--fast` only when you want a budgeted partial core index. Use `codespine background`, `codespine ui`, or `codespine repair` to inspect and recover incomplete or degraded work.
 
-GraphRAG regression suites are JSON objects with `cases` and optional `gates` thresholds. Each case can assert availability, abstention, focus, evidence kinds, citations, and confidence.
+GraphRAG regression suites are JSON objects with `cases` and optional `gates` thresholds. Each case can assert availability, abstention, focus, evidence kinds, citations, confidence, term inclusion/exclusion, and minimum scores. The scorer runs 10+ weighted checks and produces a structured report with per-check pass/fail, deltas, and observed values. Quality gates enforce `min_average_score`, `min_case_score`, and `min_pass_rate` — suite-defined gates take precedence over CLI defaults.
 
 ---
 
@@ -488,6 +557,155 @@ sg = ShardedGraphStore(backend="duckdb", num_shards=4)  # DuckDB (default)
 
 ---
 
+## Provenance & Traceability
+
+Every GraphRAG answer and hybrid search explain response includes a **versioned provenance envelope** with full trace metadata for audit, debugging, and regression analysis.
+
+### Response Metadata
+
+```json
+{
+  "provenance": {
+    "version": 10,
+    "package_version": "1.0.14",
+    "retrieval_mode": "graph_rag",
+    "question": "what breaks if I change PaymentService?",
+    "project": "app",
+    "focus_id": "com.example.PaymentService#processPayment",
+    "candidate_counts": {
+      "search_result": 3,
+      "impact": 5,
+      "community": 2,
+      "flow": 1
+    },
+    "search_candidate_count": 3,
+    "evidence_sources": ["hybrid_search", "analyze_impact", "symbol_community"],
+    "context_timings_ms": {
+      "search": 12,
+      "impact": 45,
+      "community": 8,
+      "flows": 3,
+      "total": 68
+    },
+    "index_fingerprint": {
+      "snapshot_mtime": 1712345678.123,
+      "overlay_mtime": 0.0
+    }
+  }
+}
+```
+
+### What each field tells you
+
+| Field | Purpose |
+|-------|---------|
+| `version` | Provenance schema version; incremented on breaking changes. Cache keys include this field for automatic invalidation. |
+| `package_version` | The CodeSpine version that generated this response. Ties answers to a specific release. |
+| `index_fingerprint` | Snapshot and overlay mtimes at the time the answer was generated. Enables deterministic replay: same fingerprint + same query → same answer (modulo caching). |
+| `candidate_counts` | How many candidates of each evidence kind were available before reranking. |
+| `context_timings_ms` | Per-stage latency for context assembly (search, impact, community, flows). |
+| `evidence_sources` | Unique set of retrieval backends that supplied selected evidence. |
+
+The same provenance envelope is exposed in two places:
+- **Top-level `provenance`** — for direct consumer access
+- **`observability.provenance`** — for monitoring and observability pipelines
+
+### Hybrid Search Provenance
+
+When `search_hybrid(..., explain=True)` is used, the response includes a parallel provenance structure with the same `version`, `package_version`, `index_fingerprint`, and per-ranker traces:
+
+```json
+{
+  "retrieval_contract": {
+    "version": 10,
+    "fusion": "rrf",
+    "rankers": ["bm25", "semantic", "fuzzy"],
+    "candidate_pool_size": 142
+  },
+  "provenance": {
+    "version": 10,
+    "package_version": "1.0.14",
+    "candidate_pool_size": 142,
+    "index_fingerprint": {
+      "snapshot_mtime": 1712345678.123,
+      "overlay_mtime": 0.0
+    },
+    "rankers": {
+      "bm25": {"traces": [...]},
+      "semantic": {"traces": [...]},
+      "fuzzy": {"traces": [...]}
+    }
+  }
+}
+```
+
+---
+
+## Quality Gates & Regression Testing
+
+CodeSpine includes a **continuous evaluation framework** (Tranche 7) that scores GraphRAG answers against expected contracts and enforces quality thresholds in CI.
+
+### Scoring
+
+Each answer is scored against an expectation object:
+
+```json
+{
+  "available": true,
+  "abstained": false,
+  "focus_id": "com.example.PaymentService#processPayment",
+  "min_evidence_count": 2,
+  "min_citation_count": 2,
+  "requires_evidence_kinds": ["search_result", "impact"],
+  "must_include_terms": ["Best match", "Impact"],
+  "min_confidence": "medium"
+}
+```
+
+The scorer runs 10+ checks covering availability, abstention, focus match, evidence count, citation count, evidence kind coverage, term inclusion/exclusion, and confidence thresholds. Each check contributes a weighted delta to the final score (0–100).
+
+### Quality Gates
+
+Results are validated against configurable gates:
+
+| Gate | Default | Description |
+|------|---------|-------------|
+| `min_average_score` | 80.0 | Minimum average score across all cases |
+| `min_case_score` | 70.0 | Minimum score for any single case |
+| `min_pass_rate` | 1.0 | Fraction of cases that must pass |
+
+Suites are JSON files with `cases` and optional `gates`:
+
+```json
+{
+  "name": "payment-service-regression",
+  "gates": { "min_average_score": 85.0, "min_pass_rate": 0.9 },
+  "cases": [
+    {"name": "processPayment-impact", "question": "what breaks if I change processPayment?", "expect": {"available": true, "focus_id": "...processPayment", "min_evidence_count": 2, "requires_evidence_kinds": ["search_result", "impact"]}},
+    {"name": "unknown-symbol",        "question": "what breaks if I change NonExistent?",     "expect": {"available": false, "abstained": true}}
+  ]
+}
+```
+
+Suite-defined gates take precedence over CLI defaults unless explicitly overridden:
+
+```bash
+codespine answer-eval --suite suite.json --project app --min-average-score 90 --json
+```
+
+### Programmatic API
+
+```python
+from codespine.graphrag import evaluate_graph_rag_suite, score_graph_rag_answer
+
+report = evaluate_graph_rag_suite(store, suite_payload, project="app")
+report["quality_gates"]["passed"]   # → True/False
+report["summary"]["average_score"]  # → float
+report["summary"]["pass_rate"]      # → float
+```
+
+---
+
 ## Result Caching
 
 Expensive analysis tools cache their results for 5 minutes. The cache is keyed by `(tool_name, arguments, snapshot_mtime)` so a new index snapshot automatically invalidates stale entries.
@@ -496,7 +714,21 @@ Expensive analysis tools cache their results for 5 minutes. The cache is keyed b
 
 The cache is per MCP server instance (in-memory, not persisted across restarts). It is invalidated automatically when `reindex_file` or `analyse_project` completes.
 
-**Cache stats** are visible via `get_capabilities()`. `answer` also exposes per-stage latency timing in its observability payload.
+**Cache stats** are visible via `get_capabilities()`. `answer` also exposes per-stage latency timing in its observability payload and cache hit/miss state with snapshot/overlay mtimes for forensic debugging.
+
+### GraphRAG Cache Details
+
+The `answer` tool uses a purpose-built cache (`ResultCache` with 128-entry LRU and 300 s TTL) keyed on:
+
+- Provenance schema version (bumped on contract changes)
+- Question text and project scope
+- Snapshot mtime (base index timestamp)
+- Overlay mtime (active overlay/dirty-file timestamp)
+
+This design ensures:
+- An answer is never served from cache after re-indexing
+- Overlay edits immediately invalidate the corresponding cached answer
+- A provenance version bump invalidates all cached answers in one shot
 
 ---
 
@@ -577,6 +809,7 @@ from codespine.sharding.store import ShardedGraphStore
 from codespine.indexer.engine import JavaIndexer
 from codespine.analysis.impact import analyze_impact
 from codespine.search.hybrid import hybrid_search
+from codespine.graphrag import graph_rag_answer, evaluate_graph_rag_suite, score_graph_rag_answer
 
 # Open (or create) the store
 sg = ShardedGraphStore()
@@ -594,6 +827,31 @@ hits = hybrid_search(store, "payment processor", project="my-project")
 
 # Impact analysis
 impact = analyze_impact(store, "PaymentService", max_depth=4, project="my-project")
+
+# GraphRAG answer with full provenance envelope
+answer = graph_rag_answer(store, "what breaks if I change PaymentService?", project="my-project")
+print(answer["answer"])                           # → "Best match: … Impact: … Evidence: …"
+print(answer["provenance"]["version"])             # → 10
+print(answer["provenance"]["index_fingerprint"])   # → { snapshot_mtime: …, overlay_mtime: … }
+print(answer["observability"]["latency_ms"])       # → per-stage timings
+print(answer["observability"]["cache"]["hit"])     # → True/False
+
+# Score an answer against an expected contract
+report = score_graph_rag_answer(answer, {"available": True, "min_evidence_count": 2})
+print(report["passed"], report["score"])           # → True, 92.5
+
+# Run a full regression suite with quality gates
+suite = {
+    "name": "payment-regression",
+    "gates": {"min_average_score": 85.0},
+    "cases": [
+        {"question": "what breaks if I change PaymentService?", "expect": {"available": True, "min_evidence_count": 2}},
+        {"question": "unknown symbol", "expect": {"available": False, "abstained": True}},
+    ],
+}
+eval_report = evaluate_graph_rag_suite(store, suite, project="my-project")
+print(eval_report["quality_gates"]["passed"])      # → True/False
+print(eval_report["summary"]["average_score"])     # → float
 ```
 
 ---
@@ -607,6 +865,10 @@ impact = analyze_impact(store, "PaymentService", max_depth=4, project="my-projec
 - `codespine force-reset` is the nuclear option — it deletes all data files without going through the DB engine. Use it when `clear-index` fails due to DB corruption (e.g. after an abrupt Ctrl+C mid-write with KùzuDB).
 - For large Spring or JPA-heavy repos, dead-code results should be reviewed before deletion. The tool is conservative by default; use `strict=True` for a more aggressive audit.
 - The `CODESPINE_BACKEND` env var must be set consistently across the indexer and the MCP server — mixing backends on the same shard path will produce errors.
+- **GraphRAG answers** are never served from cache after re-indexing or overlay edits. Cache keys include both snapshot and overlay mtimes plus the provenance schema version.
+- **Quality gate failures** in CI produce a non-zero exit code and a detailed JSON report listing every failed check per case. Use `--json` for structured CI integration.
+- **Abstained answers** still return full provenance and observability metadata, so CI pipelines can distinguish "system refused to guess" from "system failed".
+- **Evidence diversity** may reorder results compared to earlier versions: the graph-aware diverse reranker prefers underrepresented evidence kinds over pure utility ranking. This produces broader architectural coverage at the cost of different top-k ordering.
 
 ---
 
