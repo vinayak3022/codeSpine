@@ -104,6 +104,80 @@ def test_build_symbol_context_keeps_search_candidates_when_context_lookup_fails(
     assert "context_warning" in result["search_candidates"][0]
 
 
+def test_build_symbol_context_degrades_for_overlay_dirty_focus(monkeypatch):
+    monkeypatch.setattr(
+        "codespine.analysis.context.hybrid_search",
+        lambda *args, **kwargs: [
+            {
+                "id": "s1",
+                "kind": "class",
+                "name": "Foo",
+                "fqname": "com.example.Foo",
+                "context": [],
+                "context_warning": "Architectural context unavailable for this result.",
+                "context_source": "overlay_dirty",
+            }
+        ],
+    )
+    monkeypatch.setattr("codespine.analysis.context.analyze_impact", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("stale impact analysis should be skipped")))
+    monkeypatch.setattr("codespine.analysis.context.symbol_community", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("stale community analysis should be skipped")))
+    monkeypatch.setattr("codespine.analysis.context.trace_execution_flows", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("stale flow analysis should be skipped")))
+
+    result = build_symbol_context(_FailingContextStore(), "Foo")
+
+    assert result["focus"]["context_source"] == "overlay_dirty"
+    assert result["impact"]["depth_groups"] == {"1": [], "2": [], "3+": []}
+    assert result["community"]["matches"] == []
+    assert result["flows"] == []
+    assert "Overlay-dirty" in result["note"]
+
+
+def test_hybrid_search_degrades_context_for_overlay_dirty_symbols(monkeypatch):
+    class _OverlayStore:
+        def load_project(self, project: str):
+            return {
+                "project_id": project,
+                "project_path": "/tmp/project",
+                "dirty_files": {
+                    "/tmp/Foo.java": {"file_id": "f1"},
+                },
+                "deleted_files": [],
+            }
+
+    class _OverlayAwareStore:
+        overlay_store = _OverlayStore()
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "IN_COMMUNITY" in query or "IN_FLOW" in query:
+                raise AssertionError("stale context query should be skipped for dirty overlay symbols")
+            return []
+
+    monkeypatch.setattr(
+        "codespine.search.hybrid.merged_symbol_records",
+        lambda *args, **kwargs: [
+            {
+                "id": "s1",
+                "kind": "class",
+                "name": "Foo",
+                "fqname": "com.example.Foo",
+                "embedding": None,
+                "line": 1,
+                "file_id": "f1",
+                "file_path": "/tmp/Foo.java",
+                "project_id": "app",
+                "is_test": False,
+            }
+        ],
+    )
+
+    results = hybrid_search(_OverlayAwareStore(), "Foo", k=1, project="app")
+
+    assert len(results) == 1
+    assert results[0]["context"] == []
+    assert results[0]["context_source"] == "overlay_dirty"
+    assert "context_warning" in results[0]
+
+
 def test_build_symbol_context_scopes_community_and_flow_by_project(monkeypatch):
     captured: dict[str, object] = {}
 
@@ -281,10 +355,13 @@ def test_hybrid_search_explain_returns_provenance_envelope():
     assert results["retrieval_mode"] == "hybrid"
     assert results["query"] == "Foo"
     assert results["results"][0]["confidence"] == "high"
+    assert results["results"][0]["rank"] == 1
     assert results["results"][0]["confidence_reason"] == "Exact name match"
     assert "exact name match" in results["results"][0]["match_reasons"]
     assert results["results"][0]["retrieval_traces"]["bm25"]["rank"] == 1
     assert results["results"][0]["retrieval_traces"]["semantic"]["rank"] == 1
+    assert results["retrieval_contract"]["fusion"] == "rrf"
+    assert results["retrieval_contract"]["supports_rerank"] is True
     assert set(results["provenance"]["rankers"].keys()) == {"bm25", "semantic", "fuzzy"}
 
 

@@ -17,6 +17,17 @@ def build_symbol_context(store, query: str, max_depth: int = 3, project: str | N
     focus = search_results[0] if search_results else None
     focus_symbol = _focus_symbol(focus, query)
 
+    if focus and focus.get("context_source") == "overlay_dirty":
+        return {
+            "query": query,
+            "focus": focus,
+            "search_candidates": search_results,
+            "impact": {"target": focus_symbol, "depth_groups": {"1": [], "2": [], "3+": []}},
+            "community": {"query": focus_symbol, "matches": []},
+            "flows": [],
+            "note": "Overlay-dirty focus symbol; architectural context omitted to avoid stale base-index data.",
+        }
+
     impact = analyze_impact(store, focus_symbol, max_depth=max_depth, project=project)
     community = symbol_community(store, focus_symbol, project=project)
     flows = trace_execution_flows(store, entry_symbol=focus_symbol, max_depth=max_depth + 2, project=project)

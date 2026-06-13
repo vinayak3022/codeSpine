@@ -5,6 +5,16 @@ from typing import Any
 
 from codespine.indexer.symbol_builder import file_id
 
+
+def _within_project_path(doc: dict[str, Any], file_path: str | None) -> bool:
+    project_path = os.path.abspath(str(doc.get("project_path") or ""))
+    if not project_path or not file_path:
+        return True
+    try:
+        return os.path.commonpath([os.path.abspath(file_path), project_path]) == project_path
+    except ValueError:
+        return False
+
 def _load_overlay_docs(overlay_store, project: str | None = None) -> list[dict[str, Any]]:
     if project:
         doc = overlay_store.load_project(project)
@@ -84,6 +94,8 @@ def merged_symbol_records(store, overlay_store, project: str | None = None) -> l
     merged = [rec for rec in base if rec.get("file_id") not in blocked_file_ids]
     for doc in overlay_docs:
         for file_path, entry in (doc.get("dirty_files") or {}).items():
+            if not _within_project_path(doc, file_path):
+                continue
             for symbol in entry.get("symbols", []):
                 rec = dict(symbol)
                 rec["file_path"] = file_path
@@ -113,6 +125,8 @@ def merged_class_records(store, overlay_store, project: str | None = None) -> li
     merged = [rec for rec in base if rec.get("file_id") not in blocked_file_ids]
     for doc in overlay_docs:
         for file_path, entry in (doc.get("dirty_files") or {}).items():
+            if not _within_project_path(doc, file_path):
+                continue
             for cls in entry.get("classes", []):
                 rec = dict(cls)
                 rec["project_id"] = doc.get("project_id")
@@ -147,15 +161,28 @@ def merged_method_records(store, overlay_store, project: str | None = None) -> l
     merged = [rec for rec in base if rec.get("file_id") not in blocked_file_ids]
     for doc in overlay_docs:
         for file_path, entry in (doc.get("dirty_files") or {}).items():
+            if not _within_project_path(doc, file_path):
+                continue
             for method in entry.get("methods", []):
                 rec = dict(method)
+                rec["project_id"] = doc.get("project_id")
                 rec["file_path"] = file_path
                 merged.append(rec)
     return merged
 
 
+def _edge_metadata(method: dict[str, Any] | None, prefix: str) -> dict[str, Any]:
+    if not method:
+        return {}
+    return {
+        f"{prefix}_file_id": method.get("file_id"),
+        f"{prefix}_file_path": method.get("file_path"),
+        f"{prefix}_project_id": method.get("project_id"),
+    }
+
+
 def merged_call_edges(store, overlay_store, project: str | None = None) -> list[dict[str, Any]]:
-    project_clause = "AND fa.project_id = $proj" if project else ""
+    project_clause = "AND fa.project_id = $proj AND fb.project_id = $proj" if project else ""
     params: dict[str, Any] = {"proj": project} if project else {}
     base = store.query_records(
         f"""
@@ -167,23 +194,43 @@ def merged_call_edges(store, overlay_store, project: str | None = None) -> list[
                b.id as dst,
                ca.file_id as src_file_id,
                cb.file_id as dst_file_id,
+               fa.path as src_file_path,
+               fb.path as dst_file_path,
+               fa.project_id as src_project_id,
+               fb.project_id as dst_project_id,
                coalesce(r.confidence, 0.5) as confidence,
                coalesce(r.reason, 'unknown') as reason
         """,
         params,
     )
     overlay_docs = _load_overlay_docs(overlay_store, project)
-    blocked_file_ids = suppressed_file_ids(overlay_docs)
-    merged = [
-        rec for rec in base
-        if rec.get("src_file_id") not in blocked_file_ids and rec.get("dst_file_id") not in blocked_file_ids
-    ]
+    method_records = {rec["id"]: rec for rec in merged_method_records(store, overlay_store, project=project) if rec.get("id")}
+    merged = []
+    for rec in base:
+        src_meta = method_records.get(rec.get("src"))
+        dst_meta = method_records.get(rec.get("dst"))
+        if not src_meta or not dst_meta:
+            continue
+        merged.append({**rec, **_edge_metadata(src_meta, "src"), **_edge_metadata(dst_meta, "dst"), "edge_type": "CALLS"})
     for doc in overlay_docs:
-        for entry in (doc.get("dirty_files") or {}).values():
+        for file_path, entry in (doc.get("dirty_files") or {}).items():
+            if not _within_project_path(doc, file_path):
+                continue
             src_file_id = entry.get("file_id")
             for edge in entry.get("calls", []):
+                src_meta = method_records.get(edge.get("src"))
+                dst_meta = method_records.get(edge.get("dst"))
+                if not src_meta or not dst_meta:
+                    continue
                 rec = dict(edge)
-                rec["src_file_id"] = src_file_id
-                rec["dst_file_id"] = None
+                rec.update(
+                    {
+                        "src_file_id": src_meta.get("file_id") or src_file_id,
+                        "dst_file_id": dst_meta.get("file_id"),
+                        "edge_type": "CALLS",
+                        **_edge_metadata(src_meta, "src"),
+                        **_edge_metadata(dst_meta, "dst"),
+                    }
+                )
                 merged.append(rec)
     return merged

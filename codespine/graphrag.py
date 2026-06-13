@@ -125,6 +125,95 @@ def _normalize_flow(flow: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _evidence_node(kind: str, entry: dict[str, object]) -> dict[str, object]:
+    node_id = entry.get("symbol_id") or entry.get("community_id") or entry.get("flow_id") or entry.get("id")
+    if not node_id:
+        node_id = entry.get("title") or kind
+    return {
+        "id": str(node_id),
+        "symbol_id": str(entry.get("symbol_id") or node_id),
+        "kind": kind,
+        "label": str(entry.get("title") or entry.get("name") or entry.get("fqname") or entry.get("flow_kind") or kind),
+        "file_path": entry.get("file_path"),
+        "line": entry.get("line"),
+    }
+
+
+def _unique_subgraph_id(base_id: str, existing_ids: set[str], *, hint: str) -> str:
+    if base_id not in existing_ids:
+        return base_id
+    suffix = hint or "evidence"
+    candidate = f"{base_id}::{suffix}"
+    counter = 2
+    while candidate in existing_ids:
+        candidate = f"{base_id}::{suffix}:{counter}"
+        counter += 1
+    return candidate
+
+
+def _build_evidence_subgraph(focus: dict[str, object], evidence: list[dict[str, object]]) -> dict[str, object]:
+    focus_id = str(focus.get("id") or focus.get("fqname") or focus.get("name") or "focus")
+    nodes: dict[str, dict[str, object]] = {
+        focus_id: {
+            "id": focus_id,
+            "kind": str(focus.get("kind") or "symbol"),
+            "label": str(focus.get("fqname") or focus.get("name") or focus_id),
+            "file_path": focus.get("file_path"),
+            "line": focus.get("line"),
+            "role": "focus",
+        }
+    }
+    edges: list[dict[str, object]] = []
+
+    for entry in evidence:
+        node = _evidence_node(str(entry.get("kind") or "evidence"), entry)
+        node_id = _unique_subgraph_id(
+            str(node["id"]),
+            set(nodes),
+            hint=str(entry.get("citation_id") or entry.get("kind") or "evidence"),
+        )
+        if node_id != node["id"]:
+            node = {**node, "id": node_id}
+        nodes[node_id] = node
+        edges.append(
+            {
+                "source": focus_id,
+                "target": node_id,
+                "kind": str(entry.get("kind") or "evidence"),
+                "source_label": str(focus.get("fqname") or focus.get("name") or focus_id),
+                "target_label": node["label"],
+                "citation_id": entry.get("citation_id"),
+            }
+        )
+
+        subgraph = entry.get("subgraph")
+        if isinstance(subgraph, dict):
+            subgraph_id_map: dict[str, str] = {}
+            for sub_node in subgraph.get("nodes") or []:
+                if isinstance(sub_node, dict) and sub_node.get("id") is not None:
+                    original_id = str(sub_node["id"])
+                    if original_id == str(node.get("symbol_id") or ""):
+                        subgraph_id_map[original_id] = node_id
+                        continue
+                    subgraph_id = _unique_subgraph_id(
+                        original_id,
+                        set(nodes) | set(subgraph_id_map.values()),
+                        hint=str(entry.get("citation_id") or sub_node.get("role") or sub_node.get("kind") or "subgraph"),
+                    )
+                    subgraph_id_map[original_id] = subgraph_id
+                    nodes[subgraph_id] = {**sub_node, "id": subgraph_id, **({"symbol_id": original_id} if subgraph_id != original_id else {})}
+            for sub_edge in subgraph.get("edges") or []:
+                if isinstance(sub_edge, dict):
+                    edge = dict(sub_edge)
+                    if edge.get("source") in subgraph_id_map and str(edge.get("source")) != focus_id:
+                        edge["source"] = subgraph_id_map[str(edge["source"])]
+                    if edge.get("target") in subgraph_id_map:
+                        edge["target"] = subgraph_id_map[str(edge["target"])]
+                    edges.append(edge)
+
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
 def _build_evidence(
     focus: dict[str, object],
     search_candidates: list[dict[str, object]],
@@ -174,6 +263,26 @@ def _build_evidence(
                 "confidence": candidate.get("confidence"),
                 "score": candidate.get("score"),
                 "snippet": candidate.get("snippet"),
+                "subgraph": {
+                    "nodes": [
+                        {
+                            "id": str(candidate.get("id") or title),
+                            "kind": "symbol",
+                            "label": title,
+                            "file_path": candidate.get("file_path"),
+                            "line": candidate.get("line"),
+                            "role": "search_result",
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "source": str(focus.get("id") or focus.get("fqname") or focus.get("name") or "focus"),
+                            "target": str(candidate.get("id") or title),
+                            "kind": "search_result",
+                            "citation_id": citation_id,
+                        }
+                    ],
+                },
             }
         )
 
@@ -207,6 +316,27 @@ def _build_evidence(
                     "confidence": caller.get("confidence"),
                     "file_path": caller.get("file_path"),
                     "path": caller.get("path"),
+                    "subgraph": {
+                        "nodes": [
+                            {
+                                "id": str(caller.get("symbol") or title),
+                                "kind": "symbol",
+                                "label": title,
+                                "file_path": caller.get("file_path"),
+                                "line": caller.get("line"),
+                                "role": "impact",
+                                "depth": caller.get("depth"),
+                            }
+                        ],
+                        "edges": [
+                            {
+                                "source": str(caller.get("symbol") or title),
+                                "target": str(focus.get("id") or focus.get("fqname") or focus.get("name") or "focus"),
+                                "kind": str(caller.get("edge_type") or "impact"),
+                                "citation_id": citation_id,
+                            }
+                        ],
+                    },
                 }
             )
     
@@ -232,6 +362,25 @@ def _build_evidence(
                 "community_id": community_match.get("community_id"),
                 "community_label": community_match.get("community_label") or community_match.get("label"),
                 "cohesion": community_match.get("cohesion"),
+                "subgraph": {
+                    "nodes": [
+                        {
+                            "id": str(community_match.get("community_id") or title),
+                            "kind": "community",
+                            "label": title,
+                            "role": "community",
+                            "cohesion": community_match.get("cohesion"),
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "source": str(focus.get("id") or focus.get("fqname") or focus.get("name") or "focus"),
+                            "target": str(community_match.get("community_id") or title),
+                            "kind": "community_membership",
+                            "citation_id": citation_id,
+                        }
+                    ],
+                },
             }
         )
 
@@ -256,6 +405,25 @@ def _build_evidence(
                 "flow_id": flow.get("flow_id"),
                 "flow_kind": flow.get("flow_kind"),
                 "flow_depth": flow.get("flow_depth"),
+                "subgraph": {
+                    "nodes": [
+                        {
+                            "id": str(flow.get("flow_id") or title),
+                            "kind": "flow",
+                            "label": title,
+                            "role": "flow",
+                            "flow_depth": flow.get("flow_depth"),
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "source": str(focus.get("id") or focus.get("fqname") or focus.get("name") or "focus"),
+                            "target": str(flow.get("flow_id") or title),
+                            "kind": "execution_flow",
+                            "citation_id": citation_id,
+                        }
+                    ],
+                },
             }
         )
 
@@ -287,11 +455,14 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
                 "max_depth": max_depth,
                 "k": evidence_limit,
                 "search_candidates": len(search_candidates),
+                "evidence_count": 0,
+                "citation_count": 0,
             },
         }
 
     impact_summary = impact.get("summary") or {}
     evidence, citations = _build_evidence(focus, search_candidates, impact, community, flows, evidence_limit)
+    evidence_subgraph = _build_evidence_subgraph(focus, evidence)
     confidence = _confidence_payload(focus, len(evidence), impact_summary)
 
     return {
@@ -302,12 +473,15 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         "confidence": confidence,
         "evidence": evidence,
         "citations": citations,
+        "evidence_subgraph": evidence_subgraph,
         "supporting_context": {
             "impact_summary": impact_summary,
             "community": community,
             "flow_count": len(flows),
             "search_candidate_count": len(search_candidates),
             "community_label": _community_label(community),
+            "evidence_subgraph_nodes": len(evidence_subgraph["nodes"]),
+            "evidence_subgraph_edges": len(evidence_subgraph["edges"]),
         },
         "observability": {
             "retrieval_mode": "graph_rag",

@@ -72,7 +72,10 @@ def test_graph_rag_answer_builds_contracts(monkeypatch):
     assert result["confidence"]["label"] == "high"
     assert result["evidence"]
     assert result["citations"]
+    assert result["evidence_subgraph"]["nodes"]
+    assert result["evidence_subgraph"]["edges"]
     assert result["evidence"][0]["citation_id"] == result["citations"][0]["id"]
+    assert result["evidence"][0]["subgraph"]["nodes"]
     assert any(item["kind"] == "community" for item in result["evidence"])
     assert any(item["kind"] == "flow" for item in result["evidence"])
     community_citation = next(item for item in result["citations"] if item["kind"] == "community")
@@ -84,6 +87,7 @@ def test_graph_rag_answer_builds_contracts(monkeypatch):
     assert result["observability"]["retrieval_mode"] == "graph_rag"
     assert result["observability"]["k"] == 5
     assert result["supporting_context"]["impact_summary"]["direct"] == 1
+    assert result["supporting_context"]["evidence_subgraph_nodes"] >= 1
 
 
 def test_graph_rag_answer_normalizes_real_flow_shape_and_keeps_citations_unique(monkeypatch):
@@ -162,6 +166,47 @@ def test_graph_rag_answer_honors_k_as_evidence_budget(monkeypatch):
     assert result["observability"]["citation_count"] == 2
 
 
+def test_graph_rag_answer_preserves_focus_anchor_when_focus_is_evidence(monkeypatch):
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {
+            "id": "m1",
+            "kind": "method",
+            "name": "processPayment",
+            "fqname": "com.example.PaymentService#processPayment",
+            "file_path": "/tmp/PaymentService.java",
+            "line": 12,
+            "score": 0.97,
+            "confidence": "high",
+            "snippet": "public void processPayment() {}",
+        },
+        "search_candidates": [
+            {
+                "id": "m1",
+                "name": "processPayment",
+                "fqname": "com.example.PaymentService#processPayment",
+                "file_path": "/tmp/PaymentService.java",
+                "line": 12,
+                "score": 0.97,
+                "confidence": "high",
+                "snippet": "public void processPayment() {}",
+            }
+        ],
+        "impact": {"impacted_callers": {"1": [], "2": [], "3+": []}, "summary": {"direct": 0, "indirect": 0, "transitive": 0, "self_callers": 0}},
+        "community": None,
+        "flows": [],
+    }
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: context)
+
+    result = graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+
+    focus_nodes = [node for node in result["evidence_subgraph"]["nodes"] if node.get("role") == "focus"]
+    assert len(focus_nodes) == 1
+    assert focus_nodes[0]["id"] == "m1"
+    assert any(node.get("symbol_id") == "m1" and node.get("role") != "focus" for node in result["evidence_subgraph"]["nodes"])
+    assert all(edge["source"] != edge["target"] for edge in result["evidence_subgraph"]["edges"])
+
+
 def test_graph_rag_answer_returns_unavailable_when_no_focus(monkeypatch):
     monkeypatch.setattr(
         "codespine.graphrag.build_symbol_context",
@@ -172,6 +217,8 @@ def test_graph_rag_answer_returns_unavailable_when_no_focus(monkeypatch):
 
     assert result["available"] is False
     assert "GraphRAG answer" in result["note"]
+    assert result["observability"]["evidence_count"] == 0
+    assert result["observability"]["citation_count"] == 0
 
 
 def test_cli_answer_forwards_question_and_contract(monkeypatch):

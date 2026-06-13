@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 
-from codespine.overlay.merge import merged_symbol_records
+from codespine.overlay.merge import _load_overlay_docs, merged_symbol_records
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
 from codespine.search.rrf import reciprocal_rank_fusion
@@ -91,6 +91,14 @@ def _context_entry(
     }
 
 
+def _dirty_overlay_file_paths(overlay_store, project: str | None = None) -> set[str]:
+    paths: set[str] = set()
+    for doc in _load_overlay_docs(overlay_store, project):
+        for file_path in (doc.get("dirty_files") or {}).keys():
+            paths.add(file_path)
+    return paths
+
+
 def _load_symbol_context(store, symbol_id: str) -> list[dict[str, object]]:
     community_rows = store.query_records(
         """
@@ -158,6 +166,12 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
     bm25_trace_by_id, bm25_traces = _rank_trace_map(bm25_rank, trace_limit)
     fuzzy_trace_by_id, fuzzy_traces = _rank_trace_map(fuzzy_rank, trace_limit)
     semantic_trace_by_id, semantic_traces = _rank_trace_map(semantic_rank, trace_limit)
+    dirty_overlay_paths: set[str] = set()
+    if overlay_store is not None:
+        try:
+            dirty_overlay_paths = _dirty_overlay_file_paths(overlay_store, project)
+        except Exception:
+            dirty_overlay_paths = set()
 
     fused = reciprocal_rank_fusion([bm25_rank, semantic_rank, fuzzy_rank])
     rec_by_id = {r["id"]: r for r in recs}
@@ -208,9 +222,17 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
     results.sort(key=lambda x: x["score"], reverse=True)
     top_k = results[:k]
 
+    for rank, item in enumerate(top_k, start=1):
+        item["rank"] = rank
+
     # Attach architectural context in the same response. This is best-effort:
     # a context query failure must not hide ranked symbol results.
     for item in top_k:
+        if item.get("file_path") and item["file_path"] in dirty_overlay_paths:
+            item["context"] = []
+            item["context_warning"] = "Architectural context unavailable for this result."
+            item["context_source"] = "overlay_dirty"
+            continue
         try:
             item["context"] = _load_symbol_context(store, item["id"])
         except Exception as exc:  # noqa: BLE001
@@ -273,6 +295,13 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
         "retrieval_mode": "hybrid",
         "query": query,
         "results": top_k,
+        "retrieval_contract": {
+            "fusion": "rrf",
+            "rankers": ["bm25", "semantic", "fuzzy"],
+            "candidate_pool_size": len(recs),
+            "returned": len(top_k),
+            "supports_rerank": True,
+        },
         "provenance": {
             "rankers": {
                 "bm25": {"traces": bm25_traces},

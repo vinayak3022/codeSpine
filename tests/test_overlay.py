@@ -11,6 +11,7 @@ from codespine.config import SETTINGS
 from codespine.db.store import GraphStore
 from codespine.indexer.engine import JavaIndexer
 from codespine.overlay.store import build_overlay_file_entry
+from codespine.overlay.merge import merged_call_edges
 from codespine.search.hybrid import hybrid_search
 from codespine.analysis.impact import analyze_impact
 from codespine.watch.watcher import get_overlay_status
@@ -135,6 +136,321 @@ def test_overlay_deleted_file_suppresses_base_symbols(isolated_settings, tmp_pat
 
     results = hybrid_search(store, "DeleteMe", project=project_id)
     assert not any(item.get("fqname") == "com.example.DeleteMe" for item in results if isinstance(item, dict))
+
+
+def test_overlay_project_scoped_search_ignores_out_of_project_dirty_symbols(isolated_settings, tmp_path: Path):
+    class _OverlayStore:
+        def load_project(self, project: str):
+            return {
+                "project_id": project,
+                "project_path": "/repo/app",
+                "dirty_files": {
+                    "/repo/other/src/main/java/com/example/Foo.java": {
+                        "file_id": "f_other",
+                        "symbols": [
+                            {
+                                "id": "s_other",
+                                "kind": "class",
+                                "name": "Foo",
+                                "fqname": "com.other.Foo",
+                                "line": 1,
+                                "col": 1,
+                                "file_id": "f_other",
+                                "file_path": "/repo/other/src/main/java/com/example/Foo.java",
+                                "project_id": "other",
+                                "is_test": False,
+                            }
+                        ],
+                    },
+                    "/repo/app/src/main/java/com/example/Foo.java": {
+                        "file_id": "f_app",
+                        "symbols": [
+                            {
+                                "id": "s_app",
+                                "kind": "class",
+                                "name": "Foo",
+                                "fqname": "com.example.Foo",
+                                "line": 1,
+                                "col": 1,
+                                "file_id": "f_app",
+                                "file_path": "/repo/app/src/main/java/com/example/Foo.java",
+                                "project_id": "app",
+                                "is_test": False,
+                            }
+                        ],
+                    },
+                },
+                "deleted_files": [],
+            }
+
+    class _OverlayAwareStore:
+        overlay_store = _OverlayStore()
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            return []
+
+    results = hybrid_search(_OverlayAwareStore(), "Foo", project="app", k=10)
+
+    assert results
+    assert all(item.get("file_path", "").startswith("/repo/app/") for item in results)
+    assert all(item.get("fqname") == "com.example.Foo" for item in results)
+
+
+def test_overlay_project_scoped_impact_filters_cross_project_and_deleted_call_edges(isolated_settings, tmp_path: Path):
+    class _OverlayStore:
+        def load_project(self, project: str):
+            return {
+                "project_id": project,
+                "project_path": "/repo/app",
+                "dirty_files": {
+                    "/repo/app/src/main/java/com/example/App.java": {
+                        "file_id": "f_app",
+                        "symbols": [
+                            {
+                                "id": "s_target",
+                                "kind": "method",
+                                "name": "target",
+                                "fqname": "com.example.App#target()",
+                                "line": 1,
+                                "col": 1,
+                                "file_id": "f_app",
+                                "file_path": "/repo/app/src/main/java/com/example/App.java",
+                                "project_id": "app",
+                                "is_test": False,
+                            },
+                                {
+                                    "id": "s_caller",
+                                    "kind": "method",
+                                    "name": "caller",
+                                    "fqname": "com.example.Caller#caller()",
+                                    "line": 2,
+                                    "col": 1,
+                                    "file_id": "f_app",
+                                    "file_path": "/repo/app/src/main/java/com/example/App.java",
+                                "project_id": "app",
+                                "is_test": False,
+                            },
+                        ],
+                        "methods": [
+                            {
+                                "id": "m_target",
+                                "class_id": "c_app",
+                                "class_fqcn": "com.example.App",
+                                "name": "target",
+                                "signature": "target()",
+                                "return_type": "void",
+                                "is_constructor": False,
+                                "is_test": False,
+                                "file_id": "f_app",
+                                "file_path": "/repo/app/src/main/java/com/example/App.java",
+                                "project_id": "app",
+                            },
+                                {
+                                    "id": "m_caller",
+                                    "class_id": "c_caller",
+                                    "class_fqcn": "com.example.Caller",
+                                    "name": "caller",
+                                    "signature": "caller()",
+                                    "return_type": "void",
+                                    "is_constructor": False,
+                                    "is_test": False,
+                                "file_id": "f_app",
+                                "file_path": "/repo/app/src/main/java/com/example/App.java",
+                                "project_id": "app",
+                            },
+                        ],
+                        "calls": [
+                            {"src": "m_caller", "dst": "m_deleted", "confidence": 0.9, "reason": "deleted-target"},
+                        ],
+                    }
+                },
+                "deleted_files": ["/repo/app/src/main/java/com/example/Deleted.java"],
+            }
+
+        def list_projects(self):
+            return [self.load_project("app")]
+
+    class _OverlayAwareStore:
+        overlay_store = _OverlayStore()
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "MATCH (s:Symbol), (f:File)" in query and "f.project_id = $proj" in query:
+                return [
+                    {
+                        "id": "s_target",
+                        "kind": "method",
+                        "name": "target",
+                        "fqname": "com.example.App#target()",
+                        "embedding": None,
+                        "line": 1,
+                        "col": 1,
+                        "file_id": "f_app",
+                        "file_path": "/repo/app/src/main/java/com/example/App.java",
+                        "project_id": "app",
+                        "is_test": False,
+                    }
+                ]
+            if "MATCH (m:Method), (c:Class), (f:File)" in query and "f.project_id = $proj" in query and "RETURN m.id as id" in query:
+                return [
+                    {
+                        "id": "m_target",
+                        "class_id": "c_app",
+                        "class_fqcn": "com.example.App",
+                        "name": "target",
+                        "signature": "target()",
+                        "return_type": "void",
+                        "is_constructor": False,
+                        "is_test": False,
+                        "file_id": "f_app",
+                        "file_path": "/repo/app/src/main/java/com/example/App.java",
+                        "project_id": "app",
+                    },
+                        {
+                            "id": "m_caller",
+                            "class_id": "c_caller",
+                            "class_fqcn": "com.example.Caller",
+                            "name": "caller",
+                            "signature": "caller()",
+                            "return_type": "void",
+                            "is_constructor": False,
+                        "is_test": False,
+                        "file_id": "f_app",
+                        "file_path": "/repo/app/src/main/java/com/example/App.java",
+                        "project_id": "app",
+                    },
+                ]
+            if "RETURN a.id as src" in query and "b.id as dst" in query and "CALLS" in query:
+                return [
+                    {"src": "m_caller", "dst": "m_target", "src_file_id": "f_app", "dst_file_id": "f_app", "edge_type": "CALLS", "confidence": 0.9, "reason": "project"},
+                    {"src": "m_external", "dst": "m_target", "src_file_id": "f_other", "dst_file_id": "f_app", "edge_type": "CALLS", "confidence": 0.9, "reason": "cross-project"},
+                ]
+            return []
+
+    impact = analyze_impact(_OverlayAwareStore(), "target", project="app")
+
+    direct = impact["impacted_callers"]["1"]
+    assert [item.get("symbol") for item in direct] == ["m_caller"]
+    assert all(item.get("project_id") == "app" for item in direct)
+
+
+def test_overlay_merged_call_edges_drop_deleted_and_cross_project_targets(isolated_settings, tmp_path: Path):
+    class _OverlayStore:
+        def load_project(self, project: str):
+            return {
+                "project_id": project,
+                "project_path": "/repo/app",
+                "dirty_files": {
+                    "/repo/app/src/main/java/com/example/App.java": {
+                        "file_id": "f_app",
+                        "methods": [
+                            {
+                                "id": "m_target",
+                                "class_id": "c_caller",
+                                "class_fqcn": "com.example.App",
+                                "name": "target",
+                                "signature": "target()",
+                                "return_type": "void",
+                                "is_constructor": False,
+                                "is_test": False,
+                                "file_id": "f_app",
+                                "file_path": "/repo/app/src/main/java/com/example/App.java",
+                                "project_id": "app",
+                            },
+                            {
+                                "id": "m_caller",
+                                "class_id": "c_caller",
+                                "class_fqcn": "com.example.App",
+                                "name": "caller",
+                                "signature": "caller()",
+                                "return_type": "void",
+                                "is_constructor": False,
+                                "is_test": False,
+                                "file_id": "f_app",
+                                "file_path": "/repo/app/src/main/java/com/example/App.java",
+                                "project_id": "app",
+                            },
+                        ],
+                        "calls": [
+                            {"src": "m_caller", "dst": "m_target", "confidence": 0.9, "reason": "project"},
+                            {"src": "m_caller", "dst": "m_deleted", "confidence": 0.9, "reason": "deleted"},
+                            {"src": "m_caller", "dst": "m_external", "confidence": 0.9, "reason": "cross-project-target"},
+                        ],
+                    },
+                    "/repo/other/src/main/java/com/example/Other.java": {
+                        "file_id": "f_other",
+                        "methods": [
+                            {
+                                "id": "m_external",
+                                "class_id": "c_other",
+                                "class_fqcn": "com.other.Other",
+                                "name": "external",
+                                "signature": "external()",
+                                "return_type": "void",
+                                "is_constructor": False,
+                                "is_test": False,
+                                "file_id": "f_other",
+                                "file_path": "/repo/other/src/main/java/com/example/Other.java",
+                                "project_id": "other",
+                            }
+                        ],
+                        "calls": [
+                            {"src": "m_external", "dst": "m_target", "confidence": 0.9, "reason": "outside-project"},
+                        ],
+                    },
+                },
+                "deleted_files": ["/repo/app/src/main/java/com/example/Deleted.java"],
+            }
+
+    class _OverlayAwareStore:
+        overlay_store = _OverlayStore()
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "MATCH (m:Method), (c:Class), (f:File)" in query and "f.project_id = $proj" in query and "RETURN m.id as id" in query:
+                return [
+                    {
+                        "id": "m_target",
+                        "class_id": "c_caller",
+                        "class_fqcn": "com.example.App",
+                        "name": "target",
+                        "signature": "target()",
+                        "return_type": "void",
+                        "is_constructor": False,
+                        "is_test": False,
+                        "file_id": "f_app",
+                        "file_path": "/repo/app/src/main/java/com/example/App.java",
+                        "project_id": "app",
+                    },
+                    {
+                        "id": "m_caller",
+                        "class_id": "c_caller",
+                        "class_fqcn": "com.example.App",
+                        "name": "caller",
+                        "signature": "caller()",
+                        "return_type": "void",
+                        "is_constructor": False,
+                        "is_test": False,
+                        "file_id": "f_app",
+                        "file_path": "/repo/app/src/main/java/com/example/App.java",
+                        "project_id": "app",
+                    },
+                ]
+            if "RETURN a.id as src" in query and "b.id as dst" in query and "CALLS" in query:
+                return [
+                    {"src": "m_caller", "dst": "m_target", "src_file_id": "f_app", "dst_file_id": "f_app", "confidence": 0.9, "reason": "project"},
+                    {"src": "m_external", "dst": "m_target", "src_file_id": "f_other", "dst_file_id": "f_app", "confidence": 0.9, "reason": "cross-project"},
+                    {"src": "m_caller", "dst": "m_deleted", "src_file_id": "f_app", "dst_file_id": "f_deleted", "confidence": 0.9, "reason": "deleted"},
+                ]
+            return []
+
+    edges = merged_call_edges(_OverlayAwareStore(), _OverlayAwareStore().overlay_store, project="app")
+
+    assert len(edges) == 2
+    assert {(edge["src"], edge["dst"]) for edge in edges} == {("m_caller", "m_target")}
+    assert all(edge["src_file_id"] == "f_app" for edge in edges)
+    assert all(edge["dst_file_id"] == "f_app" for edge in edges)
+    assert all(edge["src_project_id"] == "app" for edge in edges)
+    assert all(edge["dst_project_id"] == "app" for edge in edges)
+    assert all(edge["edge_type"] == "CALLS" for edge in edges)
 
 
 def test_overlay_impact_includes_dirty_call_edges(isolated_settings, tmp_path: Path):
