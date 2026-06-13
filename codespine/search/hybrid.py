@@ -14,7 +14,46 @@ LOGGER = logging.getLogger(__name__)
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
-_SEARCH_PROVENANCE_VERSION = 8
+_SEARCH_PROVENANCE_VERSION = 10
+
+
+def _store_snapshot_mtime(store, project: str | None = None) -> float:
+    try:
+        router = getattr(store, "router", None)
+        if router is not None and hasattr(router, "all_shards") and hasattr(router, "snapshot_path"):
+            shard_ids = list(router.all_shards())
+            mtimes = [_snapshot_mtime_for_path(router.snapshot_path(idx) + ".updated") for idx in shard_ids]
+            return max(mtimes, default=0.0)
+        snapshot_path = getattr(store, "_snapshot_path", "")
+        return _snapshot_mtime_for_path(snapshot_path + ".updated")
+    except Exception:
+        return 0.0
+
+
+def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
+    overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is None:
+        return 0.0
+    try:
+        if project:
+            return _snapshot_mtime_for_path(overlay_store.project_path(project))
+        mtimes = []
+        for doc in overlay_store.list_projects():
+            project_id = doc.get("project_id")
+            if project_id:
+                mtimes.append(_snapshot_mtime_for_path(overlay_store.project_path(project_id)))
+        return max(mtimes, default=0.0)
+    except Exception:
+        return 0.0
+
+
+def _snapshot_mtime_for_path(path: str) -> float:
+    try:
+        if path and os.path.exists(path):
+            return os.stat(path).st_mtime_ns / 1_000_000_000
+    except OSError:
+        pass
+    return 0.0
 
 
 def _rank_trace_map(ranking: list[tuple[str, float]], limit: int) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
@@ -309,6 +348,10 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
             "version": _SEARCH_PROVENANCE_VERSION,
             "package_version": __version__,
             "candidate_pool_size": len(recs),
+            "index_fingerprint": {
+                "snapshot_mtime": _store_snapshot_mtime(store, project),
+                "overlay_mtime": _overlay_snapshot_mtime(store, project),
+            },
             "rankers": {
                 "bm25": {"traces": bm25_traces},
                 "semantic": {"traces": semantic_traces},

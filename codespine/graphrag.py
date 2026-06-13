@@ -25,7 +25,7 @@ _EVIDENCE_KIND_WEIGHTS = {
 }
 
 _GRAPH_RAG_CACHE = ResultCache(maxsize=128, ttl_s=300.0)
-_GRAPH_RAG_PROVENANCE_VERSION = 8
+_GRAPH_RAG_PROVENANCE_VERSION = 10
 
 
 def _pretty_evidence_kind(kind: str) -> str:
@@ -113,6 +113,8 @@ def _graph_rag_provenance(
     search_candidates: list[dict[str, object]],
     context_timings: dict[str, object],
     evidence: list[dict[str, object]],
+    snapshot_mtime: float = 0.0,
+    overlay_mtime: float = 0.0,
 ) -> dict[str, object]:
     focus_id = str(
         (focus or {}).get("id")
@@ -132,6 +134,10 @@ def _graph_rag_provenance(
         "search_candidate_count": len(search_candidates),
         "evidence_sources": _unique_preserve_order([str(item.get("source") or item.get("kind") or "evidence") for item in evidence]),
         "context_timings_ms": context_timings,
+        "index_fingerprint": {
+            "snapshot_mtime": snapshot_mtime,
+            "overlay_mtime": overlay_mtime,
+        },
     }
 
 
@@ -275,7 +281,7 @@ def _abstain_response(
             "search_candidates": len(search_candidates),
             "evidence_count": 0,
             "citation_count": 0,
-            "evidence_rerank": {"strategy": "utility_ranked", "candidate_counts": candidate_counts, "selected": []},
+            "evidence_rerank": {"strategy": "graph_aware_diverse", "candidate_counts": candidate_counts, "selected": []},
             "provenance": provenance,
         },
     }
@@ -578,6 +584,8 @@ def _build_evidence(
         cohesion = candidate.get("cohesion")
         if isinstance(cohesion, (int, float)):
             score += min(max(float(cohesion), 0.0), 1.0) * 0.25
+            if float(cohesion) > 0.7:
+                score += 0.15  # graph-aware: high-cohesion community bonus
         return score
 
     def _flow_candidate_score(candidate: dict[str, object]) -> float:
@@ -588,6 +596,53 @@ def _build_evidence(
         elif isinstance(depth, int) and depth > 0:
             score += max(0.05, 0.2 - depth * 0.03)
         return score
+
+    def _diverse_selection(
+        candidates: list[dict[str, object]],
+        limit: int,
+    ) -> list[dict[str, object]]:
+        """Greedy diverse selection: prefer underrepresented evidence kinds.
+
+        Applies a diversity penalty to kinds already well-represented
+        in the selected set, producing a broader evidence mix.
+        """
+        if not candidates or limit <= 0:
+            return []
+
+        kind_counts: dict[str, int] = {}
+        remaining = sorted(
+            candidates,
+            key=lambda c: (
+                float(c.get("rerank_score") or 0.0),
+                c.get("kind") == "impact",
+                c.get("kind") == "search_result",
+                str(c.get("title") or "").lower(),
+                str(c.get("citation_id") or ""),
+            ),
+            reverse=True,
+        )
+        selected: list[dict[str, object]] = []
+
+        while len(selected) < limit and remaining:
+            best_idx = 0
+            best_effective = -1.0
+            for idx, cand in enumerate(remaining):
+                base = float(cand.get("rerank_score") or 0.0)
+                kind = str(cand.get("kind") or "unknown")
+                kind_ratio = kind_counts.get(kind, 0) / max(limit, 1)
+                diversity_penalty = 1.0 - 0.3 * kind_ratio
+                effective = base * diversity_penalty
+                if effective > best_effective:
+                    best_effective = effective
+                    best_idx = idx
+            chosen = remaining.pop(best_idx)
+            kind = str(chosen.get("kind") or "unknown")
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+            chosen["rerank_score"] = round(best_effective, 4)
+            chosen["diversity_bonus"] = True
+            selected.append(chosen)
+
+        return selected
 
     for candidate in search_candidates:
         title = str(candidate.get("fqname") or candidate.get("name") or candidate.get("id") or "search result")
@@ -771,17 +826,7 @@ def _build_evidence(
             }
         )
 
-    selected_candidates = sorted(
-        candidates,
-        key=lambda item: (
-            float(item.get("rerank_score") or 0.0),
-            item.get("kind") == "impact",
-            item.get("kind") == "search_result",
-            str(item.get("title") or "").lower(),
-            str(item.get("citation_id") or ""),
-        ),
-        reverse=True,
-    )[:limit]
+    selected_candidates = _diverse_selection(candidates, limit)
 
     evidence: list[dict[str, object]] = []
     citations: list[dict[str, object]] = []
@@ -839,6 +884,8 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         search_candidates=search_candidates,
         context_timings=context_timings,
         evidence=[],
+        snapshot_mtime=snapshot_mtime,
+        overlay_mtime=overlay_mtime,
     )
 
     ambiguity = _detect_ambiguity(search_candidates)
@@ -931,6 +978,8 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         search_candidates=search_candidates,
         context_timings=context_timings,
         evidence=evidence,
+        snapshot_mtime=snapshot_mtime,
+        overlay_mtime=overlay_mtime,
     )
 
     result = {
@@ -975,7 +1024,7 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             "evidence_count": len(evidence),
             "citation_count": len(citations),
             "evidence_rerank": {
-                "strategy": "utility_ranked",
+                "strategy": "graph_aware_diverse",
                 "candidate_counts": candidate_counts,
                 "selected": [
                     {

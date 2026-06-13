@@ -379,9 +379,11 @@ def test_hybrid_search_explain_returns_provenance_envelope():
     assert results["results"][0]["retrieval_traces"]["semantic"]["rank"] == 1
     assert results["retrieval_contract"]["fusion"] == "rrf"
     assert results["retrieval_contract"]["supports_rerank"] is True
-    assert results["retrieval_contract"]["version"] == 8
-    assert results["provenance"]["version"] == 8
+    assert results["retrieval_contract"]["version"] == 10
+    assert results["provenance"]["version"] == 10
     assert results["provenance"]["package_version"] == __version__
+    assert results["provenance"]["index_fingerprint"]["snapshot_mtime"] >= 0.0
+    assert "overlay_mtime" in results["provenance"]["index_fingerprint"]
     assert set(results["provenance"]["rankers"].keys()) == {"bm25", "semantic", "fuzzy"}
 
 
