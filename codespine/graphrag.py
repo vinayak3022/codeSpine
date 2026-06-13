@@ -5,6 +5,7 @@ import os
 import time
 from difflib import SequenceMatcher
 
+from codespine import __version__
 from codespine.cache.result_cache import ResultCache
 from codespine.analysis.context import build_symbol_context
 
@@ -24,6 +25,7 @@ _EVIDENCE_KIND_WEIGHTS = {
 }
 
 _GRAPH_RAG_CACHE = ResultCache(maxsize=128, ttl_s=300.0)
+_GRAPH_RAG_PROVENANCE_VERSION = 8
 
 
 def _pretty_evidence_kind(kind: str) -> str:
@@ -90,6 +92,7 @@ def _graph_rag_cache_key(
     return ResultCache.make_key(
         "graph_rag_answer",
         {
+            "version": _GRAPH_RAG_PROVENANCE_VERSION,
             "question": question,
             "project": project,
             "max_depth": max_depth,
@@ -99,6 +102,37 @@ def _graph_rag_cache_key(
         },
         0.0,
     )
+
+
+def _graph_rag_provenance(
+    *,
+    question: str,
+    project: str | None,
+    focus: dict[str, object] | None,
+    candidate_counts: dict[str, int],
+    search_candidates: list[dict[str, object]],
+    context_timings: dict[str, object],
+    evidence: list[dict[str, object]],
+) -> dict[str, object]:
+    focus_id = str(
+        (focus or {}).get("id")
+        or (focus or {}).get("symbol_id")
+        or (focus or {}).get("fqname")
+        or (focus or {}).get("name")
+        or ""
+    ) or None
+    return {
+        "version": _GRAPH_RAG_PROVENANCE_VERSION,
+        "package_version": __version__,
+        "retrieval_mode": "graph_rag",
+        "question": question,
+        "project": project,
+        "focus_id": focus_id,
+        "candidate_counts": candidate_counts,
+        "search_candidate_count": len(search_candidates),
+        "evidence_sources": _unique_preserve_order([str(item.get("source") or item.get("kind") or "evidence") for item in evidence]),
+        "context_timings_ms": context_timings,
+    }
 
 
 def _candidate_snapshot(candidate: dict[str, object], *, rank: int | None = None) -> dict[str, object]:
@@ -186,6 +220,7 @@ def _abstain_response(
     note: str,
     ambiguity: dict[str, object] | None = None,
     context_note: str | None = None,
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
     response: dict[str, object] = {
         "available": False,
@@ -229,6 +264,7 @@ def _abstain_response(
             "evidence_subgraph_edges": 0,
             "context_note": context_note,
         },
+        "provenance": provenance,
         "observability": {
             "retrieval_mode": "graph_rag",
             "primitives": _OBSERVABILITY_PRIMITIVES,
@@ -240,6 +276,7 @@ def _abstain_response(
             "evidence_count": 0,
             "citation_count": 0,
             "evidence_rerank": {"strategy": "utility_ranked", "candidate_counts": candidate_counts, "selected": []},
+            "provenance": provenance,
         },
     }
     if ambiguity:
@@ -793,6 +830,16 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         "community": len(_community_matches(community)[:2]),
         "flow": len(flows[:2]),
     }
+    context_timings = dict(context.get("timings_ms") or {})
+    provenance = _graph_rag_provenance(
+        question=question,
+        project=project,
+        focus=focus if isinstance(focus, dict) else None,
+        candidate_counts=candidate_counts,
+        search_candidates=search_candidates,
+        context_timings=context_timings,
+        evidence=[],
+    )
 
     ambiguity = _detect_ambiguity(search_candidates)
     if ambiguity:
@@ -807,12 +854,13 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             note=f"Ambiguous symbol resolution for GraphRAG answer: {ambiguity['reason']}",
             ambiguity=ambiguity,
             context_note=str(context_note) if context_note else None,
+            provenance=provenance,
         )
         result.setdefault("observability", {})
         result["observability"]["latency_ms"] = {
             "total": context_ms,
             "cache_lookup": 0,
-            "context": dict(context.get("timings_ms") or {}),
+            "context": context_timings,
         }
         result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
         result["observability"]["elapsed_ms"] = context_ms
@@ -830,12 +878,13 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             candidate_counts=candidate_counts,
             note="No symbol match found for a GraphRAG answer.",
             context_note=str(context_note) if context_note else None,
+            provenance=provenance,
         )
         result.setdefault("observability", {})
         result["observability"]["latency_ms"] = {
             "total": context_ms,
             "cache_lookup": 0,
-            "context": dict(context.get("timings_ms") or {}),
+            "context": context_timings,
         }
         result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
         result["observability"]["elapsed_ms"] = context_ms
@@ -857,13 +906,14 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             candidate_counts=candidate_counts,
             note="GraphRAG could not assemble enough grounded evidence to answer safely.",
             context_note=str(context_note) if context_note else None,
+            provenance=provenance,
         )
         result.setdefault("observability", {})
         total_ms = int((time.perf_counter() - started) * 1000)
         result["observability"]["latency_ms"] = {
             "total": total_ms,
             "cache_lookup": 0,
-            "context": dict(context.get("timings_ms") or {}),
+            "context": context_timings,
             "evidence_build": evidence_ms,
         }
         result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
@@ -873,6 +923,15 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
 
     evidence_subgraph = _build_evidence_subgraph(focus, evidence)
     confidence = _confidence_payload(focus, evidence, impact_summary)
+    final_provenance = _graph_rag_provenance(
+        question=question,
+        project=project,
+        focus=focus if isinstance(focus, dict) else None,
+        candidate_counts=candidate_counts,
+        search_candidates=search_candidates,
+        context_timings=context_timings,
+        evidence=evidence,
+    )
 
     result = {
         "available": True,
@@ -884,6 +943,7 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         "evidence": evidence,
         "citations": citations,
         "evidence_subgraph": evidence_subgraph,
+        "provenance": {**final_provenance, "evidence_ids": [str(item.get("id") or "") for item in evidence]},
         "answer_contract": {
             "status": "supported",
             "grounded": True,
@@ -935,11 +995,12 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
             "latency_ms": {
                 "total": 0,
                 "cache_lookup": 0,
-                "context": dict(context.get("timings_ms") or {}),
+                "context": context_timings,
                 "evidence_build": evidence_ms,
                 "serialization": 0,
             },
             "cache": {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime},
+            "provenance": final_provenance,
         },
     }
     total_ms = int((time.perf_counter() - started) * 1000)

@@ -6,6 +6,7 @@ import os
 
 from click.testing import CliRunner
 
+from codespine import __version__
 from codespine.cli import main
 from codespine.graphrag import _GRAPH_RAG_CACHE, evaluate_graph_rag_suite, graph_rag_answer, score_graph_rag_answer
 from codespine.mcp.server import build_mcp_server
@@ -87,6 +88,9 @@ def test_graph_rag_answer_builds_contracts(monkeypatch):
     assert flow_citation["flow_id"] == "f1"
     assert result["observability"]["retrieval_mode"] == "graph_rag"
     assert result["observability"]["k"] == 5
+    assert result["provenance"]["version"] == 8
+    assert result["provenance"]["package_version"] == __version__
+    assert result["observability"]["provenance"]["version"] == 8
     assert result["observability"]["evidence_rerank"]["strategy"] == "utility_ranked"
     assert result["observability"]["evidence_rerank"]["selected"][0]["title"] == "com.example.PaymentService#processPayment"
     assert result["observability"]["evidence_rerank"]["selected"][0]["citation_id"] == "c1"
@@ -418,6 +422,8 @@ def test_graph_rag_answer_returns_unavailable_when_no_focus(monkeypatch):
     assert result["evidence_subgraph"] == {"nodes": [], "edges": []}
     assert result["supporting_context"]["search_candidate_count"] == 0
     assert result["supporting_context"]["evidence_subgraph_nodes"] == 0
+    assert result["provenance"]["version"] == 8
+    assert result["observability"]["provenance"]["version"] == 8
     assert result["observability"]["evidence_count"] == 0
     assert result["observability"]["citation_count"] == 0
 

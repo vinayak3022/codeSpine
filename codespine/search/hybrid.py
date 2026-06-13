@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 
+from codespine import __version__
 from codespine.overlay.merge import _load_overlay_docs, merged_symbol_records
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
@@ -13,6 +14,7 @@ LOGGER = logging.getLogger(__name__)
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
+_SEARCH_PROVENANCE_VERSION = 8
 
 
 def _rank_trace_map(ranking: list[tuple[str, float]], limit: int) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
@@ -296,6 +298,7 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
         "query": query,
         "results": top_k,
         "retrieval_contract": {
+            "version": _SEARCH_PROVENANCE_VERSION,
             "fusion": "rrf",
             "rankers": ["bm25", "semantic", "fuzzy"],
             "candidate_pool_size": len(recs),
@@ -303,6 +306,9 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
             "supports_rerank": True,
         },
         "provenance": {
+            "version": _SEARCH_PROVENANCE_VERSION,
+            "package_version": __version__,
+            "candidate_pool_size": len(recs),
             "rankers": {
                 "bm25": {"traces": bm25_traces},
                 "semantic": {"traces": semantic_traces},

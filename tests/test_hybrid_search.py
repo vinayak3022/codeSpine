@@ -7,6 +7,7 @@ from pathlib import Path
 from click.testing import CliRunner
 import pytest
 
+from codespine import __version__
 from codespine.analysis.context import build_symbol_context
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
@@ -378,6 +379,9 @@ def test_hybrid_search_explain_returns_provenance_envelope():
     assert results["results"][0]["retrieval_traces"]["semantic"]["rank"] == 1
     assert results["retrieval_contract"]["fusion"] == "rrf"
     assert results["retrieval_contract"]["supports_rerank"] is True
+    assert results["retrieval_contract"]["version"] == 8
+    assert results["provenance"]["version"] == 8
+    assert results["provenance"]["package_version"] == __version__
     assert set(results["provenance"]["rankers"].keys()) == {"bm25", "semantic", "fuzzy"}
 
 

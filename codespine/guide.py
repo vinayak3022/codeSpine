@@ -45,8 +45,8 @@ GUIDE_SECTIONS: list[dict] = [
         "id": "tools_search",
         "title": "Search & Lookup",
         "tools": [
-            {"name": "search_hybrid", "one_liner": "Ranked symbol search (BM25 + vector + fuzzy via RRF). Pass project= or explain=True for scoped, provenance-aware retrieval."},
-            {"name": "answer", "one_liner": "GraphRAG answer surface with reranked evidence, citations, confidence, latency observability, cache-aware execution, and safe abstention on ambiguity or weak grounding."},
+            {"name": "search_hybrid", "one_liner": "Ranked symbol search (BM25 + vector + fuzzy via RRF). Pass project= or explain=True for scoped, versioned provenance-aware retrieval."},
+            {"name": "answer", "one_liner": "GraphRAG answer surface with reranked evidence, citations, confidence, latency observability, versioned provenance, cache-aware execution, and safe abstention on ambiguity or weak grounding."},
             {"name": "find_symbol", "one_liner": "Exact/prefix name lookup. Use to resolve ambiguity or list overloads."},
             {"name": "get_symbol_context", "one_liner": "One-shot deep context: search + impact + community + flows in one call."},
             {"name": "get_neighborhood", "one_liner": "Callers, callees, siblings, and override/implements for a symbol."},
@@ -151,9 +151,9 @@ GUIDE_SECTIONS: list[dict] = [
             "- BM25 + fuzzy search works without embeddings. Semantic search needs\n"
             "  'pip install codespine[ml]' and 'analyse_project(path, embed=True)'.\n"
             "- Use search_hybrid(query, project=..., explain=True) when you want ranker\n"
-            "  traces, match reasons, and confidence explanations.\n"
+            "  traces, match reasons, confidence explanations, and versioned provenance.\n"
             "- Use answer(question, project=...) for a GraphRAG response with reranked evidence,\n"
-            "  citations, confidence, observability metadata, and trust-preserving abstention when the symbol is ambiguous or weakly grounded.\n"
+            "  citations, confidence, observability metadata, provenance, and trust-preserving abstention when the symbol is ambiguous or weakly grounded.\n"
             "- If community/flow/coupling data is missing, re-run:\n"
             "  analyse_project(path, deep=True)"
         ),

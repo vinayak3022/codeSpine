@@ -173,7 +173,7 @@ codespine guide --json   # structured JSON for tooling
 
 | Tool | Description |
 |------|-------------|
-| `search_hybrid(query, k, project, explain)` | Ranked symbol search (BM25 + vector + fuzzy via RRF) with `high/medium/low` confidence scores; `explain=True` adds provenance, retrieval traces, match reasons, and a retrieval contract for reranking. |
+| `search_hybrid(query, k, project, explain)` | Ranked symbol search (BM25 + vector + fuzzy via RRF) with `high/medium/low` confidence scores; `explain=True` adds versioned provenance, retrieval traces, match reasons, and a retrieval contract for reranking. |
 | `find_symbol(name, kind, project, limit)` | Exact/prefix name lookup; returns `primary_match` flag and disambiguated overloads. |
 | `get_symbol_context(query, max_depth, project)` | One-shot deep context: search + impact + community + flows. |
 | `get_neighborhood(symbol, project)` | Callers (same project), `cross_project_callers` (other projects), callees, siblings, and override/implements links. |
@@ -195,7 +195,7 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 
 | Tool | Description |
 |------|-------------|
-| `answer(question, project)` | GraphRAG answer surface with reranked evidence, evidence subgraph, citations, confidence, latency observability, cache-aware execution, and safe abstention on ambiguity or weak grounding. |
+| `answer(question, project)` | GraphRAG answer surface with reranked evidence, evidence subgraph, citations, confidence, latency observability, versioned provenance, cache-aware execution, and safe abstention on ambiguity or weak grounding. |
 | `answer-eval(suite, project)` | Run a GraphRAG regression suite, score answers against expectations, and enforce quality gates in CI. |
 | `ask(question, project)` | Keyword-based natural language dispatcher: routes "who calls X", "what breaks if Y", "explain Z", "find methods named …" to the right tool automatically. |
 | `what_breaks(symbol, project)` | Plain-English blast-radius summary with `risk_level` (low / medium / high). |
