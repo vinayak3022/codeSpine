@@ -8,6 +8,8 @@ from click.testing import CliRunner
 import pytest
 
 from codespine.analysis.context import build_symbol_context
+from codespine.analysis.flow import trace_execution_flows
+from codespine.analysis.impact import analyze_impact
 from codespine.cli import main
 from codespine.mcp.server import build_mcp_server
 from codespine.search.hybrid import hybrid_search
@@ -100,6 +102,100 @@ def test_build_symbol_context_keeps_search_candidates_when_context_lookup_fails(
     assert len(result["search_candidates"]) == 1
     assert result["search_candidates"][0]["context"] == []
     assert "context_warning" in result["search_candidates"][0]
+
+
+def test_build_symbol_context_scopes_community_and_flow_by_project(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_analyze_impact(store, query: str, max_depth: int = 3, project: str | None = None):
+        captured["impact_query"] = query
+        captured["impact_project"] = project
+        return {"resolved_to": []}
+
+    def fake_symbol_community(store, query: str, project: str | None = None):
+        captured["community_query"] = query
+        captured["community_project"] = project
+        return {"matches": []}
+
+    def fake_trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None, progress=None):
+        captured["flow_entry"] = entry_symbol
+        captured["flow_project"] = project
+        return []
+
+    monkeypatch.setattr("codespine.analysis.context.analyze_impact", fake_analyze_impact)
+    monkeypatch.setattr("codespine.analysis.context.symbol_community", fake_symbol_community)
+    monkeypatch.setattr("codespine.analysis.context.trace_execution_flows", fake_trace_execution_flows)
+
+    result = build_symbol_context(_FailingContextStore(), "Foo", project="app")
+
+    assert result["focus"]["name"] == "Foo"
+    assert result["focus"]["fqname"] == "com.example.Foo"
+    assert captured == {
+        "impact_query": "com.example.Foo",
+        "impact_project": "app",
+        "community_query": "com.example.Foo",
+        "community_project": "app",
+        "flow_entry": "com.example.Foo",
+        "flow_project": "app",
+    }
+
+
+def test_analyze_impact_scopes_traversal_by_project():
+    class _ImpactScopeStore:
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "RETURN s.id as id" in query:
+                return [{"id": "s_target"}]
+            if "RETURN s.id as sid, m.id as mid" in query:
+                return [{"sid": "s_target", "mid": "m_target"}]
+            if "RETURN a.id as src, b.id as dst" in query and "CALLS" in query:
+                if "fa.project_id = $proj" in query and "fb.project_id = $proj" in query:
+                    return [{"src": "m_caller", "dst": "m_target", "edge_type": "CALLS", "confidence": 0.9, "reason": "project"}]
+                return [{"src": "external_caller", "dst": "m_target", "edge_type": "CALLS", "confidence": 0.9, "reason": "cross"}]
+            if "DI_INJECT" in query or "INTERFACE_BINDING" in query:
+                return []
+            if "RETURN m.id as id, m.name as name, m.signature as fqname" in query:
+                ids = params.get("ids", []) if params else []
+                out: list[dict] = []
+                for mid in ids:
+                    if mid == "m_target":
+                        out.append({"id": "m_target", "name": "target", "fqname": "com.example.App#target", "file_path": "/app/Target.java", "project_id": "app", "class_fqcn": "com.example.App"})
+                    elif mid == "m_caller":
+                        out.append({"id": "m_caller", "name": "caller", "fqname": "com.example.Caller#caller", "file_path": "/app/Caller.java", "project_id": "app", "class_fqcn": "com.example.Caller"})
+                    elif mid == "external_caller":
+                        out.append({"id": "external_caller", "name": "external", "fqname": "com.other.Other#external", "file_path": "/other/External.java", "project_id": "other", "class_fqcn": "com.other.Other"})
+                return out
+            return []
+
+    impact = analyze_impact(_ImpactScopeStore(), "target", project="app")
+
+    assert impact["impacted_callers"]["1"][0]["name"] == "caller"
+    assert impact["impacted_callers"]["1"][0]["project_id"] == "app"
+
+
+def test_trace_execution_flows_scopes_traversal_by_project():
+    class _FlowScopeStore:
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "RETURN m.id as id" in query and "f.project_id = $proj" in query:
+                return [{"id": "m_entry"}]
+            if "MATCH (a:Method)-[:CALLS]->(b:Method)" in query:
+                if "fa.project_id = $proj" in query and "fb.project_id = $proj" in query:
+                    return [{"src": "m_entry", "dst": "m_helper"}]
+                return [{"src": "m_entry", "dst": "external_method"}]
+            if "RETURN m.id as id, m.name as name, m.signature as fqname" in query:
+                ids = params.get("ids", []) if params else []
+                mapping = {
+                    "m_entry": {"id": "m_entry", "name": "main", "fqname": "com.example.App#main", "file_path": "/app/Main.java", "project_id": "app", "class_fqcn": "com.example.App"},
+                    "m_helper": {"id": "m_helper", "name": "helper", "fqname": "com.example.App#helper", "file_path": "/app/Helper.java", "project_id": "app", "class_fqcn": "com.example.App"},
+                    "external_method": {"id": "external_method", "name": "external", "fqname": "com.other.Other#external", "file_path": "/other/External.java", "project_id": "other", "class_fqcn": "com.other.Other"},
+                }
+                return [mapping[mid] for mid in ids if mid in mapping]
+            return []
+
+    flows = trace_execution_flows(_FlowScopeStore(), entry_symbol="com.example.App#main", project="app")
+
+    assert len(flows) == 1
+    assert [node["name"] for node in flows[0]["nodes"]] == ["main", "helper"]
+    assert all(node["project_id"] == "app" for node in flows[0]["nodes"])
 
 
 def test_hybrid_search_returns_flow_depth_from_duckdb_context(tmp_path: Path):

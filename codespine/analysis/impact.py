@@ -99,36 +99,63 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
     if not target_method_ids:
         return {"target": symbol_query, "depth_groups": {"1": [], "2": [], "3+": []}}
 
-    # Load all call edges – cross-project callers are included intentionally so
-    # impact analysis surfaces inter-module dependencies.
+    # Load call edges; when project is provided, keep traversal within that scope.
     if overlay_store is not None:
         edges = merged_call_edges(store, overlay_store, project=project)
         for edge in edges:
             edge["edge_type"] = "CALLS"
     else:
-        edges = store.query_records(
-            """
-            MATCH (a:Method)-[r:CALLS]->(b:Method)
-            RETURN a.id as src, b.id as dst, 'CALLS' as edge_type,
-                   coalesce(r.confidence, 0.5) as confidence,
-                   coalesce(r.reason, 'unknown') as reason
-            """
-        )
+        if project:
+            edges = store.query_records(
+                """
+                MATCH (a:Method)-[r:CALLS]->(b:Method), (ca:Class), (fa:File), (cb:Class), (fb:File)
+                WHERE a.class_id = ca.id AND ca.file_id = fa.id
+                  AND b.class_id = cb.id AND cb.file_id = fb.id
+                  AND fa.project_id = $proj AND fb.project_id = $proj
+                RETURN a.id as src, b.id as dst, 'CALLS' as edge_type,
+                       coalesce(r.confidence, 0.5) as confidence,
+                       coalesce(r.reason, 'unknown') as reason
+                """,
+                {"proj": project},
+            )
+        else:
+            edges = store.query_records(
+                """
+                MATCH (a:Method)-[r:CALLS]->(b:Method)
+                RETURN a.id as src, b.id as dst, 'CALLS' as edge_type,
+                       coalesce(r.confidence, 0.5) as confidence,
+                       coalesce(r.reason, 'unknown') as reason
+                """
+            )
 
     # Augment with DI injection edges: for each target method's class, find all
     # classes that @Inject it (or bind it via @Component/@Service) and add their
     # methods as implicit callers at depth+1 with edge_type "DI_INJECT".
     try:
-        di_edges = store.query_records(
-            """
-            MATCH (a:Method), (ca:Class), (b:Method), (cb:Class),
-                  (ca)-[r:INJECTS]->(cb)
-            WHERE a.class_id = ca.id AND b.class_id = cb.id
-            RETURN a.id as src, b.id as dst, 'DI_INJECT' as edge_type,
-                   coalesce(r.confidence, 0.8) as confidence,
-                   coalesce(r.binding_type, 'field_inject') as reason
-            """
-        )
+        if project:
+            di_edges = store.query_records(
+                """
+                MATCH (a:Method), (ca:Class)-[r:INJECTS]->(cb:Class), (b:Method), (fa:File), (fb:File)
+                WHERE a.class_id = ca.id AND ca.file_id = fa.id
+                  AND b.class_id = cb.id AND cb.file_id = fb.id
+                  AND fa.project_id = $proj AND fb.project_id = $proj
+                RETURN a.id as src, b.id as dst, 'DI_INJECT' as edge_type,
+                       coalesce(r.confidence, 0.8) as confidence,
+                       coalesce(r.binding_type, 'field_inject') as reason
+                """,
+                {"proj": project},
+            )
+        else:
+            di_edges = store.query_records(
+                """
+                MATCH (a:Method), (ca:Class), (b:Method), (cb:Class),
+                      (ca)-[r:INJECTS]->(cb)
+                WHERE a.class_id = ca.id AND b.class_id = cb.id
+                RETURN a.id as src, b.id as dst, 'DI_INJECT' as edge_type,
+                       coalesce(r.confidence, 0.8) as confidence,
+                       coalesce(r.binding_type, 'field_inject') as reason
+                """
+            )
         edges = list(edges) + di_edges
     except Exception:
         pass  # INJECTS table may not exist on old DBs
@@ -136,16 +163,30 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
     # Also follow BINDS_INTERFACE — any class implementing the target's interface
     # counts as an indirect caller.
     try:
-        bi_edges = store.query_records(
-            """
-            MATCH (a:Method), (ca:Class), (b:Method), (cb:Class),
-                  (ca)-[r:BINDS_INTERFACE]->(cb)
-            WHERE a.class_id = ca.id AND b.class_id = cb.id
-            RETURN a.id as src, b.id as dst, 'INTERFACE_BINDING' as edge_type,
-                   coalesce(r.confidence, 0.9) as confidence,
-                   coalesce(r.reason, 'implements') as reason
-            """
-        )
+        if project:
+            bi_edges = store.query_records(
+                """
+                MATCH (a:Method), (ca:Class)-[r:BINDS_INTERFACE]->(cb:Class), (b:Method), (fa:File), (fb:File)
+                WHERE a.class_id = ca.id AND ca.file_id = fa.id
+                  AND b.class_id = cb.id AND cb.file_id = fb.id
+                  AND fa.project_id = $proj AND fb.project_id = $proj
+                RETURN a.id as src, b.id as dst, 'INTERFACE_BINDING' as edge_type,
+                       coalesce(r.confidence, 0.9) as confidence,
+                       coalesce(r.reason, 'implements') as reason
+                """,
+                {"proj": project},
+            )
+        else:
+            bi_edges = store.query_records(
+                """
+                MATCH (a:Method), (ca:Class), (b:Method), (cb:Class),
+                      (ca)-[r:BINDS_INTERFACE]->(cb)
+                WHERE a.class_id = ca.id AND b.class_id = cb.id
+                RETURN a.id as src, b.id as dst, 'INTERFACE_BINDING' as edge_type,
+                       coalesce(r.confidence, 0.9) as confidence,
+                       coalesce(r.reason, 'implements') as reason
+                """
+            )
         edges = list(edges) + bi_edges
     except Exception:
         pass

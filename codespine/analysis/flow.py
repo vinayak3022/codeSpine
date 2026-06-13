@@ -5,6 +5,52 @@ from collections import defaultdict, deque
 from codespine.analysis.impact import _resolve_method_metadata
 
 
+def _resolve_entry_methods(store, entry_symbol: str, project: str | None = None) -> list[str]:
+    needle = (entry_symbol or "").strip()
+    if not needle:
+        return []
+
+    candidates: list[str] = []
+
+    def _add(candidate: str) -> None:
+        candidate = candidate.strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    _add(needle)
+    if "#" in needle:
+        _add(needle.rsplit("#", 1)[1])
+    if "(" in needle and needle.endswith(")"):
+        _add(needle.split("(", 1)[0])
+
+    for candidate in candidates:
+        if project:
+            start = store.query_records(
+                """
+                MATCH (m:Method), (c:Class), (f:File)
+                WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $proj
+                AND (m.id = $q OR lower(m.name) = lower($q) OR lower(m.signature) = lower($q) OR lower(m.signature) CONTAINS lower($q))
+                RETURN m.id as id
+                LIMIT 10
+                """,
+                {"q": candidate, "proj": project},
+            )
+        else:
+            start = store.query_records(
+                """
+                MATCH (m:Method)
+                WHERE m.id = $q OR lower(m.name) = lower($q) OR lower(m.signature) = lower($q) OR lower(m.signature) CONTAINS lower($q)
+                RETURN m.id as id
+                LIMIT 10
+                """,
+                {"q": candidate},
+            )
+        ids = [r["id"] for r in start]
+        if ids:
+            return ids
+    return []
+
+
 def _entry_methods(store, project: str | None = None) -> list[str]:
     if project:
         recs = store.query_records(
@@ -54,39 +100,30 @@ def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int
             progress(msg)
 
     _ping("loading call graph")
-    edges = store.query_records(
-        """
-        MATCH (a:Method)-[:CALLS]->(b:Method)
-        RETURN a.id as src, b.id as dst
-        """
-    )
+    if project:
+        edges = store.query_records(
+            """
+            MATCH (a:Method)-[:CALLS]->(b:Method), (ca:Class), (fa:File), (cb:Class), (fb:File)
+            WHERE a.class_id = ca.id AND ca.file_id = fa.id
+              AND b.class_id = cb.id AND cb.file_id = fb.id
+              AND fa.project_id = $proj AND fb.project_id = $proj
+            RETURN a.id as src, b.id as dst
+            """,
+            {"proj": project},
+        )
+    else:
+        edges = store.query_records(
+            """
+            MATCH (a:Method)-[:CALLS]->(b:Method)
+            RETURN a.id as src, b.id as dst
+            """
+        )
     adj: dict[str, list[str]] = defaultdict(list)
     for edge in edges:
         adj[edge["src"]].append(edge["dst"])
 
     if entry_symbol:
-        if project:
-            start = store.query_records(
-                """
-                MATCH (m:Method), (c:Class), (f:File)
-                WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $proj
-                AND (m.id = $q OR lower(m.name) = lower($q) OR lower(m.signature) CONTAINS lower($q))
-                RETURN m.id as id
-                LIMIT 10
-                """,
-                {"q": entry_symbol, "proj": project},
-            )
-        else:
-            start = store.query_records(
-                """
-                MATCH (m:Method)
-                WHERE m.id = $q OR lower(m.name) = lower($q) OR lower(m.signature) CONTAINS lower($q)
-                RETURN m.id as id
-                LIMIT 10
-                """,
-                {"q": entry_symbol},
-            )
-        entries = [r["id"] for r in start]
+        entries = _resolve_entry_methods(store, entry_symbol, project=project)
     else:
         entries = _entry_methods(store, project=project)
 

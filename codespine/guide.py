@@ -10,7 +10,7 @@ GUIDE_SECTIONS: list[dict] = [
         "title": "What is CodeSpine?",
         "body": (
             "CodeSpine is a Java code-intelligence engine. It parses Java source "
-            "into a graph database (DuckDB by default, Kuzu as an alternate backend) and exposes hybrid search, impact analysis, "
+            "into a graph database (DuckDB by default, Kuzu as an alternate backend) and exposes hybrid search, GraphRAG answers, impact analysis, "
             "dead-code detection, execution-flow tracing, community detection, and "
             "git change-coupling -- all via MCP tools or CLI commands.\n"
             "Language: Java. Layouts: single-module, multi-module (Maven/Gradle), workspaces."
@@ -46,6 +46,7 @@ GUIDE_SECTIONS: list[dict] = [
         "title": "Search & Lookup",
         "tools": [
             {"name": "search_hybrid", "one_liner": "Ranked symbol search (BM25 + vector + fuzzy via RRF). Pass project= or explain=True for scoped, provenance-aware retrieval."},
+            {"name": "answer", "one_liner": "GraphRAG answer surface with evidence, citations, confidence, and observability contracts."},
             {"name": "find_symbol", "one_liner": "Exact/prefix name lookup. Use to resolve ambiguity or list overloads."},
             {"name": "get_symbol_context", "one_liner": "One-shot deep context: search + impact + community + flows in one call."},
             {"name": "get_neighborhood", "one_liner": "Callers, callees, siblings, and override/implements for a symbol."},
@@ -122,6 +123,9 @@ GUIDE_SECTIONS: list[dict] = [
             "Understand a symbol:\n"
             "  search_hybrid('PaymentService') -> get_impact('processPayment') -> get_neighborhood('processPayment')\n"
             "\n"
+            "Answer a question:\n"
+            "  answer('what breaks if I change PaymentService?')\n"
+            "\n"
             "Find dead code:\n"
             "  detect_dead_code(strict=True) -> get_impact(candidate) to verify each hit\n"
             "\n"
@@ -148,6 +152,8 @@ GUIDE_SECTIONS: list[dict] = [
             "  'pip install codespine[ml]' and 'analyse_project(path, embed=True)'.\n"
             "- Use search_hybrid(query, project=..., explain=True) when you want ranker\n"
             "  traces, match reasons, and confidence explanations.\n"
+            "- Use answer(question, project=...) for a GraphRAG response with evidence,\n"
+            "  citations, confidence, and observability metadata.\n"
             "- If community/flow/coupling data is missing, re-run:\n"
             "  analyse_project(path, deep=True)"
         ),

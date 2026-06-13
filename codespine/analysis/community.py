@@ -169,14 +169,26 @@ def detect_communities(store, progress=None) -> list[dict]:
     return communities
 
 
-def symbol_community(store, symbol_query: str) -> dict:
-    recs = store.query_records(
-        """
-        MATCH (s:Symbol)-[:IN_COMMUNITY]->(c:Community)
-        WHERE s.id = $q OR lower(s.fqname) = lower($q) OR lower(s.name) = lower($q)
-        RETURN s.id as symbol_id, s.fqname as fqname, c.id as community_id, c.label as label, c.cohesion as cohesion
-        LIMIT 20
-        """,
-        {"q": symbol_query},
-    )
+def symbol_community(store, symbol_query: str, project: str | None = None) -> dict:
+    if project:
+        recs = store.query_records(
+            """
+            MATCH (s:Symbol)-[:IN_COMMUNITY]->(c:Community), (f:File)
+            WHERE s.file_id = f.id AND f.project_id = $proj
+              AND (s.id = $q OR lower(s.fqname) = lower($q) OR lower(s.name) = lower($q))
+            RETURN s.id as symbol_id, s.fqname as fqname, c.id as community_id, c.label as label, c.cohesion as cohesion
+            LIMIT 20
+            """,
+            {"q": symbol_query, "proj": project},
+        )
+    else:
+        recs = store.query_records(
+            """
+            MATCH (s:Symbol)-[:IN_COMMUNITY]->(c:Community)
+            WHERE s.id = $q OR lower(s.fqname) = lower($q) OR lower(s.name) = lower($q)
+            RETURN s.id as symbol_id, s.fqname as fqname, c.id as community_id, c.label as label, c.cohesion as cohesion
+            LIMIT 20
+            """,
+            {"q": symbol_query},
+        )
     return {"query": symbol_query, "matches": recs}

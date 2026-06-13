@@ -156,7 +156,7 @@ codespine guide --json   # structured JSON for tooling
 
 ---
 
-## MCP Tools (45 total)
+## MCP Tools (46 total)
 
 ### Discovery & Status
 
@@ -195,6 +195,7 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 
 | Tool | Description |
 |------|-------------|
+| `answer(question, project)` | GraphRAG answer surface with evidence, citations, confidence, and observability contracts. |
 | `ask(question, project)` | Keyword-based natural language dispatcher: routes "who calls X", "what breaks if Y", "explain Z", "find methods named …" to the right tool automatically. |
 | `what_breaks(symbol, project)` | Plain-English blast-radius summary with `risk_level` (low / medium / high). |
 | `explain(symbol, project)` | What a class or method does and how it fits in the architecture. |
@@ -279,6 +280,7 @@ codespine watch --path . --install-hook      # also install post-commit git hook
 codespine watch --path . --uninstall-hook    # remove git hook
 
 # Search & Analysis (CLI)
+codespine answer "question" --project app    # GraphRAG answer with evidence/citations/confidence
 codespine search "query" --project app       # scoped hybrid search
 codespine search "query" --explain           # provenance-aware hybrid search
 codespine context "symbol"                   # one-shot deep context

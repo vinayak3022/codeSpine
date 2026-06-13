@@ -27,6 +27,7 @@ from codespine.analysis.deadcode import detect_dead_code
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
 from codespine.config import SETTINGS
+from codespine.graphrag import graph_rag_answer
 from codespine.sharding import ShardedGraphStore, ShardRouter
 from codespine.diff.branch_diff import compare_branches
 from codespine.health import index_health, project_health, smoke_test_index
@@ -1524,6 +1525,19 @@ def impact(symbol: str, max_depth: int, as_json: bool) -> None:
     """Impact analysis grouped by depth with confidence scores."""
     store = _open_store(read_only=True)
     result = analyze_impact(store, symbol, max_depth=max_depth)
+    _echo_json(result, as_json)
+
+
+@main.command()
+@click.argument("question")
+@click.option("--project", default=None)
+@click.option("--max-depth", default=3, show_default=True, type=int)
+@click.option("--k", default=5, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def answer(question: str, project: str | None, max_depth: int, k: int, as_json: bool) -> None:
+    """GraphRAG answer surface with evidence, citations, confidence, and observability."""
+    store = _open_store(read_only=True)
+    result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
     _echo_json(result, as_json)
 
 

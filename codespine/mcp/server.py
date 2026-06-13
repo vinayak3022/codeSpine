@@ -23,6 +23,7 @@ from codespine.analysis.flow import trace_execution_flows as trace_flows_analysi
 from codespine.analysis.impact import analyze_impact
 from codespine.diff.branch_diff import compare_branches as compare_branches_analysis
 from codespine.health import index_health
+from codespine.graphrag import graph_rag_answer
 from codespine.overlay.git_state import current_head
 from codespine.overlay.merge import overlay_summary
 from codespine.project_state import derive_project_status, list_project_states, load_project_state, snapshot_info, synthetic_project_state
@@ -833,6 +834,19 @@ def build_mcp_server(store, repo_path_provider):
         if not result.get("search_candidates"):
             return _no_symbols_response()
         return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
+
+    @mcp.tool()
+    def answer(question: str, project: str | None = None, max_depth: int = 3, k: int = 5):
+        """
+        GraphRAG answer surface with evidence, citations, confidence, and observability.
+        """
+        try:
+            result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
+            if not result.get("available"):
+                return _json(result)
+            return _staleness_meta(store, result, project, overlay_store=overlay_store, deep_scope=True)
+        except Exception as exc:
+            return _safe_tool_response("answer", exc)
 
     @mcp.tool()
     def get_codebase_stats():
