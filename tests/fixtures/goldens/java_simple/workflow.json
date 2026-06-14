@@ -11,8 +11,8 @@
   },
   "impact": {
     "resolved_to": [
-      "testProcessPayment",
-      "processPayment"
+      "processPayment",
+      "testProcessPayment"
     ],
     "direct_callers": [
       "main"

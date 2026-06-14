@@ -1,0 +1,37 @@
+{
+  "name": "java-simple-graphrag-benchmark",
+  "gates": {
+    "min_average_score": 80.0,
+    "min_case_score": 70.0,
+    "min_pass_rate": 1.0
+  },
+  "cases": [
+    {
+      "name": "processPayment-abstains-on-ambiguous-corpus",
+      "question": "what breaks if I change processPayment?",
+      "expect": {
+        "available": false,
+        "abstained": true,
+        "min_score": 70.0
+      }
+    },
+    {
+      "name": "service-abstains-on-ambiguous-corpus",
+      "question": "explain Service",
+      "expect": {
+        "available": false,
+        "abstained": true,
+        "min_score": 70.0
+      }
+    },
+    {
+      "name": "unknown-symbol-abstains",
+      "question": "what breaks if I change NonExistentThing?",
+      "expect": {
+        "available": false,
+        "abstained": true,
+        "min_score": 70.0
+      }
+    }
+  ]
+}

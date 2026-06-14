@@ -107,7 +107,7 @@ def _workflow_contract(store: GraphStore, project_id: str) -> dict:
             },
         },
         "impact": {
-            "resolved_to": [item["name"] for item in impact["resolved_to"]],
+            "resolved_to": sorted(item["name"] for item in impact["resolved_to"]),
             "direct_callers": [item["name"] for item in impact["impacted_callers"]["1"]],
             "summary": impact["summary"],
         },

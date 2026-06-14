@@ -170,6 +170,87 @@ Every answer includes `observability.latency_ms` with per-stage breakdown:
 
 ---
 
+## Benchmark Results (v1.0.14 smoke benchmark)
+
+The numbers below were measured on **commit `e2e4145`** using an **Apple M2 / macOS 25.4.0 / Python 3.10.9 / DuckDB backend** with **no ML model installed** (hash-embedding fallback). The benchmark corpus was the bundled Java fixture copied to a temporary workspace:
+
+- dataset: `tests/fixtures/java_simple`
+- size: **3 files / 3 classes / 4 methods / 3 call edges / 7 symbols**
+- GraphRAG evaluation suite: `benchmarks/java_simple_answer_eval.json`
+
+This is a **smoke benchmark**, not a scale benchmark. It is useful for regression detection, cache validation, and end-to-end correctness, but it is too small to represent medium/large Java repos.
+
+### Methodology
+
+- **Indexing:** 5 fresh runs of `analyse --complete --deep`
+- **Retrieval latency:** 15 in-process runs each for `search_hybrid(..., explain=True)` and `analyze_impact(...)`
+- **GraphRAG latency:** 10 cold/warm pairs using the same in-process store to measure cache behavior
+- **Quality:** `answer-eval` against the bundled suite
+- **Freshness:** modify one Java file, rerun incremental `analyse`, verify the new symbol is searchable in a fresh process
+
+### Indexing
+
+| Benchmark | Runs | Median | P95 | Max |
+|-----------|------|--------|-----|-----|
+| `analyse --complete --deep` | 5 | **1125.51 ms** | **1695.40 ms** | 1831.70 ms |
+| Incremental `analyse` after one file change | 1 | **1117.07 ms** | — | — |
+
+### Retrieval quality
+
+Measured on 5 labeled queries (`processPayment`, `helper`, `App`, `ServiceTest`, `process payment`) against the temporary copied fixture corpus (`project_id=query_corpus`):
+
+| Metric | Value |
+|--------|-------|
+| Top-1 accuracy | **1.00** |
+| Recall@3 | **1.00** |
+| MRR@3 | **1.00** |
+
+### Query latency
+
+| Tool | Runs | Median | P95 | Max |
+|------|------|--------|-----|-----|
+| `search_hybrid(..., explain=True)` | 15 | **5.68 ms** | **5.88 ms** | 5.89 ms |
+| `analyze_impact(...)` | 15 | **9.59 ms** | **10.42 ms** | 11.40 ms |
+| `graph_rag_answer(...)` cold | 10 | **22.81 ms** | **23.33 ms** | 23.34 ms |
+| `graph_rag_answer(...)` warm | 10 | **0.08 ms** | **0.10 ms** | 0.10 ms |
+
+Observed GraphRAG warm-cache hit rate in-process: **100%**.
+
+### GraphRAG quality on the tiny corpus
+
+`answer-eval` against `benchmarks/java_simple_answer_eval.json` produced:
+
+| Metric | Value |
+|--------|-------|
+| Average regression score | **70.0** |
+| Min case score | **70.0** |
+| Pass rate | **1.0** |
+| Quality gates passed | **false** |
+
+Observed violation:
+
+- `Average regression score 70.00 is below 80.00.`
+
+Important caveat: on this tiny corpus, the current GraphRAG answer surface **abstains** on semantically meaningful questions such as `what breaks if I change processPayment?` because the ambiguity threshold treats nearby class/method names as unsafe to guess between. That is why the measured GraphRAG status during the latency benchmark was **`abstained`**, and why the suite is primarily an abstention/fallback benchmark rather than a supported-answer benchmark.
+
+### Freshness / incremental correctness
+
+After adding a new method (`newlyAddedBenchmarkMethod`) to `Service.java` and rerunning incremental `analyse`, a fresh process resolved the new method as the **top search result**:
+
+- top result: `com.example.Service#newlyAddedBenchmarkMethod()`
+- visibility after incremental reindex: **true**
+
+### What this benchmark says today
+
+- **Indexing and read-path latency are fast** on the bundled smoke corpus.
+- **GraphRAG caching works**: warm calls dropped from ~22.8 ms median to ~0.08 ms median in-process.
+- **Incremental freshness works** when verified from a fresh process after re-index.
+- **GraphRAG quality on tiny corpora is conservative**: abstention is correct and stable, but the current ambiguity policy is strict enough to fail the default `min_average_score=80` gate on the bundled smoke suite.
+
+For a production benchmark on real codebases, run the same workflow on a medium and large Java corpus and keep the same reporting fields (dataset size, cold/warm split, p95, retrieval accuracy, and `answer-eval` score).
+
+---
+
 ## MCP Configuration
 
 Foreground server:
