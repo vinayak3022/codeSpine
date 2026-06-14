@@ -21,7 +21,7 @@ from codespine.analysis.context import build_symbol_context
 from codespine.analysis.coupling import get_coupling
 from codespine.analysis.deadcode import detect_dead_code as detect_dead_code_analysis
 from codespine.analysis.flow import trace_execution_flows as trace_flows_analysis
-from codespine.analysis.impact import analyze_impact
+from codespine.analysis.impact import analyze_impact, resolve_symbol_targets
 from codespine.diff.branch_diff import compare_branches as compare_branches_analysis
 from codespine.health import index_health
 from codespine.graphrag import graph_rag_answer
@@ -116,6 +116,17 @@ def _normalize_symbol_input(raw: str) -> str:
     if "#" in s:
         s = s[s.index("#") + 1:]
     return s
+
+
+def _preferred_symbol_inputs(raw: str) -> list[str]:
+    original = raw.strip()
+    normalized = _normalize_symbol_input(raw)
+    candidates: list[str] = []
+    if original:
+        candidates.append(original)
+    if normalized and normalized != original:
+        candidates.append(normalized)
+    return candidates
 
 
 def _parse_indexed_at(raw) -> int:
@@ -797,10 +808,23 @@ def build_mcp_server(store, repo_path_provider):
         """
         if entry_symbol:
             entry_symbol = _normalize_symbol_input(entry_symbol)
-        flows = trace_flows_analysis(store, entry_symbol=entry_symbol, max_depth=max_depth, project=project)
+        result = trace_flows_analysis(
+            store,
+            entry_symbol=entry_symbol,
+            max_depth=max_depth,
+            project=project,
+            include_metadata=True,
+        )
+        flows = result.get("flows", []) if isinstance(result, dict) else result
         if not flows:
             return _no_symbols_response("No entry points found. Run 'codespine analyse --deep' or provide entry_symbol.")
-        return _staleness_meta(store, {"available": True, "flows": flows}, project, overlay_store=overlay_store, deep_scope=True)
+        return _staleness_meta(
+            store,
+            {"available": True, "flows": flows, "flow_truncation": result.get("truncation", {}) if isinstance(result, dict) else {}},
+            project,
+            overlay_store=overlay_store,
+            deep_scope=True,
+        )
 
     @mcp.tool()
     def get_symbol_community(symbol: str):
@@ -2207,10 +2231,25 @@ def build_mcp_server(store, repo_path_provider):
         risk_level: "low" (<5 callers), "medium" (5–20), "high" (>20).
         """
         try:
-            normalized = _normalize_symbol_input(symbol)
-            result = analyze_impact(store, normalized, max_depth=4, project=project)
-            if not result.get("resolved_to"):
-                result = analyze_impact(store, symbol, max_depth=4, project=project)
+            result = None
+            for candidate in _preferred_symbol_inputs(symbol):
+                result = analyze_impact(store, candidate, max_depth=4, project=project)
+                if result.get("resolution", {}).get("status") != "not_found":
+                    break
+            result = result or analyze_impact(store, symbol, max_depth=4, project=project)
+            resolution = result.get("resolution", {})
+            if resolution.get("status") == "ambiguous":
+                return _staleness_meta(store, {
+                    "available": True,
+                    "symbol": symbol,
+                    "resolution_status": "ambiguous",
+                    "ambiguity": resolution,
+                    "risk_level": "unknown",
+                    "total_callers": 0,
+                    "impacted_callers": {"1": [], "2": [], "3+": []},
+                    "self_callers": [],
+                    "summary": {"direct": 0, "indirect": 0, "transitive": 0, "self_callers": 0},
+                }, project, overlay_store=overlay_store)
             if not result.get("resolved_to"):
                 return {"available": False, "note": f"Symbol '{symbol}' not found."}
             callers = result.get("impacted_callers", {})
@@ -2225,6 +2264,7 @@ def build_mcp_server(store, repo_path_provider):
                 "impacted_callers": callers,
                 "self_callers": result.get("self_callers", []),
                 "summary": result.get("summary", {}),
+                "resolution": resolution,
             }, project, overlay_store=overlay_store)
         except Exception as exc:
             return _safe_tool_response("what_breaks", exc)
@@ -2240,18 +2280,24 @@ def build_mcp_server(store, repo_path_provider):
           community  — architectural cluster membership
         """
         try:
-            normalized = _normalize_symbol_input(symbol)
-            # 1. Find the symbol.
-            sym_recs = store.query_records(
-                """
-                MATCH (s:Symbol)
-                WHERE lower(s.name) = $namel OR lower(s.fqname) CONTAINS $namel
-                RETURN s.id as id, s.kind as kind, s.name as name,
-                       s.fqname as fqname, s.file_id as file_id, s.line as line
-                LIMIT 5
-                """,
-                {"namel": normalized.lower()},
-            )
+            resolution = None
+            for candidate in _preferred_symbol_inputs(symbol):
+                resolution = resolve_symbol_targets(store, candidate, project=project)
+                if resolution.get("status") != "not_found":
+                    break
+            resolution = resolution or resolve_symbol_targets(store, symbol, project=project)
+            if resolution.get("status") == "ambiguous":
+                return _staleness_meta(store, {
+                    "available": True,
+                    "symbol": symbol,
+                    "resolution_status": "ambiguous",
+                    "ambiguity": resolution,
+                    "matched": resolution.get("matches", []),
+                    "callers": [],
+                    "callees": [],
+                    "community": None,
+                }, project, overlay_store=overlay_store)
+            sym_recs = resolution.get("matches", [])
             if not sym_recs:
                 return {"available": False, "note": f"Symbol '{symbol}' not found."}
 
@@ -2266,25 +2312,38 @@ def build_mcp_server(store, repo_path_provider):
                 {"sid": top["id"]},
             )
 
-            # 3. Direct callers/callees (first-degree neighborhood via Method).
-            callers = store.query_records(
-                """
-                MATCH (caller:Method)-[:CALLS]->(m:Method), (s:Symbol)
-                WHERE s.id = $sid AND s.fqname CONTAINS m.signature
-                RETURN caller.name as name, caller.id as id
-                LIMIT 10
-                """,
-                {"sid": top["id"]},
-            )
-            callees = store.query_records(
-                """
-                MATCH (m:Method)-[:CALLS]->(callee:Method), (s:Symbol)
-                WHERE s.id = $sid AND s.fqname CONTAINS m.signature
-                RETURN callee.name as name, callee.id as id
-                LIMIT 10
-                """,
-                {"sid": top["id"]},
-            )
+            method_ids = resolution.get("resolved_method_ids", [])
+            if method_ids:
+                method_scope = {"ids": method_ids}
+                project_clause = "AND fa.project_id = $proj AND fb.project_id = $proj" if project else ""
+                params = dict(method_scope)
+                if project:
+                    params["proj"] = project
+                callers = store.query_records(
+                    f"""
+                    MATCH (caller:Method)-[:CALLS]->(m:Method), (ca:Class), (fa:File), (cb:Class), (fb:File)
+                    WHERE caller.class_id = ca.id AND ca.file_id = fa.id
+                      AND m.class_id = cb.id AND cb.file_id = fb.id
+                      AND m.id IN $ids {project_clause}
+                    RETURN DISTINCT caller.name as name, caller.id as id
+                    LIMIT 10
+                    """,
+                    params,
+                )
+                callees = store.query_records(
+                    f"""
+                    MATCH (m:Method)-[:CALLS]->(callee:Method), (ca:Class), (fa:File), (cb:Class), (fb:File)
+                    WHERE m.class_id = ca.id AND ca.file_id = fa.id
+                      AND callee.class_id = cb.id AND cb.file_id = fb.id
+                      AND m.id IN $ids {project_clause}
+                    RETURN DISTINCT callee.name as name, callee.id as id
+                    LIMIT 10
+                    """,
+                    params,
+                )
+            else:
+                callers = []
+                callees = []
 
             return _staleness_meta(store, {
                 "available": True,
@@ -2293,6 +2352,7 @@ def build_mcp_server(store, repo_path_provider):
                 "community": community_info[0] if community_info else None,
                 "callers": callers,
                 "callees": callees,
+                "resolution_status": resolution.get("status"),
             }, project, overlay_store=overlay_store)
         except Exception as exc:
             return _safe_tool_response("explain", exc)

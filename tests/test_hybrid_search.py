@@ -9,7 +9,7 @@ import pytest
 
 from codespine import __version__
 from codespine.analysis.context import build_symbol_context, resolve_symbol_focus
-from codespine.analysis.flow import trace_execution_flows
+from codespine.analysis.flow import _resolve_entry_methods, trace_execution_flows
 from codespine.analysis.impact import analyze_impact
 from codespine.cli import main
 from codespine.mcp.server import build_mcp_server
@@ -409,9 +409,10 @@ def test_build_symbol_context_scopes_community_and_flow_by_project(monkeypatch):
         captured["community_project"] = project
         return {"matches": []}
 
-    def fake_trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None, progress=None):
+    def fake_trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int = 6, project: str | None = None, progress=None, **kwargs):
         captured["flow_entry"] = entry_symbol
         captured["flow_project"] = project
+        captured["flow_include_metadata"] = kwargs.get("include_metadata")
         return []
 
     monkeypatch.setattr("codespine.analysis.context.analyze_impact", fake_analyze_impact)
@@ -429,6 +430,7 @@ def test_build_symbol_context_scopes_community_and_flow_by_project(monkeypatch):
         "community_project": "app",
         "flow_entry": "com.example.Foo",
         "flow_project": "app",
+        "flow_include_metadata": True,
     }
 
 
@@ -526,6 +528,20 @@ def test_trace_execution_flows_metadata_resolution_honors_project(monkeypatch):
 
     assert [node["project_id"] for node in flows[0]["nodes"]] == ["app", "app"]
     assert [node["file_path"] for node in flows[0]["nodes"]] == ["/repo/app/Main.java", "/repo/app/Helper.java"]
+
+
+def test_resolve_entry_methods_prefers_qualified_exact_match_over_bare_name_fallback():
+    class _Store:
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "lower(c.fqcn) = lower($class_fqcn)" in query:
+                return [{"id": "m_target"}]
+            if (params or {}).get("q") == "target" and ("lower(m.name) = lower($q)" in query or "lower(m.signature) = lower($q)" in query):
+                return [{"id": "m_shadow"}]
+            if "lower(m.name) = lower($q)" in query or "lower(m.signature) = lower($q)" in query:
+                return []
+            raise AssertionError(f"unexpected query: {query}")
+
+    assert _resolve_entry_methods(_Store(), "com.example.App#target", project="app") == ["m_target"]
 
 
 def test_analyze_impact_metadata_resolution_honors_project(monkeypatch):

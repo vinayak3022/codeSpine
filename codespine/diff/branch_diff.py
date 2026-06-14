@@ -145,43 +145,117 @@ def _class_hashes(source: bytes) -> dict[str, str]:
     return out
 
 
-def _symbol_manifest(repo_path: str) -> dict[str, dict]:
-    manifest: dict[str, dict] = {}
-    for root, _, files in os.walk(repo_path):
-        if any(skip in root for skip in [".git", "target", "build", "out"]):
-            continue
-        for f in files:
-            if not f.endswith(".java"):
-                continue
-            path = os.path.join(root, f)
-            rel = os.path.relpath(path, repo_path)
-            with open(path, "rb") as fp:
-                source = fp.read()
-            parsed = parse_java_source(source)
-            method_hashes = _method_hashes(source)
-            class_hashes = _class_hashes(source)
-            for cls in parsed.classes:
-                cls_key = f"class:{cls.fqcn}"
-                manifest[cls_key] = {
-                    "kind": "Class",
-                    "file": rel,
-                    "name": cls.fqcn,
-                    "hash": class_hashes.get(cls.name, cls.body_hash),
-                    "line_start": cls.line,
+def _manifest_for_file(repo_path: str, rel_path: str) -> tuple[list[dict], list[str]]:
+    path = os.path.join(repo_path, rel_path)
+    if not os.path.exists(path):
+        return [], []
+    try:
+        with open(path, "rb") as fp:
+            source = fp.read()
+        parsed = parse_java_source(source)
+        method_hashes = _method_hashes(source)
+        class_hashes = _class_hashes(source)
+    except Exception as exc:
+        return [], [f"{rel_path}: {exc}"]
+
+    records: list[dict] = []
+    for cls in parsed.classes:
+        class_semantic_id = f"class:{cls.fqcn}"
+        class_hash = class_hashes.get(cls.name, cls.body_hash)
+        records.append(
+            {
+                "kind": "Class",
+                "file": rel_path,
+                "name": cls.fqcn,
+                "class": cls.fqcn,
+                "semantic_id": class_semantic_id,
+                "fqid": f"{class_semantic_id}@{rel_path}",
+                "semantic_hash": class_hash,
+                "hash": class_hash,
+                "line_start": cls.line,
+            }
+        )
+        for m in cls.methods:
+            method_semantic_id = f"method:{cls.fqcn}#{m.signature}"
+            mh = method_hashes.get(f"{m.name}({','.join(m.parameter_types)})") or method_hashes.get(m.signature) or {}
+            method_hash = m.body_hash or mh.get("hash") or ""
+            records.append(
+                {
+                    "kind": "Method",
+                    "file": rel_path,
+                    "name": m.signature,
+                    "class": cls.fqcn,
+                    "semantic_id": method_semantic_id,
+                    "fqid": f"{method_semantic_id}@{rel_path}",
+                    "semantic_hash": method_hash,
+                    "hash": method_hash,
+                    "line_start": mh.get("line_start", m.line),
+                    "line_end": mh.get("line_end", m.line),
                 }
-                for m in cls.methods:
-                    m_key = f"method:{cls.fqcn}#{m.signature}"
-                    mh = method_hashes.get(f"{m.name}({','.join(m.parameter_types)})") or method_hashes.get(m.signature) or {}
-                    manifest[m_key] = {
-                        "kind": "Method",
-                        "file": rel,
-                        "name": m.signature,
-                        "class": cls.fqcn,
-                        "hash": m.body_hash or mh.get("hash"),
-                        "line_start": mh.get("line_start", m.line),
-                        "line_end": mh.get("line_end", m.line),
-                    }
-    return manifest
+            )
+    return records, []
+
+
+def _git_changed_files(repo_path: str, base_ref: str, head_ref: str) -> list[dict[str, str]]:
+    proc = subprocess.run(
+        ["git", "-C", repo_path, "diff", "--name-status", "--find-renames", base_ref, head_ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    changes: list[dict[str, str]] = []
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status.startswith("R") or status.startswith("C"):
+            if len(parts) < 3:
+                continue
+            changes.append({"status": "M", "base": parts[1], "head": parts[2]})
+        elif status == "A" and len(parts) >= 2:
+            changes.append({"status": "A", "head": parts[1]})
+        elif status == "D" and len(parts) >= 2:
+            changes.append({"status": "D", "base": parts[1]})
+        elif len(parts) >= 2:
+            changes.append({"status": "M", "base": parts[1], "head": parts[1]})
+    return changes
+
+
+def _group_by_semantic_id(records: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for rec in records:
+        grouped.setdefault(str(rec.get("semantic_id") or ""), []).append(rec)
+    return grouped
+
+
+def _diff_semantic_records(base_records: list[dict], head_records: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    added: list[dict] = []
+    removed: list[dict] = []
+    modified: list[dict] = []
+
+    base_groups = _group_by_semantic_id(base_records)
+    head_groups = _group_by_semantic_id(head_records)
+    semantic_ids = sorted((set(base_groups) | set(head_groups)) - {""})
+    for semantic_id in semantic_ids:
+        base_group = base_groups.get(semantic_id, [])
+        head_group = head_groups.get(semantic_id, [])
+        if len(base_group) == 1 and len(head_group) == 1:
+            if str(base_group[0].get("semantic_hash") or "") != str(head_group[0].get("semantic_hash") or ""):
+                modified.append(head_group[0])
+            continue
+
+        base_by_fqid = {str(rec.get("fqid") or ""): rec for rec in base_group}
+        head_by_fqid = {str(rec.get("fqid") or ""): rec for rec in head_group}
+        for fqid in sorted(set(head_by_fqid) - set(base_by_fqid)):
+            added.append(head_by_fqid[fqid])
+        for fqid in sorted(set(base_by_fqid) - set(head_by_fqid)):
+            removed.append(base_by_fqid[fqid])
+        for fqid in sorted(set(base_by_fqid) & set(head_by_fqid)):
+            if str(base_by_fqid[fqid].get("semantic_hash") or "") != str(head_by_fqid[fqid].get("semantic_hash") or ""):
+                modified.append(head_by_fqid[fqid])
+    return added, removed, modified
 
 
 def compare_branches(repo_path: str, base_ref: str, head_ref: str) -> dict:
@@ -193,24 +267,43 @@ def compare_branches(repo_path: str, base_ref: str, head_ref: str) -> dict:
         subprocess.run(["git", "-C", repo_path, "worktree", "add", "--detach", base_dir, base_ref], check=True, capture_output=True)
         subprocess.run(["git", "-C", repo_path, "worktree", "add", "--detach", head_dir, head_ref], check=True, capture_output=True)
 
-        base_manifest = _symbol_manifest(base_dir)
-        head_manifest = _symbol_manifest(head_dir)
+        changes = _git_changed_files(repo_path, base_ref, head_ref)
+        added: list[dict] = []
+        removed: list[dict] = []
+        modified: list[dict] = []
+        warnings: list[str] = []
 
-        added = sorted(set(head_manifest) - set(base_manifest))
-        removed = sorted(set(base_manifest) - set(head_manifest))
+        for change in changes:
+            status = change["status"]
+            base_rel = change.get("base")
+            head_rel = change.get("head")
+            base_records, base_warnings = _manifest_for_file(base_dir, base_rel) if base_rel else ([], [])
+            head_records, head_warnings = _manifest_for_file(head_dir, head_rel) if head_rel else ([], [])
+            for warning in base_warnings + head_warnings:
+                if warning not in warnings:
+                    warnings.append(warning)
+            if base_warnings or head_warnings:
+                continue
+            if status == "A":
+                added.extend(head_records)
+            elif status == "D":
+                removed.extend(base_records)
+            else:
+                file_added, file_removed, file_modified = _diff_semantic_records(base_records, head_records)
+                added.extend(file_added)
+                removed.extend(file_removed)
+                modified.extend(file_modified)
 
-        modified = []
-        for key in sorted(set(base_manifest) & set(head_manifest)):
-            if json.dumps(base_manifest[key], sort_keys=True) != json.dumps(head_manifest[key], sort_keys=True):
-                modified.append(key)
-
-        return {
+        result = {
             "base": base_ref,
             "head": head_ref,
-            "added": [head_manifest[k] for k in added],
-            "removed": [base_manifest[k] for k in removed],
-            "modified": [head_manifest[k] for k in modified],
+            "added": added,
+            "removed": removed,
+            "modified": modified,
         }
+        if warnings:
+            result["warnings"] = warnings
+        return result
     finally:
         subprocess.run(["git", "-C", repo_path, "worktree", "remove", "--force", base_dir], check=False, capture_output=True)
         subprocess.run(["git", "-C", repo_path, "worktree", "remove", "--force", head_dir], check=False, capture_output=True)

@@ -5,18 +5,21 @@ from collections import defaultdict, deque
 from codespine.overlay.merge import merged_call_edges, merged_method_records, merged_symbol_records
 
 
-def _resolve_symbol_ids(store, symbol_query: str, project: str | None = None) -> list[str]:
+def _symbol_exact_match(rec: dict, needle: str) -> bool:
+    return (
+        str(rec.get("id") or "").lower() == needle
+        or str(rec.get("name") or "").lower() == needle
+        or str(rec.get("fqname") or "").lower() == needle
+    )
+
+
+def _resolve_exact_symbol_records(store, symbol_query: str, project: str | None = None) -> list[dict]:
     overlay_store = getattr(store, "overlay_store", None)
+    needle = (symbol_query or "").strip().lower()
+    if not needle:
+        return []
     if overlay_store is not None:
-        recs = []
-        needle = symbol_query.lower()
-        for rec in merged_symbol_records(store, overlay_store, project=project):
-            name = str(rec.get("name") or "").lower()
-            fqname = str(rec.get("fqname") or "").lower()
-            if rec.get("id") == symbol_query or name == needle or fqname == needle or needle in fqname:
-                recs.append({"id": rec["id"]})
-                if len(recs) >= 50:
-                    break
+        recs = [rec for rec in merged_symbol_records(store, overlay_store, project=project) if _symbol_exact_match(rec, needle)]
     else:
         project_clause = "AND f.project_id = $proj" if project else ""
         params: dict = {"q": symbol_query}
@@ -26,13 +29,157 @@ def _resolve_symbol_ids(store, symbol_query: str, project: str | None = None) ->
             f"""
             MATCH (s:Symbol), (f:File)
             WHERE s.file_id = f.id {project_clause}
-            AND (s.id = $q OR lower(s.name) = lower($q) OR lower(s.fqname) = lower($q) OR lower(s.fqname) CONTAINS lower($q))
-            RETURN s.id as id
-            LIMIT 50
+            AND (s.id = $q OR lower(s.name) = lower($q) OR lower(s.fqname) = lower($q))
+            RETURN s.id as id, s.kind as kind, s.name as name, s.fqname as fqname,
+                   s.file_id as file_id, f.project_id as project_id, f.path as file_path,
+                   f.is_test as is_test
             """,
             params,
         )
-    return [r["id"] for r in recs]
+    seen: set[str] = set()
+    out: list[dict] = []
+    for rec in recs:
+        rec_id = rec.get("id")
+        if not rec_id or rec_id in seen:
+            continue
+        seen.add(str(rec_id))
+        out.append(rec)
+    return out
+
+
+def _resolve_methods_for_symbol(store, symbol_rec: dict, project: str | None = None) -> list[str]:
+    overlay_store = getattr(store, "overlay_store", None)
+    symbol_kind = str(symbol_rec.get("kind") or "").lower()
+    fqname = str(symbol_rec.get("fqname") or "")
+    symbol_name = str(symbol_rec.get("name") or "")
+    method_ids: list[str] = []
+
+    def _append_method_id(mid: str | None) -> None:
+        mid = str(mid or "")
+        if mid and mid not in method_ids:
+            method_ids.append(mid)
+
+    def _append_test_companions() -> None:
+        if not project or symbol_kind != "method" or not symbol_name or symbol_name.lower().startswith("test"):
+            return
+        candidates = [f"test{symbol_name[0].upper()}{symbol_name[1:]}", f"test_{symbol_name}"]
+        if overlay_store is not None:
+            for rec in merged_method_records(store, overlay_store, project=project):
+                rec_name = str(rec.get("name") or "")
+                rec_sig = str(rec.get("signature") or "")
+                if any(rec_name.lower() == candidate.lower() or rec_sig.lower() == f"{candidate}()".lower() for candidate in candidates):
+                    _append_method_id(rec.get("id"))
+            return
+        if not hasattr(store, "query_records"):
+            return
+        project_clause = "AND f.project_id = $proj" if project else ""
+        for candidate in candidates:
+            params = {"q": candidate}
+            if project:
+                params["proj"] = project
+            rows = store.query_records(
+                f"""
+                MATCH (m:Method), (c:Class), (f:File)
+                WHERE m.class_id = c.id AND c.file_id = f.id {project_clause}
+                  AND (lower(m.name) = lower($q) OR lower(m.signature) = lower($q))
+                RETURN m.id as id, m.name as name, m.signature as fqname,
+                       c.fqcn as class_fqcn, f.project_id as project_id, f.path as file_path
+                """,
+                params,
+            )
+            for row in rows:
+                _append_method_id(row.get("id"))
+
+    if symbol_kind == "class":
+        class_fqcn = fqname or str(symbol_rec.get("name") or "")
+        if not class_fqcn:
+            return []
+        if overlay_store is not None:
+            method_ids = []
+            for rec in merged_method_records(store, overlay_store, project=project):
+                if str(rec.get("class_fqcn") or "").lower() == class_fqcn.lower():
+                    method_ids.append(str(rec["id"]))
+            return method_ids
+        project_clause = "AND f.project_id = $proj" if project else ""
+        params: dict = {"class_fqcn": class_fqcn}
+        if project:
+            params["proj"] = project
+        rows = store.query_records(
+            f"""
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id {project_clause}
+              AND lower(c.fqcn) = lower($class_fqcn)
+            RETURN m.id as id
+                """,
+                params,
+            )
+        for row in rows:
+            _append_method_id(row.get("id"))
+        return method_ids
+
+    if fqname and "#" in fqname:
+        class_fqcn, signature = fqname.rsplit("#", 1)
+        if overlay_store is not None:
+            for rec in merged_method_records(store, overlay_store, project=project):
+                if str(rec.get("class_fqcn") or "").lower() == class_fqcn.lower() and str(rec.get("signature") or "").lower() == signature.lower():
+                    _append_method_id(rec.get("id"))
+        elif hasattr(store, "query_records"):
+            project_clause = "AND f.project_id = $proj" if project else ""
+            params = {"class_fqcn": class_fqcn, "signature": signature}
+            if project:
+                params["proj"] = project
+            rows = store.query_records(
+                f"""
+                MATCH (m:Method), (c:Class), (f:File)
+                WHERE m.class_id = c.id AND c.file_id = f.id {project_clause}
+                  AND lower(c.fqcn) = lower($class_fqcn)
+                  AND lower(m.signature) = lower($signature)
+                RETURN m.id as id, m.name as name, m.signature as fqname,
+                       c.fqcn as class_fqcn, f.project_id as project_id, f.path as file_path
+                """,
+                params,
+            )
+            for row in rows:
+                _append_method_id(row.get("id"))
+
+    _append_test_companions()
+
+    if method_ids:
+        return method_ids
+
+    if not symbol_rec.get("id"):
+        return []
+
+    # Compatibility fallback for older test/store query shapes that only expose
+    # a symbol-to-method join. Keep it project-scoped and exact on the symbol id.
+    if not hasattr(store, "query_records"):
+        return []
+    params = {"sid": symbol_rec["id"]}
+    project_clause = "AND f.project_id = $proj" if project else ""
+    if project:
+        params["proj"] = project
+    rows = store.query_records(
+        f"""
+        MATCH (s:Symbol), (m:Method), (c:Class), (f:File)
+        WHERE s.file_id = f.id AND m.class_id = c.id AND c.file_id = f.id {project_clause}
+          AND s.id = $sid
+        RETURN s.id as sid, m.id as mid
+        """,
+        params,
+    )
+    return [str(row["mid"]) for row in rows if row.get("mid")]
+
+
+def resolve_symbol_targets(store, symbol_query: str, project: str | None = None) -> dict:
+    exact_matches = _resolve_exact_symbol_records(store, symbol_query, project=project)
+    if not exact_matches:
+        return {"status": "not_found", "matches": [], "resolved_method_ids": []}
+    if len(exact_matches) > 1:
+        return {"status": "ambiguous", "matches": exact_matches, "resolved_method_ids": []}
+
+    symbol_rec = exact_matches[0]
+    method_ids = _resolve_methods_for_symbol(store, symbol_rec, project=project)
+    return {"status": "exact", "matches": exact_matches, "resolved_method_ids": method_ids}
 
 
 def _resolve_method_metadata(store, method_ids: list[str], project: str | None = None) -> dict[str, dict]:
@@ -67,41 +214,21 @@ def _resolve_method_metadata(store, method_ids: list[str], project: str | None =
 
 
 def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | None = None) -> dict:
-    target_symbol_ids = _resolve_symbol_ids(store, symbol_query, project=project)
-    if not target_symbol_ids:
-        return {"target": symbol_query, "depth_groups": {"1": [], "2": [], "3+": []}}
+    resolution = resolve_symbol_targets(store, symbol_query, project=project)
+    if resolution["status"] != "exact":
+        payload = {
+            "target": symbol_query,
+            "resolution": resolution,
+            "depth_groups": {"1": [], "2": [], "3+": []},
+        }
+        if resolution["status"] == "ambiguous":
+            payload["ambiguity"] = {"matches": resolution["matches"]}
+        return payload
 
     overlay_store = getattr(store, "overlay_store", None)
-    if overlay_store is not None:
-        methods = merged_method_records(store, overlay_store, project=project)
-        symbols = merged_symbol_records(store, overlay_store, project=project)
-        fqname_and_file_to_method = {
-            (f"{rec.get('class_fqcn')}#{rec.get('signature')}", rec.get("file_id")): rec["id"]
-            for rec in methods
-        }
-        symbol_to_method = {}
-        for rec in symbols:
-            if rec.get("kind") != "method":
-                continue
-            method_key = (rec.get("fqname"), rec.get("file_id"))
-            method_id = fqname_and_file_to_method.get(method_key)
-            if method_id:
-                symbol_to_method[rec["id"]] = method_id
-    else:
-        symbol_to_method = {
-            r["sid"]: r["mid"]
-            for r in store.query_records(
-                """
-                MATCH (s:Symbol),(m:Method)
-                WHERE s.kind = 'method' AND s.fqname CONTAINS m.signature
-                RETURN s.id as sid, m.id as mid
-                """
-            )
-        }
-
-    target_method_ids = [symbol_to_method[sid] for sid in target_symbol_ids if sid in symbol_to_method]
+    target_method_ids = resolution["resolved_method_ids"]
     if not target_method_ids:
-        return {"target": symbol_query, "depth_groups": {"1": [], "2": [], "3+": []}}
+        return {"target": symbol_query, "resolution": resolution, "depth_groups": {"1": [], "2": [], "3+": []}}
 
     # Load call edges; when project is provided, keep traversal within that scope.
     if overlay_store is not None:
@@ -260,6 +387,7 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
             "fqname": target_meta.get(mid, {}).get("fqname"),
             "file_path": target_meta.get(mid, {}).get("file_path"),
             "class_fqcn": target_meta.get(mid, {}).get("class_fqcn"),
+            "project_id": target_meta.get(mid, {}).get("project_id"),
         }
         for mid in target_method_ids
     ]
@@ -282,6 +410,7 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
 
     return {
         "target": symbol_query,
+        "resolution": resolution,
         "resolved_to": resolved_targets,
         "self_callers": self_callers,
         "impacted_callers": depth_groups,

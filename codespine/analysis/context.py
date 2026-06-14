@@ -87,7 +87,14 @@ def build_symbol_context(
     community = symbol_community(store, focus_symbol, project=project)
     community_ms = int((time.perf_counter() - community_started) * 1000)
     flows_started = time.perf_counter()
-    flows = trace_execution_flows(store, entry_symbol=focus_symbol, max_depth=max_depth + 2, project=project)
+    flows_payload = trace_execution_flows(
+        store,
+        entry_symbol=focus_symbol,
+        max_depth=max_depth + 2,
+        project=project,
+        include_metadata=True,
+    )
+    flows = flows_payload.get("flows", []) if isinstance(flows_payload, dict) else flows_payload
     flows_ms = int((time.perf_counter() - flows_started) * 1000)
 
     return {
@@ -97,6 +104,7 @@ def build_symbol_context(
         "impact": impact,
         "community": community,
         "flows": flows,
+        "flow_truncation": flows_payload.get("truncation", {}) if isinstance(flows_payload, dict) else {},
         "timings_ms": {
             "search": search_ms,
             "impact": impact_ms,
