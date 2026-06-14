@@ -175,11 +175,53 @@ def resolve_symbol_targets(store, symbol_query: str, project: str | None = None)
     if not exact_matches:
         return {"status": "not_found", "matches": [], "resolved_method_ids": []}
     if len(exact_matches) > 1:
+        # Ambiguity resolution: if one match is clearly better (e.g. a non-test
+        # class when all others are test or different kinds), resolve to that.
+        # Otherwise return ambiguous so callers can decide.
+        best = _pick_best_symbol(exact_matches)
+        if best is not None:
+            method_ids = _resolve_methods_for_symbol(store, best, project=project)
+            return {"status": "exact", "matches": [best], "resolved_method_ids": method_ids}
         return {"status": "ambiguous", "matches": exact_matches, "resolved_method_ids": []}
 
     symbol_rec = exact_matches[0]
     method_ids = _resolve_methods_for_symbol(store, symbol_rec, project=project)
     return {"status": "exact", "matches": exact_matches, "resolved_method_ids": method_ids}
+
+
+def _pick_best_symbol(matches: list[dict]) -> dict | None:
+    """From a list of ambiguous symbol matches, pick the best one.
+
+    Priority:
+      1. Non-test class symbols (clearly the intended target)
+      2. Any non-test symbol when all others are test symbols
+      3. None — if no clear winner exists
+
+    Returns None when all candidates are equally ambiguous (e.g. two methods
+    with the same name in different classes, or multiple test classes).
+    """
+    if not matches:
+        return None
+
+    non_test = [m for m in matches if not m.get("is_test")]
+    non_test_classes = [m for m in non_test if str(m.get("kind") or "").lower() == "class"]
+
+    # Prefer a non-test class match above all else
+    if len(non_test_classes) == 1:
+        return non_test_classes[0]
+
+    # If we have multiple non-test classes, pick by name (prefer the shortest
+    # FQCN, which is typically the "main" class vs a test or companion)
+    if len(non_test_classes) > 1:
+        non_test_classes.sort(key=lambda m: len(str(m.get("fqname") or m.get("name") or "")))
+        return non_test_classes[0]
+
+    # If there's exactly one non-test symbol among all matches, pick it
+    if len(non_test) == 1:
+        return non_test[0]
+
+    # All non-test matches (if any) are equally ambiguous — give up
+    return None
 
 
 def _resolve_method_metadata(store, method_ids: list[str], project: str | None = None) -> dict[str, dict]:
