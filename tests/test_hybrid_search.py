@@ -83,6 +83,110 @@ class _LowConfidenceExplainableStore:
         return []
 
 
+class _ExactMatchFastPathStore:
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+        self.queries.append(query)
+        if "RETURN s.id as id" in query:
+            return [
+                {
+                    "id": "s1",
+                    "kind": "class",
+                    "name": "Foo",
+                    "fqname": "com.example.Foo",
+                    "embedding": None,
+                    "line": 1,
+                    "file_id": "f1",
+                    "file_path": "/tmp/Foo.java",
+                    "project_id": "app",
+                    "is_test": False,
+                },
+                {
+                    "id": "s2",
+                    "kind": "method",
+                    "name": "Foo",
+                    "fqname": "com.example.Other#Foo",
+                    "embedding": None,
+                    "line": 2,
+                    "file_id": "f2",
+                    "file_path": "/tmp/Other.java",
+                    "project_id": "app",
+                    "is_test": False,
+                },
+            ]
+        if "IN_COMMUNITY" in query:
+            return [
+                {"symbol_id": "s1", "community_id": "comm1", "community_label": "Ordering"},
+                {"symbol_id": "s2", "community_id": "comm2", "community_label": "Payments"},
+            ]
+        if "IN_FLOW" in query:
+            return [
+                {"symbol_id": "s1", "flow_id": "flow1", "flow_kind": "entry", "flow_depth": 0},
+                {"symbol_id": "s2", "flow_id": "flow2", "flow_kind": "exit", "flow_depth": 1},
+            ]
+        return []
+
+
+class _ExactMatchOrderingStore:
+    def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+        if "RETURN s.id as id" in query:
+            return [
+                {
+                    "id": "s-name-z",
+                    "kind": "class",
+                    "name": "com.example.Foo",
+                    "fqname": "com.example.Zeta#Foo",
+                    "embedding": None,
+                    "line": 1,
+                    "file_id": "f-name-z",
+                    "file_path": "/tmp/Zeta.java",
+                    "project_id": "app",
+                    "is_test": False,
+                },
+                {
+                    "id": "com.example.Foo",
+                    "kind": "field",
+                    "name": "Other",
+                    "fqname": "com.example.Other#Other",
+                    "embedding": None,
+                    "line": 2,
+                    "file_id": "f-id",
+                    "file_path": "/tmp/Other.java",
+                    "project_id": "app",
+                    "is_test": False,
+                },
+                {
+                    "id": "s-name-a",
+                    "kind": "class",
+                    "name": "com.example.Foo",
+                    "fqname": "com.example.Alpha#Helper",
+                    "embedding": None,
+                    "line": 3,
+                    "file_id": "f-name-a",
+                    "file_path": "/tmp/HelperA.java",
+                    "project_id": "app",
+                    "is_test": False,
+                },
+                {
+                    "id": "s-fqname",
+                    "kind": "class",
+                    "name": "Other",
+                    "fqname": "com.example.Foo",
+                    "embedding": None,
+                    "line": 4,
+                    "file_id": "f-fqname",
+                    "file_path": "/tmp/Foo.java",
+                    "project_id": "app",
+                    "is_test": False,
+                },
+            ]
+        if "IN_COMMUNITY" in query or "IN_FLOW" in query:
+            return []
+        return []
+
+
 def test_hybrid_search_degrades_gracefully_when_context_lookup_fails():
     results = hybrid_search(_FailingContextStore(), "Foo", k=1)
 
@@ -346,13 +450,13 @@ def test_hybrid_search_context_does_not_cross_product_community_and_flow_rows():
                 ]
             if "IN_COMMUNITY" in query:
                 return [
-                    {"community_id": "comm1", "community_label": "Ordering"},
-                    {"community_id": "comm2", "community_label": "Payments"},
+                    {"symbol_id": "s1", "community_id": "comm1", "community_label": "Ordering"},
+                    {"symbol_id": "s1", "community_id": "comm2", "community_label": "Payments"},
                 ]
             if "IN_FLOW" in query:
                 return [
-                    {"flow_id": "flow1", "flow_kind": "entry", "flow_depth": 0},
-                    {"flow_id": "flow2", "flow_kind": "exit", "flow_depth": 1},
+                    {"symbol_id": "s1", "flow_id": "flow1", "flow_kind": "entry", "flow_depth": 0},
+                    {"symbol_id": "s1", "flow_id": "flow2", "flow_kind": "exit", "flow_depth": 1},
                 ]
             return []
 
@@ -367,23 +471,63 @@ def test_hybrid_search_context_does_not_cross_product_community_and_flow_rows():
 
 
 def test_hybrid_search_explain_returns_provenance_envelope():
-    results = hybrid_search(_ExplainableStore(), "Foo", k=1, explain=True)
+    results = hybrid_search(_ExplainableStore(), "Fo", k=1, explain=True)
 
     assert results["retrieval_mode"] == "hybrid"
-    assert results["query"] == "Foo"
-    assert results["results"][0]["confidence"] == "high"
+    assert results["query"] == "Fo"
+    assert results["results"][0]["confidence"] == "medium"
     assert results["results"][0]["rank"] == 1
-    assert results["results"][0]["confidence_reason"] == "Exact name match"
-    assert "exact name match" in results["results"][0]["match_reasons"]
+    assert results["results"][0]["confidence_reason"] == "Partial lexical match"
+    assert "substring name match" in results["results"][0]["match_reasons"]
     assert results["results"][0]["retrieval_traces"]["bm25"]["rank"] == 1
     assert results["results"][0]["retrieval_traces"]["semantic"]["rank"] == 1
     assert results["retrieval_contract"]["fusion"] == "rrf"
     assert results["retrieval_contract"]["supports_rerank"] is True
-    assert results["retrieval_contract"]["version"] == 10
-    assert results["provenance"]["version"] == 10
+    assert results["retrieval_contract"]["version"] == 11
+    assert results["provenance"]["version"] == 11
     assert results["provenance"]["package_version"] == __version__
     assert results["provenance"]["index_fingerprint"]["snapshot_mtime"] >= 0.0
     assert "overlay_mtime" in results["provenance"]["index_fingerprint"]
+    assert set(results["provenance"]["rankers"].keys()) == {"bm25", "semantic", "fuzzy"}
+
+
+def test_hybrid_search_exact_match_fast_path_batches_context_and_skips_rankers(monkeypatch):
+    store = _ExactMatchFastPathStore()
+
+    monkeypatch.setattr("codespine.search.hybrid.rank_bm25", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("bm25 should not run for exact matches")))
+    monkeypatch.setattr("codespine.search.hybrid.rank_fuzzy", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fuzzy should not run for exact matches")))
+    monkeypatch.setattr("codespine.search.hybrid.rank_semantic", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("semantic should not run for exact matches")))
+
+    results = hybrid_search(store, "Foo", k=2, project="app")
+
+    assert len(results) == 2
+    assert sum(1 for q in store.queries if "IN_COMMUNITY" in q) == 1
+    assert sum(1 for q in store.queries if "IN_FLOW" in q) == 1
+    assert all(result["confidence"] == "high" for result in results)
+    assert all(result["context"] for result in results)
+
+
+def test_hybrid_search_exact_match_fast_path_orders_deterministically():
+    results = hybrid_search(_ExactMatchOrderingStore(), "com.example.Foo", k=4, project="app")
+
+    assert [result["id"] for result in results] == ["s-fqname", "com.example.Foo", "s-name-a", "s-name-z"]
+
+
+def test_hybrid_search_exact_match_explain_preserves_contract(monkeypatch):
+    store = _ExplainableStore()
+
+    monkeypatch.setattr("codespine.search.hybrid.rank_bm25", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("bm25 should not run for exact matches")))
+    monkeypatch.setattr("codespine.search.hybrid.rank_fuzzy", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fuzzy should not run for exact matches")))
+    monkeypatch.setattr("codespine.search.hybrid.rank_semantic", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("semantic should not run for exact matches")))
+
+    results = hybrid_search(store, "Foo", k=1, explain=True)
+
+    assert results["retrieval_mode"] == "hybrid"
+    assert results["results"][0]["confidence"] == "high"
+    assert results["results"][0]["confidence_reason"] == "Exact name match"
+    assert results["results"][0]["retrieval_traces"] == {}
+    assert results["retrieval_contract"]["version"] == 11
+    assert results["retrieval_contract"]["supports_rerank"] is True
     assert set(results["provenance"]["rankers"].keys()) == {"bm25", "semantic", "fuzzy"}
 
 

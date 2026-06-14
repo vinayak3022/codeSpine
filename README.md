@@ -628,7 +628,7 @@ Every GraphRAG answer and hybrid search explain response includes a **versioned 
 ```json
 {
   "provenance": {
-    "version": 10,
+    "version": 11,
     "package_version": "1.0.15",
     "retrieval_mode": "graph_rag",
     "question": "what breaks if I change PaymentService?",
@@ -679,13 +679,13 @@ When `search_hybrid(..., explain=True)` is used, the response includes a paralle
 ```json
 {
   "retrieval_contract": {
-    "version": 10,
+    "version": 11,
     "fusion": "rrf",
     "rankers": ["bm25", "semantic", "fuzzy"],
     "candidate_pool_size": 142
   },
   "provenance": {
-    "version": 10,
+    "version": 11,
     "package_version": "1.0.15",
     "candidate_pool_size": 142,
     "index_fingerprint": {

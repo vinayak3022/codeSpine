@@ -14,7 +14,7 @@ LOGGER = logging.getLogger(__name__)
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
-_SEARCH_PROVENANCE_VERSION = 10
+_SEARCH_PROVENANCE_VERSION = 11
 
 
 def _store_snapshot_mtime(store, project: str | None = None) -> float:
@@ -68,10 +68,13 @@ def _rank_trace_map(ranking: list[tuple[str, float]], limit: int) -> tuple[dict[
 
 def _match_reasons(query_lower: str, rec: dict, rank_traces: dict[str, dict[str, object]]) -> list[str]:
     reasons: list[str] = []
+    id_lower = (rec.get("id") or "").lower()
     name_lower = (rec.get("name") or "").lower()
     fqname_lower = (rec.get("fqname") or "").lower()
 
-    if name_lower == query_lower or fqname_lower == query_lower:
+    if id_lower == query_lower:
+        reasons.append("exact id match")
+    elif name_lower == query_lower or fqname_lower == query_lower:
         reasons.append("exact name match")
     else:
         if query_lower and query_lower in name_lower:
@@ -91,8 +94,11 @@ def _match_reasons(query_lower: str, rec: dict, rank_traces: dict[str, dict[str,
 
 
 def _confidence_reason(query_lower: str, rec: dict, rank_traces: dict[str, dict[str, object]]) -> str:
+    id_lower = (rec.get("id") or "").lower()
     name_lower = (rec.get("name") or "").lower()
     fqname_lower = (rec.get("fqname") or "").lower()
+    if id_lower == query_lower:
+        return "Exact id match"
     if name_lower == query_lower or fqname_lower == query_lower:
         return "Exact name match"
     if query_lower and (query_lower in name_lower or query_lower in fqname_lower):
@@ -100,6 +106,27 @@ def _confidence_reason(query_lower: str, rec: dict, rank_traces: dict[str, dict[
     if rank_traces:
         return "Retrieved by combined lexical, fuzzy, and semantic signals"
     return "Weak lexical overlap"
+
+
+def _is_exact_query_match(query_lower: str, rec: dict) -> bool:
+    if not query_lower:
+        return False
+    return query_lower in {
+        (rec.get("id") or "").lower(),
+        (rec.get("name") or "").lower(),
+        (rec.get("fqname") or "").lower(),
+    }
+
+
+def _exact_match_sort_key(query_lower: str, rec: dict) -> tuple[int, int, int, str, str, str]:
+    id_lower = (rec.get("id") or "").lower()
+    name_lower = (rec.get("name") or "").lower()
+    fqname_lower = (rec.get("fqname") or "").lower()
+    kind = (rec.get("kind") or "").lower()
+    exact_match_rank = 0 if query_lower in {id_lower, fqname_lower} else 1
+    kind_rank = 0 if kind == "class" else 1 if kind == "method" else 2
+    test_rank = 1 if rec.get("is_test") else 0
+    return (exact_match_rank, kind_rank, test_rank, fqname_lower, name_lower, id_lower)
 
 
 def _read_snippet(file_path: str, line: int, context: int = _SNIPPET_CONTEXT_LINES) -> str | None:
@@ -163,6 +190,48 @@ def _load_symbol_context(store, symbol_id: str) -> list[dict[str, object]]:
     return context[:3]
 
 
+def _load_symbol_contexts(store, symbol_ids: list[str]) -> dict[str, list[dict[str, object]]]:
+    unique_ids = list(dict.fromkeys(symbol_ids))
+    if not unique_ids:
+        return {}
+
+    community_rows = store.query_records(
+        """
+        MATCH (s:Symbol)-[:IN_COMMUNITY]->(c:Community)
+        WHERE s.id IN $sids
+        RETURN s.id as symbol_id, c.id as community_id, c.label as community_label
+        ORDER BY s.id, c.id
+        """,
+        {"sids": unique_ids},
+    )
+    flow_rows = store.query_records(
+        """
+        MATCH (s:Symbol)-[f:IN_FLOW]->(fl:Flow)
+        WHERE s.id IN $sids
+        RETURN s.id as symbol_id, fl.id as flow_id, fl.kind as flow_kind, f.depth as flow_depth
+        ORDER BY s.id, fl.id
+        """,
+        {"sids": unique_ids},
+    )
+
+    communities: dict[str, list[dict[str, object]]] = {}
+    flows: dict[str, list[dict[str, object]]] = {}
+    for row in community_rows:
+        symbol_id = row.get("symbol_id")
+        if symbol_id:
+            communities.setdefault(str(symbol_id), []).append(_context_entry(community=row))
+    for row in flow_rows:
+        symbol_id = row.get("symbol_id")
+        if symbol_id:
+            flows.setdefault(str(symbol_id), []).append(_context_entry(flow=row))
+
+    contexts: dict[str, list[dict[str, object]]] = {}
+    for symbol_id in unique_ids:
+        context = communities.get(symbol_id, []) + flows.get(symbol_id, [])
+        contexts[symbol_id] = context[:3]
+    return contexts
+
+
 def hybrid_search(store, query: str, k: int = 20, project: str | None = None, explain: bool = False) -> list[dict] | dict:
     overlay_store = getattr(store, "overlay_store", None)
     if overlay_store is not None:
@@ -195,18 +264,35 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
 
     query_lower = query.lower().strip()
 
-    lexical_docs = [(r["id"], f"{r.get('name', '')} {r.get('fqname', '')}") for r in recs]
-    fuzzy_docs = [(r["id"], r.get("name", "")) for r in recs]
-    vector_docs = [(r["id"], r.get("embedding")) for r in recs]
-
-    bm25_rank = rank_bm25(query, lexical_docs)
-    fuzzy_rank = rank_fuzzy(query, fuzzy_docs)
-    semantic_rank = rank_semantic(query, vector_docs)
-
     trace_limit = max(k, 1)
-    bm25_trace_by_id, bm25_traces = _rank_trace_map(bm25_rank, trace_limit)
-    fuzzy_trace_by_id, fuzzy_traces = _rank_trace_map(fuzzy_rank, trace_limit)
-    semantic_trace_by_id, semantic_traces = _rank_trace_map(semantic_rank, trace_limit)
+    exact_matches = [rec for rec in recs if _is_exact_query_match(query_lower, rec)]
+    if exact_matches:
+        exact_matches.sort(key=lambda rec: _exact_match_sort_key(query_lower, rec))
+
+    bm25_rank: list[tuple[str, float]] = []
+    fuzzy_rank: list[tuple[str, float]] = []
+    semantic_rank: list[tuple[str, float]] = []
+    if exact_matches:
+        ranked = [(rec["id"], 1.0) for rec in exact_matches]
+        bm25_trace_by_id: dict[str, dict[str, object]] = {}
+        fuzzy_trace_by_id: dict[str, dict[str, object]] = {}
+        semantic_trace_by_id: dict[str, dict[str, object]] = {}
+        bm25_traces: list[dict[str, object]] = []
+        fuzzy_traces: list[dict[str, object]] = []
+        semantic_traces: list[dict[str, object]] = []
+    else:
+        lexical_docs = [(r["id"], f"{r.get('name', '')} {r.get('fqname', '')}") for r in recs]
+        fuzzy_docs = [(r["id"], r.get("name", "")) for r in recs]
+        vector_docs = [(r["id"], r.get("embedding")) for r in recs]
+
+        bm25_rank = rank_bm25(query, lexical_docs)
+        fuzzy_rank = rank_fuzzy(query, fuzzy_docs)
+        semantic_rank = rank_semantic(query, vector_docs)
+
+        bm25_trace_by_id, bm25_traces = _rank_trace_map(bm25_rank, trace_limit)
+        fuzzy_trace_by_id, fuzzy_traces = _rank_trace_map(fuzzy_rank, trace_limit)
+        semantic_trace_by_id, semantic_traces = _rank_trace_map(semantic_rank, trace_limit)
+
     dirty_overlay_paths: set[str] = set()
     if overlay_store is not None:
         try:
@@ -214,7 +300,7 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
         except Exception:
             dirty_overlay_paths = set()
 
-    fused = reciprocal_rank_fusion([bm25_rank, semantic_rank, fuzzy_rank])
+    fused = ranked if exact_matches else reciprocal_rank_fusion([bm25_rank, semantic_rank, fuzzy_rank])
     rec_by_id = {r["id"]: r for r in recs}
 
     results = []
@@ -229,10 +315,8 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
         if rec.get("kind") in {"method", "class"}:
             multiplier *= 1.2
 
-        # Exact name match: guarantee this symbol ranks first regardless of RRF score.
-        name_lower = (rec.get("name") or "").lower()
-        fqname_lower = (rec.get("fqname") or "").lower()
-        if name_lower == query_lower or fqname_lower == query_lower:
+        # Exact matches are sorted deterministically above when the fast path is used.
+        if _is_exact_query_match(query_lower, rec):
             multiplier *= 5.0
 
         rank_traces = {
@@ -260,7 +344,8 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
             item["confidence_reason"] = _confidence_reason(query_lower, rec, rank_traces)
         results.append(item)
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    if not exact_matches:
+        results.sort(key=lambda x: x["score"], reverse=True)
     top_k = results[:k]
 
     for rank, item in enumerate(top_k, start=1):
@@ -268,11 +353,20 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
 
     # Attach architectural context in the same response. This is best-effort:
     # a context query failure must not hide ranked symbol results.
+    context_by_id: dict[str, list[dict[str, object]]] | None = None
+    try:
+        context_by_id = _load_symbol_contexts(store, [item["id"] for item in top_k])
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Unable to batch load architectural context: %s", exc)
+
     for item in top_k:
         if item.get("file_path") and item["file_path"] in dirty_overlay_paths:
             item["context"] = []
             item["context_warning"] = "Architectural context unavailable for this result."
             item["context_source"] = "overlay_dirty"
+            continue
+        if context_by_id is not None:
+            item["context"] = context_by_id.get(item["id"], [])
             continue
         try:
             item["context"] = _load_symbol_context(store, item["id"])
@@ -299,7 +393,7 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
             continue
         item_name = (item.get("name") or "").lower()
         item_fqname = (item.get("fqname") or "").lower()
-        if item_name == query_lower or item_fqname == query_lower:
+        if (item.get("id") or "").lower() == query_lower or item_name == query_lower or item_fqname == query_lower:
             item["confidence"] = "high"
             has_exact_match = True
         elif query_lower in item_name or query_lower in item_fqname:
