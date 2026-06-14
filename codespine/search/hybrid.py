@@ -4,13 +4,17 @@ import logging
 import os
 
 from codespine import __version__
+from codespine.config import SETTINGS
 from codespine.overlay.merge import _load_overlay_docs, merged_symbol_records
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
 from codespine.search.rrf import reciprocal_rank_fusion
-from codespine.search.vector import _load_model, rank_semantic
+from codespine.search.vector import _load_model, rank_cross_encoder, rank_semantic
 
 LOGGER = logging.getLogger(__name__)
+
+# Cross-encoder rerank is applied to the top N candidates from RRF fusion.
+_CROSS_ENCODER_RERANK_TOP_N = 20
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
@@ -365,6 +369,24 @@ def hybrid_search(
         # Real model: semantic (1.0), BM25 (0.8), fuzzy (0.6)
         _rrf_weights = [0.8, 1.0, 0.6]
     fused = ranked if exact_matches else reciprocal_rank_fusion(_rrf_pool, weights=_rrf_weights)
+
+    # Cross-encoder reranking (optional, opt-in via config): apply to top N
+    # candidates from the RRF pool for more precise ordering.
+    _cross_encoder_model = SETTINGS.cross_encoder_model
+    if _cross_encoder_model and not exact_matches:
+        _top_n = fused[:_CROSS_ENCODER_RERANK_TOP_N]
+        _rest = fused[_CROSS_ENCODER_RERANK_TOP_N:]
+        if _top_n:
+            ce_candidates = [
+                (doc_id, _build_lexical_text(rec_by_id.get(doc_id, {})))
+                for doc_id, _ in _top_n
+                if doc_id in rec_by_id
+            ]
+            ce_ranked = rank_cross_encoder(query, ce_candidates)
+            # Merge: cross-encoder results first, then remaining RRF results
+            seen_ce = {doc_id for doc_id, _ in ce_ranked}
+            fused = ce_ranked + [(doc_id, score) for doc_id, score in _rest if doc_id not in seen_ce]
+
     rec_by_id = {r["id"]: r for r in recs}
 
     results = []

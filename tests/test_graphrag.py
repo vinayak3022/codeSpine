@@ -801,8 +801,8 @@ def test_cli_answer_eval_summary_reports_token_metrics(monkeypatch, tmp_path):
 def test_mcp_answer_tool_is_exposed_and_forwarded(monkeypatch):
     captured: dict[str, object] = {}
 
-    def fake_graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full"):
-        captured.update({"question": question, "project": project, "max_depth": max_depth, "k": k, "detail": detail})
+    def fake_graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full", deep: bool = False):
+        captured.update({"question": question, "project": project, "max_depth": max_depth, "k": k, "detail": detail, "deep": deep})
         return {"available": True, "answer": "ok", "confidence": {"label": "high", "score": 0.9, "reason": "x"}, "evidence": [], "citations": [], "observability": {"retrieval_mode": "graph_rag"}}
 
     monkeypatch.setattr("codespine.mcp.server.graph_rag_answer", fake_graph_rag_answer)
@@ -814,11 +814,12 @@ def test_mcp_answer_tool_is_exposed_and_forwarded(monkeypatch):
         assert "question" in answer_tool.parameters["properties"]
         assert "detail" in answer_tool.parameters["properties"]
         assert answer_tool.parameters["properties"]["detail"]["default"] == "full"
+        assert answer_tool.parameters["properties"]["deep"]["default"] is False
         await mcp.call_tool("answer", {"question": "what breaks if I change Foo?", "project": "app", "detail": "compact"})
 
     asyncio.run(_run())
 
-    assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5, "detail": "compact"}
+    assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5, "detail": "compact", "deep": False}
 
 
 def test_mcp_answer_tool_preserves_unavailable_result_shape(monkeypatch):

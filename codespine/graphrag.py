@@ -90,12 +90,14 @@ def _graph_rag_cache_key(
     detail: str,
     snapshot_mtime: float,
     overlay_mtime: float,
+    deep: bool = False,
 ) -> tuple:
     return ResultCache.make_key(
         "graph_rag_answer",
         {
             "version": _GRAPH_RAG_PROVENANCE_VERSION,
             "detail": detail,
+            "deep": deep,
             "question": question,
             "project": project,
             "max_depth": max_depth,
@@ -887,6 +889,7 @@ def graph_rag_answer(
     max_depth: int = 3,
     k: int = 5,
     detail: str = "full",
+    deep: bool = False,
 ) -> dict:
     started = time.perf_counter()
     detail = (detail or "full").lower().strip()
@@ -895,7 +898,7 @@ def graph_rag_answer(
     snapshot_mtime = _store_snapshot_mtime(store, project)
     overlay_mtime = _overlay_snapshot_mtime(store, project)
     evidence_limit = max(0, int(k))
-    cache_key = _graph_rag_cache_key(question, project, max_depth, evidence_limit, detail, snapshot_mtime, overlay_mtime)
+    cache_key = _graph_rag_cache_key(question, project, max_depth, evidence_limit, detail, snapshot_mtime, overlay_mtime, deep=deep)
     cached = _GRAPH_RAG_CACHE.get(cache_key)
     if cached is not None:
         result = json.loads(cached)
@@ -1110,6 +1113,54 @@ def graph_rag_answer(
             "provenance": final_provenance,
         },
     }
+    # ── Deep mode enrichment ───────────────────────────────────────────
+    # When deep=True, augment the result with community member symbols and
+    # flow path details for richer agent context.
+    deep_analysis: dict[str, object] = {}
+    if deep:
+        try:
+            # Enrich with community member symbols
+            community_members: list[dict[str, object]] = []
+            community_rec = community
+            if isinstance(community_rec, dict):
+                cid = community_rec.get("community_id") or community_rec.get("id")
+                if cid:
+                    members = store.query_records(
+                        """
+                        MATCH (s:Symbol)-[:IN_COMMUNITY]->(c:Community {id: $cid})
+                        RETURN s.name as name, s.kind as kind, s.fqname as fqname
+                        LIMIT 15
+                        """,
+                        {"cid": cid},
+                    )
+                    community_members = [
+                        {"name": m["name"], "kind": m["kind"], "fqname": m["fqname"]}
+                        for m in members if m.get("name")
+                    ]
+            # Enrich with flow path details
+            flow_details: list[dict[str, object]] = []
+            for flow in flows:
+                entry = flow.get("entry") or ""
+                nodes = flow.get("nodes") or []
+                if nodes and isinstance(nodes, list):
+                    flow_details.append({
+                        "entry": entry,
+                        "node_count": len(nodes),
+                        "node_names": [n.get("name") or n.get("symbol", "") for n in nodes if isinstance(n, dict)],
+                    })
+            deep_analysis = {
+                "community_member_count": len(community_members),
+                "community_members": community_members[:8],
+                "flow_details": flow_details,
+            }
+            result["deep_analysis"] = deep_analysis
+            # Enrich answer text with deep context
+            if community_members:
+                names = ", ".join(m["name"] for m in community_members[:5])
+                result["answer"] += f" Related symbols in the same community: {names}."
+        except Exception as exc:
+            LOGGER.debug("Deep mode enrichment skipped: %s", exc)
+
     total_ms = int((time.perf_counter() - started) * 1000)
     result["observability"]["elapsed_ms"] = total_ms
     result["observability"]["latency_ms"]["total"] = total_ms

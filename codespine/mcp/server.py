@@ -1000,12 +1000,20 @@ def build_mcp_server(store, repo_path_provider):
         return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
 
     @mcp.tool()
-    def answer(question: str, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full"):
+    def answer(question: str, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full", deep: bool = False):
         """
         GraphRAG answer surface with reranked evidence, citations, confidence, latency observability, and cache-aware execution.
+
+        Parameters:
+          question  – Natural-language question about the codebase.
+          project   – Scope to a single project (optional).
+          max_depth – Call-graph depth for context (default 3).
+          k         – Evidence item limit (default 5).
+          detail    – "full" (default) or "compact" for terser output.
+          deep      – If True, enrich with community member symbols and flow path details (default False).
         """
         try:
-            result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k, detail=detail)
+            result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k, detail=detail, deep=deep)
             if not result.get("available"):
                 return _json(
                     result,

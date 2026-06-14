@@ -86,6 +86,8 @@ def _text(node) -> str:
 
 def _captures(query: Query, node) -> list[tuple]:
     """Compatibility wrapper for tree-sitter Python bindings."""
+    if query is None:
+        return []
     if hasattr(query, "captures"):
         return query.captures(node)
 
@@ -375,9 +377,19 @@ def parse_java_source(source: bytes) -> ParsedFile:
     tree = PARSER.parse(source)
     root = tree.root_node
 
-    pkg_query = Query(JAVA_LANGUAGE, "(package_declaration (scoped_identifier) @pkg)")
-    import_query = Query(JAVA_LANGUAGE, "(import_declaration (scoped_identifier) @imp)")
-    cls_query = Query(
+    pkg_query: Query | None = None
+    try:
+        pkg_query = Query(JAVA_LANGUAGE, "(package_declaration (scoped_identifier) @pkg)")
+    except Exception:
+        pass
+    import_query: Query | None = None
+    try:
+        import_query = Query(JAVA_LANGUAGE, "(import_declaration (scoped_identifier) @imp)")
+    except Exception:
+        pass
+    cls_query: Query | None = None
+    try:
+        cls_query = Query(
         JAVA_LANGUAGE,
         """
         [
@@ -395,7 +407,9 @@ def parse_java_source(source: bytes) -> ParsedFile:
             body: (interface_body) @class_body) @class_decl
         ]
         """,
-    )
+        )
+    except Exception:
+        pass
     # Anonymous classes are nested inside object_creation_expression and
     # cannot declare package-level types; they are best effort only.
     # Guard: some tree-sitter-java versions use different node names for
@@ -426,33 +440,45 @@ def parse_java_source(source: bytes) -> ParsedFile:
             imports.append(_text(node))
 
     classes: list[ParsedClass] = []
-    method_query = Query(
-        JAVA_LANGUAGE,
-        """
-        (method_declaration
-          type: (_) @return_type
-          name: (identifier) @method_name
-          parameters: (formal_parameters) @params
-          body: (_)? @body) @method_decl
-        """,
-    )
-    ctor_query = Query(
-        JAVA_LANGUAGE,
-        """
-        (constructor_declaration
-          name: (identifier) @method_name
-          parameters: (formal_parameters) @params
-          body: (constructor_body) @body) @method_decl
-        """,
-    )
-    call_query = Query(
-        JAVA_LANGUAGE,
-        """
-        (method_invocation
-          name: (identifier) @call_name
-          arguments: (argument_list) @call_args) @call_inv
-        """,
-    )
+    method_query: Query | None = None
+    try:
+        method_query = Query(
+            JAVA_LANGUAGE,
+            """
+            (method_declaration
+              type: (_) @return_type
+              name: (identifier) @method_name
+              parameters: (formal_parameters) @params
+              body: (_)? @body) @method_decl
+            """,
+        )
+    except Exception:
+        pass
+    ctor_query: Query | None = None
+    try:
+        ctor_query = Query(
+            JAVA_LANGUAGE,
+            """
+            (constructor_declaration
+              name: (identifier) @method_name
+              parameters: (formal_parameters) @params
+              body: (constructor_body) @body) @method_decl
+            """,
+        )
+    except Exception:
+        pass
+    call_query: Query | None = None
+    try:
+        call_query = Query(
+            JAVA_LANGUAGE,
+            """
+            (method_invocation
+              name: (identifier) @call_name
+              arguments: (argument_list) @call_args) @call_inv
+            """,
+        )
+    except Exception:
+        pass
 
     for node, tag in _captures(cls_query, root):
         if tag != "class_decl":

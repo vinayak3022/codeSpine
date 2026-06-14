@@ -2627,6 +2627,35 @@ def stop() -> None:
             os.remove(SETTINGS.pid_file)
 
 
+@main.command()
+@click.option("--check", is_flag=True, help="Check latest version on PyPI and compare.")
+def version(check: bool) -> None:
+    """Show the installed codespine version."""
+    from codespine import __version__
+
+    click.echo(f"codespine {__version__}")
+    if check:
+        try:
+            import json
+            import urllib.request
+
+            resp = urllib.request.urlopen(
+                "https://pypi.org/pypi/codespine/json", timeout=10
+            )
+            data = json.load(resp)
+            latest = data["info"]["version"]
+            if latest == __version__:
+                click.secho(f"  ✓ Up to date (v{latest})", fg="green")
+            else:
+                click.secho(
+                    f"  ✗ Update available: v{latest} (installed: v{__version__})",
+                    fg="yellow",
+                )
+                click.echo("  Run: pip install --upgrade codespine")
+        except Exception as exc:
+            click.secho(f"  Could not check latest version: {exc}", fg="red")
+
+
 @main.command("install-model")
 def install_model() -> None:
     """Download and cache the sentence-transformers embedding model.
@@ -2655,6 +2684,62 @@ def install_model() -> None:
         click.secho(f"✓ Model '{model_name}' ready. Semantic search is now enabled.", fg="green")
     except Exception as exc:
         click.secho(f"✗ Failed to load model: {exc}", fg="red")
+
+
+@main.command()
+@click.argument("output_path", type=click.Path())
+def export(output_path: str) -> None:
+    """Export the full index to a portable tarball for CI/CD cache seeding.
+
+    Creates a .tar.gz archive of all shard data at OUTPUT_PATH.
+    The archive includes the shards directory, embedding cache, and overlay data.
+    """
+    import tarfile
+
+    output_path = os.path.abspath(output_path)
+    targets = [SETTINGS.shards_dir, SETTINGS.embedding_cache_path]
+    click.echo(f"Exporting index to {output_path} ...")
+    try:
+        with tarfile.open(output_path, "w:gz") as tar:
+            for path in targets:
+                if os.path.exists(path):
+                    tar.add(path, arcname=os.path.basename(path))
+        size_mb = os.path.getsize(output_path) / 1_000_000
+        click.secho(f"✓ Exported ({size_mb:.1f} MB)", fg="green")
+    except Exception as exc:
+        click.secho(f"✗ Export failed: {exc}", fg="red")
+        raise click.Abort() from exc
+
+
+@main.command()
+@click.argument("input_path", type=click.Path(exists=True))
+def import_index(input_path: str) -> None:
+    """Import a previously exported index tarball.
+
+    Extracts the archive into the configured shards directory, embedding cache,
+    and overlay data path. Overwrites existing data.
+    """
+    import tarfile
+
+    input_path = os.path.abspath(input_path)
+    click.echo(f"Importing index from {input_path} ...")
+    try:
+        shards_dir = SETTINGS.shards_dir
+        cache_path = SETTINGS.embedding_cache_path
+        # Snapshot the current index before overwriting (safety net).
+        if os.path.exists(shards_dir):
+            shards_bak = shards_dir + ".bak"
+            click.echo(f"  Backing up existing shards to {shards_bak}")
+            import shutil
+            shutil.move(shards_dir, shards_bak)
+
+        with tarfile.open(input_path, "r:gz") as tar:
+            tar.extractall(path=os.path.dirname(shards_dir) or ".")
+
+        click.secho("✓ Import complete. Restart the MCP server to use the restored index.", fg="green")
+    except Exception as exc:
+        click.secho(f"✗ Import failed: {exc}", fg="red")
+        raise click.Abort() from exc
 
 
 @main.command("run-mcp", hidden=True)

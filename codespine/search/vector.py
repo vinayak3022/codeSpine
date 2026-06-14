@@ -183,3 +183,50 @@ def rank_semantic(query: str, docs: list[tuple[str, list[float] | None]]) -> lis
         ranked.append((doc_id, cosine_similarity(qv, emb)))
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked
+
+
+# ---------------------------------------------------------------------------
+# Cross-encoder reranker (optional, opt-in via config)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _load_reranker():
+    """Load the cross-encoder reranker model (or None if not configured/available)."""
+    model_name = SETTINGS.cross_encoder_model
+    if not model_name:
+        return None
+    try:
+        from sentence_transformers import CrossEncoder
+
+        return CrossEncoder(model_name)
+    except Exception:
+        LOGGER.warning("Cross-encoder model '%s' not available", model_name)
+        return None
+
+
+def rank_cross_encoder(
+    query: str,
+    candidates: list[tuple[str, str]],
+) -> list[tuple[str, float]]:
+    """Re-rank candidate (doc_id, text) pairs using a cross-encoder.
+
+    Only applied to the top-N candidates from the RRF pool to keep latency
+    reasonable (cross-encoders are O(n) per query-doc pair).
+    Returns (doc_id, score) sorted descending.
+    """
+    reranker = _load_reranker()
+    if reranker is None or not candidates:
+        return [(doc_id, 1.0) for doc_id, _ in candidates]
+
+    pairs = [(query, text) for _, text in candidates]
+    try:
+        scores = reranker.predict(pairs, show_progress_bar=False)
+    except Exception as exc:
+        LOGGER.warning("Cross-encoder reranking failed: %s", exc)
+        return [(doc_id, 1.0) for doc_id, _ in candidates]
+
+    ranked: list[tuple[str, float]] = []
+    for (doc_id, _), score in zip(candidates, scores):
+        ranked.append((doc_id, float(score)))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked

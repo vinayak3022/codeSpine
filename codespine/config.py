@@ -27,8 +27,9 @@ class Settings:
     overlay_dir: str = os.path.expanduser("~/.codespine_overlay")
     embedding_model: str = "BAAI/bge-base-en-v1.5"
     vector_dim: int = 768
+    cross_encoder_model: str = ""
     rrf_k: int = 60
-    semantic_candidate_pool: int = 2000
+    semantic_candidate_pool: int = 5000
     write_batch_size: int = 500
     index_file_batch_size: int = 1000
     index_method_batch_size: int = 10000
