@@ -56,10 +56,13 @@ def _call_graph_communities(symbol_meta: dict[str, dict], method_edges: list[tup
     return membership
 
 
-def detect_communities(store, progress=None) -> list[dict]:
+def detect_communities(store, progress=None, project: str | None = None) -> list[dict]:
     def _ping(msg: str) -> None:
         if progress:
             progress(msg)
+
+    if project:
+        raise ValueError("Scoped community refresh is not supported; rerun without --project to refresh all communities.")
 
     _ping("loading symbols")
     symbols = store.query_records(

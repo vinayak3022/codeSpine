@@ -58,6 +58,23 @@ def _echo_json(data, as_json: bool) -> None:
         click.echo(data)
 
 
+def _list_communities(store, project: str | None = None) -> list[dict]:
+    if project:
+        return store.query_records(
+            """
+            MATCH (c:Community)<-[:IN_COMMUNITY]-(s:Symbol), (f:File)
+            WHERE s.file_id = f.id AND f.project_id = $proj
+            RETURN DISTINCT c.id as id, c.label as label, c.cohesion as cohesion
+            ORDER BY c.cohesion DESC
+            LIMIT 200
+            """,
+            {"proj": project},
+        )
+    return store.query_records(
+        "MATCH (c:Community) RETURN c.id as id, c.label as label, c.cohesion as cohesion ORDER BY c.cohesion DESC LIMIT 200"
+    )
+
+
 def _is_running() -> bool:
     if not os.path.exists(SETTINGS.pid_file):
         return False
@@ -1509,22 +1526,24 @@ def search(query: str, k: int, project: str | None, explain: bool, as_json: bool
 @main.command()
 @click.argument("query")
 @click.option("--max-depth", default=3, show_default=True, type=int)
+@click.option("--project", default=None)
 @click.option("--json", "as_json", is_flag=True)
-def context(query: str, max_depth: int, as_json: bool) -> None:
+def context(query: str, max_depth: int, project: str | None, as_json: bool) -> None:
     """Get one-shot symbol context: search + impact + community + flows."""
     store = _open_store(read_only=True)
-    result = build_symbol_context(store, query, max_depth=max_depth)
+    result = build_symbol_context(store, query, max_depth=max_depth, project=project)
     _echo_json(result, as_json)
 
 
 @main.command()
 @click.argument("symbol")
 @click.option("--max-depth", default=4, show_default=True, type=int)
+@click.option("--project", default=None)
 @click.option("--json", "as_json", is_flag=True)
-def impact(symbol: str, max_depth: int, as_json: bool) -> None:
+def impact(symbol: str, max_depth: int, project: str | None, as_json: bool) -> None:
     """Impact analysis grouped by depth with confidence scores."""
     store = _open_store(read_only=True)
-    result = analyze_impact(store, symbol, max_depth=max_depth)
+    result = analyze_impact(store, symbol, max_depth=max_depth, project=project)
     _echo_json(result, as_json)
 
 
@@ -1602,38 +1621,44 @@ def answer_eval_cmd(
 
 @main.command()
 @click.option("--limit", default=200, show_default=True, type=int)
+@click.option("--project", default=None)
 @click.option("--json", "as_json", is_flag=True)
-def deadcode(limit: int, as_json: bool) -> None:
+def deadcode(limit: int, project: str | None, as_json: bool) -> None:
     """Detect dead code candidates with Java-aware exemptions."""
     store = _open_store(read_only=True)
-    result = detect_dead_code(store, limit=limit)
+    result = detect_dead_code(store, limit=limit, project=project)
     _echo_json(result, as_json)
 
 
 @main.command()
 @click.option("--entry", "entry_symbol", default=None)
 @click.option("--max-depth", default=6, show_default=True, type=int)
+@click.option("--project", default=None)
 @click.option("--json", "as_json", is_flag=True)
-def flow(entry_symbol: str | None, max_depth: int, as_json: bool) -> None:
+def flow(entry_symbol: str | None, max_depth: int, project: str | None, as_json: bool) -> None:
     """Trace execution flows from detected entry points."""
     store = _open_store(read_only=True)
-    result = trace_execution_flows(store, entry_symbol=entry_symbol, max_depth=max_depth)
+    result = trace_execution_flows(store, entry_symbol=entry_symbol, max_depth=max_depth, project=project)
     _echo_json(result, as_json)
 
 
 @main.command()
 @click.option("--symbol", default=None)
+@click.option("--project", default=None)
+@click.option("--refresh", is_flag=True, help="Recompute all communities before listing.")
 @click.option("--json", "as_json", is_flag=True)
-def community(symbol: str | None, as_json: bool) -> None:
+def community(symbol: str | None, project: str | None, refresh: bool, as_json: bool) -> None:
     """Detect communities or lookup community for a symbol."""
-    store = _open_store(read_only=False)
-    detect_communities(store)
+    store = _open_store(read_only=not refresh)
+    if refresh:
+        try:
+            detect_communities(store, project=project)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     if symbol:
-        _echo_json(symbol_community(store, symbol), as_json)
+        _echo_json(symbol_community(store, symbol, project=project), as_json)
         return
-    communities = store.query_records(
-        "MATCH (c:Community) RETURN c.id as id, c.label as label, c.cohesion as cohesion ORDER BY c.cohesion DESC LIMIT 200"
-    )
+    communities = _list_communities(store, project=project)
     _echo_json(communities, as_json)
 
 
@@ -1641,19 +1666,29 @@ def community(symbol: str | None, as_json: bool) -> None:
 @click.option("--days", default=5, show_default=True, type=int)
 @click.option("--min-strength", default=0.3, show_default=True, type=float)
 @click.option("--min-cochanges", default=3, show_default=True, type=int)
+@click.option("--project", default=None)
 @click.option("--json", "as_json", is_flag=True)
-def coupling(days: int, min_strength: float, min_cochanges: int, as_json: bool) -> None:
+def coupling(days: int, min_strength: float, min_cochanges: int, project: str | None, as_json: bool) -> None:
     """Compute and query git change coupling."""
     store = _open_store(read_only=False)
-    project = store.query_records("MATCH (p:Project) RETURN p.id as id LIMIT 1")
-    project_id = project[0]["id"] if project else os.path.basename(os.getcwd())
-    compute_coupling(store, os.getcwd(), project_id, days=days, min_strength=min_strength, min_cochanges=min_cochanges)
+    if project is None:
+        project_rows = store.query_records("MATCH (p:Project) RETURN p.id as id LIMIT 1")
+        project_id = project_rows[0]["id"] if project_rows else os.path.basename(os.getcwd())
+        repo_path = os.getcwd()
+    else:
+        project_id = project
+        project_meta = store.get_project_metadata(project_id)
+        repo_path = os.path.abspath(str(project_meta.get("path") or "")) if project_meta else ""
+        if not repo_path:
+            raise click.ClickException(f"Project '{project_id}' has no recorded path.")
+    compute_coupling(store, repo_path, project_id, days=days, min_strength=min_strength, min_cochanges=min_cochanges)
     result = get_coupling(
         store,
         symbol=None,
         days=days,
         min_strength=min_strength,
         min_cochanges=min_cochanges,
+        project=project_id,
     )
     _echo_json(result, as_json)
 

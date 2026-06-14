@@ -91,37 +91,54 @@ def compute_coupling(
     return results
 
 
-def get_coupling(store, symbol: str | None = None, days: int = 5, min_strength: float = 0.3, min_cochanges: int = 3) -> dict:
+def get_coupling(
+    store,
+    symbol: str | None = None,
+    days: int = 5,
+    min_strength: float = 0.3,
+    min_cochanges: int = 3,
+    project: str | None = None,
+) -> dict:
     if symbol:
+        project_clause = "AND f.project_id = $proj AND f2.project_id = $proj" if project else ""
+        params = {
+            "q": symbol,
+            "min_strength": min_strength,
+            "min_cochanges": min_cochanges,
+        }
+        if project:
+            params["proj"] = project
         recs = store.query_records(
-            """
+            f"""
             MATCH (s:Symbol)-[:DECLARES]-(f:File)-[r:CO_CHANGED_WITH]-(f2:File)
             WHERE (s.id = $q OR lower(s.fqname) = lower($q) OR lower(s.name) = lower($q))
             AND r.strength >= $min_strength AND r.cochanges >= $min_cochanges
+            {project_clause}
             RETURN f.path as file, f2.path as coupled_file, r.strength as strength, r.cochanges as cochanges
             ORDER BY strength DESC, cochanges DESC
             LIMIT 200
             """,
-            {
-                "q": symbol,
-                "min_strength": min_strength,
-                "min_cochanges": min_cochanges,
-            },
+            params,
         )
         return {"symbol": symbol, "couplings": recs}
 
+    project_clause = "AND f.project_id = $proj AND f2.project_id = $proj" if project else ""
+    params = {
+        "days": days,
+        "min_strength": min_strength,
+        "min_cochanges": min_cochanges,
+    }
+    if project:
+        params["proj"] = project
     recs = store.query_records(
-        """
+        f"""
         MATCH (f:File)-[r:CO_CHANGED_WITH]-(f2:File)
         WHERE r.days = $days AND r.strength >= $min_strength AND r.cochanges >= $min_cochanges
+        {project_clause}
         RETURN f.path as file, f2.path as coupled_file, r.strength as strength, r.cochanges as cochanges
         ORDER BY strength DESC, cochanges DESC
         LIMIT 500
         """,
-        {
-            "days": days,
-            "min_strength": min_strength,
-            "min_cochanges": min_cochanges,
-        },
+        params,
     )
     return {"symbol": None, "couplings": recs}

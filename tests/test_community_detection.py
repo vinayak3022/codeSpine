@@ -5,8 +5,10 @@ class _CommunityStore:
     def __init__(self) -> None:
         self.persisted: list[tuple[str, str, float, list[str]]] = []
         self.cleared = 0
+        self.queries: list[tuple[str, dict | None]] = []
 
     def query_records(self, query: str, params=None):
+        self.queries.append((query, params))
         if "MATCH (s:Symbol)" in query and "RETURN s.id as id" in query:
             return [
                 {"id": "class_a", "kind": "class", "fqname": "com.example.alpha.ServiceA", "file_id": "f1"},
@@ -42,3 +44,18 @@ def test_detect_communities_merges_sparse_singletons_into_package_groups():
     assert all(c["size"] >= 2 for c in communities)
     labels = {c["label"] for c in communities}
     assert "com.example.alpha" in labels or "com.example.beta" in labels
+
+
+def test_detect_communities_rejects_scoped_refresh_before_persisting():
+    store = _CommunityStore()
+
+    try:
+        detect_communities(store, project="app")
+    except ValueError as exc:
+        assert "Scoped community refresh is not supported" in str(exc)
+    else:
+        raise AssertionError("detect_communities() should reject scoped refresh")
+
+    assert store.queries == []
+    assert store.cleared == 0
+    assert store.persisted == []
