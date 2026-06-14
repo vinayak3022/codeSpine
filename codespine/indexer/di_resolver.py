@@ -182,6 +182,20 @@ def resolve_di_bindings(
                 if dst_id != src_id:
                     yield (src_id, dst_id, fw, "field_inject", 0.85, "INJECTS")
 
+        # --- 1b. @Inject constructor/setter parameters → INJECTS edges ------
+        for p in cls.get("injected_params") or []:
+            inj_ann = p.get("injection_annotation") or ""
+            if not inj_ann or _simple(inj_ann) not in frozenset({
+                "Inject", "Autowired"
+            }):
+                continue
+            type_name = p.get("type_name") or ""
+            dst_ids = _resolve_type(type_name, package, imports)
+            fw = _framework(inj_ann)
+            for dst_id in dst_ids:
+                if dst_id != src_id:
+                    yield (src_id, dst_id, fw, "constructor_inject", 0.85, "INJECTS")
+
         # --- 2. @Provides / @Bean methods → INJECTS (config → type) -
         for method in cls.get("methods_with_provides") or []:
             provides_type = method.get("provides_type") or ""

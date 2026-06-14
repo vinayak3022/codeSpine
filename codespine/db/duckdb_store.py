@@ -326,6 +326,34 @@ class DuckDBStore:
             )
         except Exception:
             pass
+        # Ensure the embedding column has the correct dimension.
+        self._ensure_embedding_dim()
+
+    def _ensure_embedding_dim(self) -> None:
+        """Migrate the embedding column if FLOAT dimension has changed (384→768)."""
+        try:
+            row = self._conn.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'symbols' AND column_name = 'embedding'"
+            ).fetchone()
+            if row is None:
+                return  # no embedding column yet (empty DB)
+            current_type: str = row[0] or ""
+            expected_type = f"FLOAT[{_VECTOR_DIM}]"
+            if current_type != expected_type:
+                LOGGER.info(
+                    "Migrating embedding column %s → %s (existing embeddings cleared)",
+                    current_type, expected_type,
+                )
+                self._conn.execute("ALTER TABLE symbols DROP COLUMN embedding")
+                self._conn.execute(
+                    f"ALTER TABLE symbols ADD COLUMN embedding FLOAT[{_VECTOR_DIM}]"
+                )
+                # Clear the embedding cache so old 384-dim vectors are regenerated.
+                from codespine.search.vector import _CACHE
+                _CACHE.clear()
+        except Exception as exc:
+            LOGGER.warning("Embedding column migration skipped: %s", exc)
 
     # ------------------------------------------------------------------
     # Low-level execute helpers

@@ -38,7 +38,7 @@ def _parse_file_worker(file_path: str, root_path: str, project_id: str) -> dict:
     """
     rel_path = os.path.relpath(file_path, root_path)
     is_test = "src/test/java" in file_path.replace("\\", "/")
-    scope = JavaIndexer._scope_from_rel_path(rel_path)
+    scope = JavaIndexer._scope_from_rel_path(rel_path, project_id)
     # ── Size guard: skip files that are likely to hang tree-sitter ───────
     try:
         file_size = os.path.getsize(file_path)
@@ -375,7 +375,7 @@ class JavaIndexer:
                                 "digest": "",
                                 "is_test": "src/test/java" in fp.replace("\\", "/"),
                                 "scope": JavaIndexer._scope_from_rel_path(
-                                    os.path.relpath(fp, root_path)
+                                    os.path.relpath(fp, root_path), project_id
                                 ),
                                 "skipped_reason": "timeout",
                             })
@@ -533,7 +533,9 @@ class JavaIndexer:
                                 "file_id": f_id,
                                 "line": cls.line,
                                 "col": cls.col,
-                                "embedding": embed_text(f"class {cls.fqcn}") if embed else None,
+                                "embedding": embed_text(
+                                    f"class {cls.fqcn}, scope: {scope}"
+                                ) if embed else None,
                             }
                         )
                         classes_indexed += 1
@@ -555,6 +557,16 @@ class JavaIndexer:
                                 }
                                 for f in cls.fields
                                 if f.injection_annotation
+                            ],
+                            "injected_params": [
+                                {
+                                    "name": p.name,
+                                    "type_name": p.type_name,
+                                    "injection_annotation": p.injection_annotation,
+                                    "qualifier": p.qualifier,
+                                }
+                                for m in cls.methods
+                                for p in m.injected_params
                             ],
                             "methods_with_provides": [
                                 {
@@ -582,7 +594,9 @@ class JavaIndexer:
                                     "file_id": f_id,
                                     "line": fld.line,
                                     "col": fld.col,
-                                    "embedding": embed_text(f"field {fqfield} {fld.type_name}") if embed else None,
+                                    "embedding": embed_text(
+                                        f"field {fqfield} {fld.type_name}, scope: {scope}"
+                                    ) if embed else None,
                                 }
                             )
 
@@ -611,7 +625,9 @@ class JavaIndexer:
                                     "file_id": f_id,
                                     "line": method.line,
                                     "col": method.col,
-                                    "embedding": embed_text(f"method {fqname} returns {method.return_type}") if embed else None,
+                                    "embedding": embed_text(
+                                        f"method {fqname} returns {method.return_type}, scope: {scope}"
+                                    ) if embed else None,
                                 }
                             )
                             methods_indexed += 1
@@ -870,12 +886,12 @@ class JavaIndexer:
     @staticmethod
     def _collect_java_files(root_path: str) -> list[str]:
         out: list[str] = []
-        skip_dirs = {".git", "target", "build", "out", ".idea", ".gradle", ".mvn", "node_modules"}
-        for root, dirs, files in os.walk(root_path, topdown=True):
+        skip_env = os.environ.get("CODESPINE_SKIP_DIRS", ".git,target,build,out,.idea,.gradle,.mvn,node_modules,dist,classes,bin")
+        skip_dirs = set(skip_env.split(","))
+        for root, dirs, files in os.walk(root_path, topdown=True, followlinks=True):
             dirs[:] = [d for d in dirs if d not in skip_dirs]
             normalized = root.replace("\\", "/")
-            if "/src/" not in normalized and not normalized.endswith("/src"):
-                continue
+            # Accept all .java files under the root; remove overly restrictive filtering.
             for filename in files:
                 if filename.endswith(".java"):
                     out.append(os.path.join(root, filename))
@@ -1227,14 +1243,18 @@ class JavaIndexer:
         progress(event, payload)
 
     @staticmethod
-    def _scope_from_rel_path(rel_path: str) -> str:
+    def _scope_from_rel_path(rel_path: str, project_id: str | None = None) -> str:
         normalized = rel_path.replace("\\", "/")
         if "/java/" in normalized:
-            return normalized.split("/java/", 1)[0]
-        if "/src/" in normalized:
-            return normalized.split("/src/", 1)[0]
-        scope = os.path.dirname(normalized).strip()
-        return scope or "."
+            scope = normalized.split("/java/", 1)[0]
+        elif "/src/" in normalized:
+            scope = normalized.split("/src/", 1)[0]
+        else:
+            scope = os.path.dirname(normalized).strip() or "."
+        # Include project_id to avoid scope collisions across modules.
+        if project_id:
+            scope = f"{project_id}::{scope}"
+        return scope
 
     @staticmethod
     def detect_unresolved_imports(store) -> dict[str, list[str]]:

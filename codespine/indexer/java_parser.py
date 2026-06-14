@@ -32,6 +32,8 @@ class ParsedMethod:
     local_types: dict[str, str] = field(default_factory=dict)
     # DI metadata — set for @Provides/@Bean methods.
     provides_type: str | None = None  # return type when the method is a DI provider
+    # DI metadata — injected constructor/setter parameters.
+    injected_params: list["ParsedField"] = field(default_factory=list)
 
 
 @dataclass
@@ -286,10 +288,44 @@ def _extract_parameter_types(params_node) -> list[str]:
             tnode = child.child_by_field_name("type")
             types.append(_node_type_name(tnode))
         elif child.type == "receiver_parameter":
-            # Keep receiver as pseudo-type to stabilize signature arity
             tnode = child.child_by_field_name("type")
             types.append(_node_type_name(tnode))
     return [t for t in types if t]
+
+
+def _extract_parameter_di(params_node) -> list[ParsedField]:
+    """Extract DI injection annotations from constructor/method parameters."""
+    if params_node is None:
+        return []
+    result: list[ParsedField] = []
+    for child in params_node.named_children:
+        if child.type != "formal_parameter":
+            continue
+        tnode = child.child_by_field_name("type")
+        type_name = _node_type_name(tnode) if tnode else ""
+        name_node = child.child_by_field_name("name")
+        name = _text(name_node) if name_node else ""
+        if not type_name or not name:
+            continue
+        _, param_anns = _extract_modifiers_and_annotations(child)
+        inj_ann: str | None = None
+        qualifier: str | None = None
+        for ann in param_anns:
+            ann_simple = ann.split(".")[-1]
+            if ann_simple in _DI_FIELD_ANNOTATIONS:
+                inj_ann = ann_simple
+            if ann_simple in _DI_QUALIFIER_ANNOTATIONS:
+                qualifier = ann_simple
+        if inj_ann:
+            result.append(ParsedField(
+                name=name,
+                type_name=type_name,
+                line=name_node.start_point[0] + 1,
+                col=name_node.start_point[1] + 1,
+                injection_annotation=inj_ann,
+                qualifier=qualifier,
+            ))
+    return result
 
 
 def _extract_inheritance(class_node) -> tuple[str | None, list[str]]:
@@ -344,11 +380,38 @@ def parse_java_source(source: bytes) -> ParsedFile:
     cls_query = Query(
         JAVA_LANGUAGE,
         """
-        (class_declaration
-          name: (identifier) @class_name
-          body: (class_body) @class_body) @class_decl
+        [
+          (class_declaration
+            name: (identifier) @class_name
+            body: (class_body) @class_body) @class_decl
+          (enum_declaration
+            name: (identifier) @class_name
+            body: (enum_body) @class_body) @class_decl
+          (record_declaration
+            name: (identifier) @class_name
+            body: (class_body) @class_body) @class_decl
+          (interface_declaration
+            name: (identifier) @class_name
+            body: (interface_body) @class_body) @class_decl
+        ]
         """,
     )
+    # Anonymous classes are nested inside object_creation_expression and
+    # cannot declare package-level types; they are best effort only.
+    # Guard: some tree-sitter-java versions use different node names for
+    # object_creation_expression; fall back gracefully when unsupported.
+    anon_query = None
+    try:
+        anon_query = Query(
+            JAVA_LANGUAGE,
+            """
+            (object_creation_expression
+              type: (_) @anon_type
+              body: (class_body) @anon_body) @anon_creation
+            """,
+        )
+    except Exception:
+        pass
 
     package_name = ""
     imports: list[str] = []
@@ -370,7 +433,7 @@ def parse_java_source(source: bytes) -> ParsedFile:
           type: (_) @return_type
           name: (identifier) @method_name
           parameters: (formal_parameters) @params
-          body: (block) @body) @method_decl
+          body: (_)? @body) @method_decl
         """,
     )
     ctor_query = Query(
@@ -449,9 +512,10 @@ def parse_java_source(source: bytes) -> ParsedFile:
                 parameter_types=param_types,
                 line=m_node.start_point[0] + 1,
                 col=m_node.start_point[1] + 1,
-                body_hash=_hash_node(m_node),
-                local_types=_extract_local_types(m_node),
+                body_hash=_hash_node(m_node) if m_node.child_by_field_name("body") else "",
+                local_types=_extract_local_types(m_node) if m_node.child_by_field_name("body") else {},
                 provides_type=provides_type,
+                injected_params=_extract_parameter_di(m_params_node),
             )
 
             body_node = m_node.child_by_field_name("body")

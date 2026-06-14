@@ -22,7 +22,7 @@ from click.core import ParameterSource
 from codespine.analysis.community import detect_communities, symbol_community
 from codespine.analysis.context import build_symbol_context
 from codespine.analysis.coupling import compute_coupling, get_coupling
-from codespine.analysis.crossmodule import link_cross_module_calls
+from codespine.analysis.crossmodule import link_cross_module_calls, link_cross_project_calls
 from codespine.analysis.deadcode import detect_dead_code
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
@@ -985,6 +985,22 @@ def analyse(
     else:
         _phase("Cross-module linking...", "skipped (single module)")
 
+    # ── Cross-project call linking ──────────────────────────────────────
+    if not fast:
+        xproj_label = "Cross-project linking..."
+        _live_phase(xproj_label, "running")
+        try:
+            xproj_edges = link_cross_project_calls(
+                sg,
+                progress=lambda s: _live_phase(xproj_label, s),
+            )
+            _finish_phase(xproj_label, f"{xproj_edges} cross-project call edges")
+        except Exception as exc:
+            LOGGER.warning("Cross-project linking failed: %s", exc)
+            _finish_phase(xproj_label, f"error: {exc}")
+    else:
+        _phase("Cross-project linking...", "skipped (fast mode)")
+
     communities: list[dict] = []
     flows: list[dict] = []
     dead: list[dict] = []
@@ -1255,6 +1271,16 @@ def enrich_background(path: str, task_id: str | None) -> None:
                 progress=lambda s: LOGGER.info("Cross-module linking: %s", s),
             )
             LOGGER.info("Background cross-module linking wrote %d edges", xmod_edges)
+
+        _task_phase("cross-project linking", "Linking calls across independently-indexed projects", 0.25)
+        try:
+            xproj_edges = link_cross_project_calls(
+                sg,
+                progress=lambda s: LOGGER.info("Cross-project linking: %s", s),
+            )
+            LOGGER.info("Background cross-project linking wrote %d edges", xproj_edges)
+        except Exception as exc:
+            LOGGER.warning("Background cross-project linking failed: %s", exc)
 
         _task_phase("community detection", "Detecting graph communities", 0.40)
         communities = detect_communities(

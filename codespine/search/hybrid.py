@@ -129,6 +129,44 @@ def _exact_match_sort_key(query_lower: str, rec: dict) -> tuple[int, int, int, s
     return (exact_match_rank, kind_rank, test_rank, fqname_lower, name_lower, id_lower)
 
 
+def _build_lexical_text(rec: dict) -> str:
+    """Build a rich lexical search text for BM25 matching.
+
+    Includes kind, name, fqname, file-path basename, and project ID so that
+    BM25 matches on any of these dimensions without requiring exact fqname.
+    """
+    name = rec.get("name") or ""
+    fqname = rec.get("fqname") or ""
+    kind = rec.get("kind") or ""
+    file_path = rec.get("file_path") or ""
+    project_id = rec.get("project_id") or ""
+    path_base = file_path.rsplit("/", 1)[-1].replace(".java", "") if file_path else ""
+    parts = [name, fqname, kind]
+    if path_base and path_base not in (name, fqname):
+        parts.append(path_base)
+    if project_id:
+        parts.append(project_id)
+    return " ".join(parts)
+
+
+def _build_embedding_text(rec: dict) -> str:
+    """Build a structured embedding text from a symbol record.
+
+    Structured templates produce better vector representations than raw
+    identifiers alone, especially for sentence-transformer models.
+    """
+    name = rec.get("name") or ""
+    fqname = rec.get("fqname") or ""
+    kind = rec.get("kind") or ""
+    file_path = rec.get("file_path") or ""
+    project_id = rec.get("project_id") or ""
+    return (
+        f"type: {kind}, name: {name}, qualified name: {fqname}, "
+        f"file: {file_path.rsplit('/', 1)[-1] if file_path else ''}, "
+        f"project: {project_id}"
+    )
+
+
 def _read_snippet(file_path: str, line: int, context: int = _SNIPPET_CONTEXT_LINES) -> str | None:
     """Best-effort extraction of source lines around a symbol declaration."""
     if not file_path or not line or line < 1:
@@ -295,7 +333,10 @@ def hybrid_search(
         fuzzy_traces: list[dict[str, object]] = []
         semantic_traces: list[dict[str, object]] = []
     else:
-        lexical_docs = [(r["id"], f"{r.get('name', '')} {r.get('fqname', '')}") for r in recs]
+        # Rich multi-field text for BM25 — includes kind, name, fqname,
+        # file-path basename, and project_id.
+        lexical_docs = [(r["id"], _build_lexical_text(r)) for r in recs]
+        # Fuzzy search still uses name primarily (edit-distance on short text).
         fuzzy_docs = [(r["id"], r.get("name", "")) for r in recs]
         vector_docs = [(r["id"], r.get("embedding")) for r in recs]
 
@@ -314,7 +355,16 @@ def hybrid_search(
         except Exception:
             dirty_overlay_paths = set()
 
-    fused = ranked if exact_matches else reciprocal_rank_fusion([bm25_rank, semantic_rank, fuzzy_rank])
+    # Model-aware RRF: when a real sentence-transformer model is installed,
+    # boost the semantic ranker weight.  With hash-based fallback, keep
+    # BM25-primary fusion (equal weights) since hash vectors are less precise.
+    _has_real_model = _load_model() is not None
+    _rrf_pool = [bm25_rank, semantic_rank, fuzzy_rank]
+    _rrf_weights = None
+    if _has_real_model:
+        # Real model: semantic (1.0), BM25 (0.8), fuzzy (0.6)
+        _rrf_weights = [0.8, 1.0, 0.6]
+    fused = ranked if exact_matches else reciprocal_rank_fusion(_rrf_pool, weights=_rrf_weights)
     rec_by_id = {r["id"]: r for r in recs}
 
     results = []

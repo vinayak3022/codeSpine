@@ -25,8 +25,8 @@ class Settings:
     embedding_cache_path: str = os.path.expanduser("~/.codespine_embedding_cache.json")
     index_meta_dir: str = os.path.expanduser("~/.codespine_index_meta")
     overlay_dir: str = os.path.expanduser("~/.codespine_overlay")
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
-    vector_dim: int = 384
+    embedding_model: str = "BAAI/bge-base-en-v1.5"
+    vector_dim: int = 768
     rrf_k: int = 60
     semantic_candidate_pool: int = 2000
     write_batch_size: int = 500

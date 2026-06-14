@@ -26,7 +26,7 @@ NODE_TABLES: list[tuple[str, str]] = [
     ),
     (
         "Symbol",
-        "CREATE NODE TABLE Symbol(id STRING, kind STRING, name STRING, fqname STRING, file_id STRING, line INT64, col INT64, embedding FLOAT[384], PRIMARY KEY (id))",
+        "CREATE NODE TABLE Symbol(id STRING, kind STRING, name STRING, fqname STRING, file_id STRING, line INT64, col INT64, embedding FLOAT[768], PRIMARY KEY (id))",
     ),
     (
         "Community",
@@ -91,7 +91,7 @@ def ensure_schema(conn) -> None:
 
     _safe_execute(
         conn,
-        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '5'",
+        "MERGE (s:SchemaMeta {key: 'schema_version'}) SET s.value = '6'",
     )
 
     _safe_execute(conn, "ALTER TABLE Project ADD indexed_commit STRING DEFAULT ''")

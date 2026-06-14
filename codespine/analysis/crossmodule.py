@@ -1,4 +1,4 @@
-"""Cross-module call edge linker.
+"""Cross-module and cross-project call edge linker.
 
 After all modules in a workspace have been individually indexed, each module's
 call resolver only sees methods *within that module* (the class/method catalogs
@@ -207,4 +207,151 @@ def link_cross_module_calls(store, project_ids: list[str] | None = None, progres
 
     _ping(f"{new_edges} edges created")
     LOGGER.info("Cross-module linking: created %d new call edges.", new_edges)
+    return new_edges
+
+
+def link_cross_project_calls(sg, progress=None) -> int:
+    """Create CALLS edges between methods in *independently-indexed* projects.
+
+    Unlike ``link_cross_module_calls`` which links within a multi-module
+    workspace, this function scans ALL projects in the ShardedGraphStore and
+    creates edges between methods whose class names appear in each other's
+    signatures / return types across project boundaries.
+
+    Edges are written to the shard that owns the *source* method's project so
+    that consistent-hash locality is preserved.
+
+    Returns the number of new edges created.
+    """
+    def _ping(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    # 1. Fetch all project IDs across all shards via fan-out query.
+    proj_recs = sg.query_records("MATCH (p:Project) RETURN p.id as id, p.path as path")
+    project_ids = [r["id"] for r in proj_recs]
+    if len(project_ids) < 2:
+        LOGGER.info("Only %d project(s) indexed — skipping cross-project linking.", len(project_ids))
+        return 0
+
+    _ping(f"cross-project linking across {len(project_ids)} projects")
+
+    # 2. Global class index (all classes across all shards).
+    all_classes = sg.query_records("""
+        MATCH (c:Class), (f:File)
+        WHERE c.file_id = f.id
+        RETURN c.id as cid, c.name as name, c.fqcn as fqcn, f.project_id as pid
+    """)
+    _ping(f"building class index ({len(all_classes)} classes)")
+
+    name_to_classes: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    classes_per_project: dict[str, set[str]] = defaultdict(set)
+    for c in all_classes:
+        name_to_classes[c["name"]].append((c["cid"], c["pid"]))
+        if len(c["name"]) > _MIN_CLASS_NAME_LEN:
+            classes_per_project[c["pid"]].add(c["name"])
+
+    # 3. Pre-load all destination-class methods in one bulk query.
+    all_cross_cids: set[str] = {c["cid"] for c in all_classes if len(c["name"]) > _MIN_CLASS_NAME_LEN}
+    _ping(f"loading methods for {len(all_cross_cids)} cross-project classes")
+    dst_methods_by_cid: dict[str, list[dict]] = defaultdict(list)
+    if all_cross_cids:
+        bulk = sg.query_records("""
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE c.id IN $cids AND m.class_id = c.id AND c.file_id = f.id
+            RETURN m.id as mid, m.name as name, m.signature as sig,
+                   m.modifiers as modifiers, m.is_constructor as is_ctor,
+                   m.class_id as cid, f.project_id as pid
+        """, {"cids": list(all_cross_cids)})
+        for dm in bulk:
+            dst_methods_by_cid[dm["cid"]].append(dm)
+
+    # 4. Scan methods per project for cross-project type references.
+    new_edges = 0
+    seen: set[tuple[str, str]] = set()
+    # Batch edges by source project for shard-local writes.
+    edges_by_project: dict[str, list[dict]] = defaultdict(list)
+
+    for src_pid in project_ids:
+        other_class_names: set[str] = set()
+        for other_pid in project_ids:
+            if other_pid != src_pid:
+                other_class_names |= classes_per_project.get(other_pid, set())
+        if not other_class_names:
+            continue
+
+        _ping(f"scanning {src_pid} methods")
+        src_methods = sg.query_records("""
+            MATCH (m:Method), (c:Class), (f:File)
+            WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid
+            RETURN m.id as mid, m.name as name, m.signature as sig,
+                   m.return_type as rtype, c.id as cid
+        """, {"pid": src_pid})
+
+        for sm in src_methods:
+            sig = sm.get("sig") or ""
+            rtype = sm.get("rtype") or ""
+            tokens = set(_TOKEN_RE.findall(sig + " " + rtype))
+            matched_class_names = tokens & other_class_names
+            if not matched_class_names:
+                continue
+
+            for class_name in matched_class_names:
+                for dst_cid, dst_pid in name_to_classes.get(class_name, []):
+                    if dst_pid == src_pid:
+                        continue
+
+                    dst_methods = dst_methods_by_cid.get(dst_cid)
+                    if not dst_methods:
+                        continue
+
+                    # Strategy A: name + arity match
+                    sm_name = sm["name"]
+                    sm_pc = _param_count(sm.get("sig") or "")
+                    matched_dst_mids: set[str] = set()
+                    for dm in dst_methods:
+                        if dm["name"] == sm_name and _param_count(dm.get("sig") or "") == sm_pc:
+                            pair = (sm["mid"], dm["mid"])
+                            if pair not in seen:
+                                seen.add(pair)
+                                edges_by_project[src_pid].append({
+                                    "source_id": sm["mid"],
+                                    "target_id": dm["mid"],
+                                    "confidence": 0.7,
+                                    "reason": "cross_project_name_match",
+                                })
+                                new_edges += 1
+                            matched_dst_mids.add(dm["mid"])
+
+                    # Strategy B: constructor ref for parameter/return type
+                    if not matched_dst_mids:
+                        rtype_tokens = set(_TOKEN_RE.findall(rtype))
+                        sig_tokens = set(_TOKEN_RE.findall(sig))
+                        if class_name in rtype_tokens or class_name in sig_tokens:
+                            for dm in dst_methods:
+                                if not dm.get("is_ctor"):
+                                    continue
+                                pair = (sm["mid"], dm["mid"])
+                                if pair in seen:
+                                    continue
+                                seen.add(pair)
+                                edges_by_project[src_pid].append({
+                                    "source_id": sm["mid"],
+                                    "target_id": dm["mid"],
+                                    "confidence": 0.6,
+                                    "reason": "cross_project_ctor_ref",
+                                })
+                                new_edges += 1
+
+    # 5. Write edges to each source project's shard.
+    for project_id, records in edges_by_project.items():
+        try:
+            shard_store = sg.shard(project_id)
+            shard_store.add_calls_batch(records)
+        except Exception as exc:
+            LOGGER.warning("Failed to write %d cross-project edges for %s: %s",
+                           len(records), project_id, exc)
+
+    _ping(f"{new_edges} cross-project edges created")
+    LOGGER.info("Cross-project linking: created %d new call edges.", new_edges)
     return new_edges

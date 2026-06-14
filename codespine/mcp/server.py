@@ -19,6 +19,7 @@ from codespine import __version__
 from codespine.analysis.community import detect_communities, symbol_community
 from codespine.analysis.context import build_symbol_context
 from codespine.analysis.coupling import get_coupling
+from codespine.analysis.crossmodule import link_cross_project_calls
 from codespine.analysis.deadcode import detect_dead_code as detect_dead_code_analysis
 from codespine.analysis.flow import trace_execution_flows as trace_flows_analysis
 from codespine.analysis.impact import analyze_impact, resolve_symbol_targets
@@ -141,6 +142,11 @@ def _parse_indexed_at(raw) -> int:
         return 0
 
 
+# Module-level watch health flag, updated by build_mcp_server() on watch start/stop.
+# Used by _staleness_meta() to adjust stale-warning messaging.
+_WATCH_ACTIVE: bool = False
+
+
 def _staleness_meta(
     store,
     response: dict,
@@ -149,6 +155,7 @@ def _staleness_meta(
     deep_scope: bool = False,
     compact: bool = True,
     preserve_empty_keys: set[str] | frozenset[str] = frozenset(),
+    watch_is_active: bool | None = None,
 ) -> str:
     """Inject index staleness metadata into every tool response and serialise.
 
@@ -173,16 +180,23 @@ def _staleness_meta(
             recs = store.query_records(
                 "MATCH (p:Project) RETURN p.indexed_at as ts ORDER BY p.indexed_at ASC LIMIT 1"
             )
-        if recs:
-            ts = _parse_indexed_at(recs[0].get("ts"))
-            if ts:
-                age = int(time.time()) - ts
-                if age > 3600:
-                    # Stale warning goes FIRST so LLMs see it immediately.
-                    prefix["stale_warning"] = (
-                        f"Index is {age // 3600}h {(age % 3600) // 60}m old. "
-                        "Run analyse_project() or start_watch() to refresh."
-                    )
+            if recs:
+                ts = _parse_indexed_at(recs[0].get("ts"))
+                if ts:
+                    age = int(time.time()) - ts
+                    if age > 3600:
+                        if watch_is_active if watch_is_active is not None else _WATCH_ACTIVE:
+                            # Watch is active; downgrade warning to a note.
+                            prefix["stale_warning"] = (
+                                f"A snapshot from {age // 3600}h {(age % 3600) // 60}m ago is being served; "
+                                "watch daemon is active and results will refresh within ~30s."
+                            )
+                        else:
+                            # Stale warning goes FIRST so LLMs see it immediately.
+                            prefix["stale_warning"] = (
+                                f"Index is {age // 3600}h {(age % 3600) // 60}m old. "
+                                "Run analyse_project() or start_watch() to refresh."
+                            )
                 if not compact:
                     response["index_age_seconds"] = age
                     response["indexed_at_epoch"] = ts
@@ -451,6 +465,7 @@ def build_mcp_server(store, repo_path_provider):
                 _watch["proc"] = proc
                 _watch["path"] = watch_path
                 _watch["started_at"] = time.time()
+                _WATCH_ACTIVE = True
                 _LOGGER.info("Auto-started watch on %s (pid %d)", watch_path, proc.pid)
         except Exception as exc:
             _LOGGER.debug("Auto-watch skipped: %s", exc)
@@ -876,16 +891,28 @@ def build_mcp_server(store, repo_path_provider):
         """
         try:
             name_lower = symbol.lower()
-            # Resolve symbol → class IDs.
+            # Resolve symbol → class IDs using safe backend matching.
+            # Try exact match first, then fall back to LIKE (backend-safe).
             class_recs = store.query_records(
                 """
                 MATCH (c:Class)
-                WHERE lower(c.name) = $namel OR lower(c.fqcn) CONTAINS $namel
+                WHERE lower(c.name) = $namel OR lower(c.fqcn) = $namel
                 RETURN c.id as id, c.name as name, c.fqcn as fqcn
                 LIMIT 10
                 """,
                 {"namel": name_lower},
             )
+            if not class_recs:
+                # Broader fallback using LIKE instead of CONTAINS.
+                class_recs = store.query_records(
+                    """
+                    MATCH (c:Class)
+                    WHERE lower(c.fqcn) LIKE $like_pat
+                    RETURN c.id as id, c.name as name, c.fqcn as fqcn
+                    LIMIT 10
+                    """,
+                    {"like_pat": f"%{name_lower}%"},
+                )
             if not class_recs:
                 return {"available": False, "note": f"Class '{symbol}' not found in the index."}
 
@@ -1517,6 +1544,7 @@ def build_mcp_server(store, repo_path_provider):
         _watch["path"] = abs_path
         _watch["started_at"] = time.time()
         _watch["interval"] = global_interval
+        _WATCH_ACTIVE = True
 
         return {
             "available": True,
@@ -1556,6 +1584,7 @@ def build_mcp_server(store, repo_path_provider):
         _watch["proc"] = None
         _watch["path"] = None
         _watch["started_at"] = None
+        _WATCH_ACTIVE = False
         return {"available": True, "running": False, "stopped_path": path}
 
     @mcp.tool()
@@ -1716,6 +1745,37 @@ def build_mcp_server(store, repo_path_provider):
             result["note"] = f"Analysis exited with code {rc} after {elapsed}s. Check output_tail for errors."
 
         return result
+
+    @mcp.tool()
+    def link_cross_project_deps():
+        """
+        Create CALLS edges between methods in independently-indexed projects.
+
+        When projects are indexed separately (e.g., a library and an app that uses
+        it), methods in one project may call methods in another project without
+        any CALLS edge being created.  This tool scans ALL indexed projects and
+        links matching method signatures across project boundaries.
+
+        Two strategies are applied:
+          A. Name + arity match (confidence 0.7): same method name and parameter
+             count between projects.
+          B. Constructor reference (confidence 0.6): when a class name from another
+             project appears as a parameter or return type, link to its constructor.
+
+        Returns the number of new cross-project call edges created.
+        """
+        try:
+            from codespine.analysis.crossmodule import link_cross_project_calls
+            sg = ShardedGraphStore(read_only=False)
+            new_edges = link_cross_project_calls(sg)
+            sg.snapshot_all(background=True)
+            return _json({
+                "available": True,
+                "edges_created": new_edges,
+                "note": f"Created {new_edges} cross-project call edges across all indexed projects.",
+            })
+        except Exception as exc:
+            return _json({"available": False, "error": str(exc)})
 
     # ------------------------------------------------------------------
     # Index reset tools

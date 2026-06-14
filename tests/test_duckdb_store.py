@@ -161,7 +161,7 @@ def test_symbol_upsert_with_embedding(tmp_path: Path):
     s = _store(tmp_path)
     s.upsert_project("p", "/p")
     s.upsert_file("f1", "src/Foo.java", "p", False, "abc")
-    vec = [0.1] * 384
+    vec = [0.1] * 768
     s.upsert_symbols_batch([{
         "id": "s1", "kind": "CLASS", "name": "Foo", "fqname": "com.example.Foo",
         "file_id": "f1", "line": 1, "col": 0, "embedding": vec,
@@ -175,7 +175,7 @@ def test_symbol_mixed_embedding_batch(tmp_path: Path):
     s = _store(tmp_path)
     s.upsert_project("p", "/p")
     s.upsert_file("f1", "src/A.java", "p", False, "abc")
-    vec = [0.5] * 384
+    vec = [0.5] * 768
     s.upsert_symbols_batch([
         {"id": "s1", "kind": "CLASS", "name": "A", "fqname": "a.A",
          "file_id": "f1", "line": 1, "col": 0, "embedding": None},

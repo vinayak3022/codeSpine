@@ -161,8 +161,21 @@ def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     return dot / (na * nb)
 
 
+def _search_query_text(query: str) -> str:
+    """Build structured query text for semantic search.
+
+    Wraps the raw user query in a template that aligns with the structured
+    document embeddings produced by ``_build_embedding_text`` at index time.
+    Identifier-like queries (no spaces, camelCase) are treated as symbol
+    lookups; free-text queries are passed through with a generic prefix.
+    """
+    if " " not in query.strip():
+        return f"type: symbol, name: {query.strip()}"
+    return f"query: {query.strip()}"
+
+
 def rank_semantic(query: str, docs: list[tuple[str, list[float] | None]]) -> list[tuple[str, float]]:
-    qv = embed_text(query)
+    qv = embed_text(_search_query_text(query))
     ranked: list[tuple[str, float]] = []
     for doc_id, emb in docs:
         if emb is None:
