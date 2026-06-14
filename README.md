@@ -260,11 +260,10 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 | Tool | Description |
 |------|-------------|
 | `answer(question, project)` | **GraphRAG answer surface.** Resolves the focus symbol, builds deep context (impact + community + flows), applies graph-aware diverse evidence reranking, returns evidence subgraph with typed edges, per-item citations, confidence score, per-stage latency, provenance/envelope, index fingerprint, and safe abstention on ambiguity or weak grounding. Answers are cached with overlay-aware invalidation. |
-| `answer-eval(suite, project)` | Run a GraphRAG regression suite: score each answer against expected contracts (availability, abstention, focus, evidence kinds, citations, confidence, term inclusion/exclusion), enforce quality gates (`min_average_score`, `min_case_score`, `min_pass_rate`), and produce a structured JSON report for CI. |
 | `ask(question, project)` | Keyword-based natural language dispatcher: routes "who calls X", "what breaks if Y", "explain Z", "find methods named …" to the right tool automatically. |
 | `what_breaks(symbol, project)` | Plain-English blast-radius summary with `risk_level` (low / medium / high). |
 | `explain(symbol, project)` | What a class or method does and how it fits in the architecture. |
-| `read_symbols(file, symbols, project)` | Extract only the requested method source ranges from a file using tree-sitter — 60–70% token reduction vs. reading the whole file. |
+| `read_symbols(file_path, symbols)` | Extract only the requested method source ranges from a file using tree-sitter instead of reading the whole file. |
 | `semantic_summary(symbol, project)` | Condensed class view: name, package, extends, implements, public method signatures, annotations. ~80 tokens vs. ~800. |
 | `get_api_surface(class_name, project)` | Public methods and fields only. |
 | `file_context(file_path, project)` | Symbols in a file, callers/callees, community, co-change partners. |
@@ -293,8 +292,6 @@ Higher-level tools designed to answer full agent questions in a single call, wit
 | `start_watch(path, install_hook)` | Watch for `.java` changes; write directly to graph. Pass `install_hook=True` to also install a post-commit git hook. |
 | `stop_watch()` | Stop the background watch process. |
 | `get_watch_status()` | Watch mode status: running, path, uptime. |
-
-> **Auto-watch:** The MCP server automatically starts watching the most-recently-indexed project on startup if watch is not already running.
 
 ### Overlay
 
@@ -340,9 +337,7 @@ codespine ui                                 # local read-only index explorer
 codespine ui --open                          # open http://127.0.0.1:8765
 
 # Live watch
-codespine watch --path .                     # file-save-triggered direct-to-graph writes
-codespine watch --path . --install-hook      # also install post-commit git hook
-codespine watch --path . --uninstall-hook    # remove git hook
+codespine watch --path .                     # file-save-triggered direct-to-graph re-indexing
 
 # Search & Analysis (CLI)
 codespine answer "question" --project app                                         # GraphRAG answer (evidence subgraph, citations, confidence, provenance)
@@ -463,22 +458,10 @@ Every tool — `search_hybrid`, `get_impact`, `get_symbol_context`, `find_inject
 
 Watch mode polls `git HEAD` every 5 s. When HEAD changes it runs `git diff --name-only` to find the modified Java files and re-indexes only those — not the full project.
 
-Install an optional post-commit hook so re-indexing fires immediately on every commit:
-
-```bash
-codespine watch --path . --install-hook
-```
-
-Or from MCP:
+Install an optional post-commit hook from MCP so re-indexing fires immediately on every commit:
 
 ```python
 start_watch(path=".", install_hook=True)
-```
-
-The hook is idempotent and can be removed:
-
-```bash
-codespine watch --uninstall-hook --path .
 ```
 
 ---
