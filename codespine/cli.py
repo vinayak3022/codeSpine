@@ -760,9 +760,9 @@ def main() -> None:
 )
 @click.option(
     "--embed/--no-embed",
-    default=False,
+    default=True,
     show_default=True,
-    help="Generate vector embeddings. Off by default so analyse stays fast; rerun with --embed when semantic vectors are needed.",
+    help="Generate vector embeddings. On by default. Use --no-embed to skip for faster analysis.",
 )
 @click.option("--allow-running", is_flag=True, hidden=True, help="Skip MCP running check (used by MCP analyse_project tool).")
 @click.pass_context

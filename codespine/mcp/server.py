@@ -1616,7 +1616,7 @@ def build_mcp_server(store, repo_path_provider):
         path: str,
         full: bool = False,
         deep: bool = False,
-        embed: bool = False,
+        embed: bool = True,
     ):
         """
         Trigger indexing of a Java project (or workspace) as a background job.
@@ -1629,11 +1629,9 @@ def build_mcp_server(store, repo_path_provider):
           full  – If True, re-index every file even if unchanged (default: incremental).
           deep  – If True, run complete foreground community, flow, dead-code,
                   and coupling enrichment (slower).
-          embed – If True, generate vector embeddings for semantic search (slow when
-                  sentence-transformers is installed; BM25/fuzzy search works without them).
-
-        RECOMMENDATION: Run without embed=True first for a fast initial index (<1 min).
-        Add --embed later if you need semantic similarity search.
+          embed – If True (default), generate vector embeddings for semantic search.
+                  Pass embed=False if you only need lexical search and want to skip
+                  the ~100ms embedding step.
         """
         import os
 
