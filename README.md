@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v1.0.14** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.0.15** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 
@@ -170,7 +170,7 @@ Every answer includes `observability.latency_ms` with per-stage breakdown:
 
 ---
 
-## Benchmark Results (v1.0.14 smoke benchmark)
+## Benchmark Results (v1.0.15 smoke benchmark)
 
 The numbers below were measured on **commit `e2e4145`** using an **Apple M2 / macOS 25.4.0 / Python 3.10.9 / DuckDB backend** with **no ML model installed** (hash-embedding fallback). The benchmark corpus was the bundled Java fixture copied to a temporary workspace:
 
@@ -629,7 +629,7 @@ Every GraphRAG answer and hybrid search explain response includes a **versioned 
 {
   "provenance": {
     "version": 10,
-    "package_version": "1.0.14",
+    "package_version": "1.0.15",
     "retrieval_mode": "graph_rag",
     "question": "what breaks if I change PaymentService?",
     "project": "app",
@@ -686,7 +686,7 @@ When `search_hybrid(..., explain=True)` is used, the response includes a paralle
   },
   "provenance": {
     "version": 10,
-    "package_version": "1.0.14",
+    "package_version": "1.0.15",
     "candidate_pool_size": 142,
     "index_fingerprint": {
       "snapshot_mtime": 1712345678.123,
