@@ -35,7 +35,7 @@ def _resolve_symbol_ids(store, symbol_query: str, project: str | None = None) ->
     return [r["id"] for r in recs]
 
 
-def _resolve_method_metadata(store, method_ids: list[str]) -> dict[str, dict]:
+def _resolve_method_metadata(store, method_ids: list[str], project: str | None = None) -> dict[str, dict]:
     """Bulk-resolve method IDs to human-readable metadata in a single query.
 
     Returns a dict keyed by method ID with fields:
@@ -46,18 +46,22 @@ def _resolve_method_metadata(store, method_ids: list[str]) -> dict[str, dict]:
         return {}
     overlay_store = getattr(store, "overlay_store", None)
     if overlay_store is not None:
-        recs = [r for r in merged_method_records(store, overlay_store) if r.get("id") in set(method_ids)]
+        recs = [r for r in merged_method_records(store, overlay_store, project=project) if r.get("id") in set(method_ids)]
         for rec in recs:
             rec["fqname"] = rec.get("signature")
     else:
+        project_clause = "AND f.project_id = $proj" if project else ""
+        params: dict = {"ids": method_ids}
+        if project:
+            params["proj"] = project
         recs = store.query_records(
-            """
+            f"""
             MATCH (m:Method), (c:Class), (f:File)
-            WHERE m.id IN $ids AND m.class_id = c.id AND c.file_id = f.id
+            WHERE m.id IN $ids AND m.class_id = c.id AND c.file_id = f.id {project_clause}
             RETURN m.id as id, m.name as name, m.signature as fqname,
                    c.fqcn as class_fqcn, f.path as file_path, f.project_id as project_id
             """,
-            {"ids": method_ids},
+            params,
         )
     return {r["id"]: r for r in recs}
 
@@ -230,7 +234,7 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
     # A single bulk query resolves all collected method IDs at once.
     # ------------------------------------------------------------------ #
     all_caller_ids = [item["symbol"] for items in depth_groups.values() for item in items]
-    meta = _resolve_method_metadata(store, all_caller_ids)
+    meta = _resolve_method_metadata(store, all_caller_ids, project=project)
 
     for items in depth_groups.values():
         for item in items:
@@ -248,7 +252,7 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
             ]
 
     # Also enrich the targets_resolved list for context
-    target_meta = _resolve_method_metadata(store, target_method_ids)
+    target_meta = _resolve_method_metadata(store, target_method_ids, project=project)
     resolved_targets = [
         {
             "id": mid,

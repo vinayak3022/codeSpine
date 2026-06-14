@@ -162,7 +162,7 @@ def trace_execution_flows(store, entry_symbol: str | None = None, max_depth: int
     # ------------------------------------------------------------------ #
     _ping(f"{len(flows)} flows, enriching metadata")
     all_ids = list({node["symbol"] for flow in flows for node in flow["nodes"]})
-    meta = _resolve_method_metadata(store, all_ids)
+    meta = _resolve_method_metadata(store, all_ids, project=project)
 
     for flow in flows:
         entry_m = meta.get(flow["entry"], {})

@@ -14,7 +14,7 @@ LOGGER = logging.getLogger(__name__)
 
 _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
-_SEARCH_PROVENANCE_VERSION = 11
+_SEARCH_PROVENANCE_VERSION = 12
 
 
 def _store_snapshot_mtime(store, project: str | None = None) -> float:
@@ -232,7 +232,16 @@ def _load_symbol_contexts(store, symbol_ids: list[str]) -> dict[str, list[dict[s
     return contexts
 
 
-def hybrid_search(store, query: str, k: int = 20, project: str | None = None, explain: bool = False) -> list[dict] | dict:
+def hybrid_search(
+    store,
+    query: str,
+    k: int = 20,
+    project: str | None = None,
+    explain: bool = False,
+    detail: str = "full",
+    include_context: bool | None = None,
+    include_snippets: bool | None = None,
+) -> list[dict] | dict:
     overlay_store = getattr(store, "overlay_store", None)
     if overlay_store is not None:
         recs = merged_symbol_records(store, overlay_store, project=project)
@@ -263,6 +272,11 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
         return []
 
     query_lower = query.lower().strip()
+    detail = (detail or "full").lower().strip()
+    if detail not in {"full", "compact"}:
+        raise ValueError("detail must be 'full' or 'compact'")
+    include_context = detail != "compact" if include_context is None else include_context
+    include_snippets = detail != "compact" if include_snippets is None else include_snippets
 
     trace_limit = max(k, 1)
     exact_matches = [rec for rec in recs if _is_exact_query_match(query_lower, rec)]
@@ -351,37 +365,39 @@ def hybrid_search(store, query: str, k: int = 20, project: str | None = None, ex
     for rank, item in enumerate(top_k, start=1):
         item["rank"] = rank
 
-    # Attach architectural context in the same response. This is best-effort:
-    # a context query failure must not hide ranked symbol results.
-    context_by_id: dict[str, list[dict[str, object]]] | None = None
-    try:
-        context_by_id = _load_symbol_contexts(store, [item["id"] for item in top_k])
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Unable to batch load architectural context: %s", exc)
-
-    for item in top_k:
-        if item.get("file_path") and item["file_path"] in dirty_overlay_paths:
-            item["context"] = []
-            item["context_warning"] = "Architectural context unavailable for this result."
-            item["context_source"] = "overlay_dirty"
-            continue
-        if context_by_id is not None:
-            item["context"] = context_by_id.get(item["id"], [])
-            continue
+    if include_context:
+        # Attach architectural context in the same response. This is best-effort:
+        # a context query failure must not hide ranked symbol results.
+        context_by_id: dict[str, list[dict[str, object]]] | None = None
         try:
-            item["context"] = _load_symbol_context(store, item["id"])
+            context_by_id = _load_symbol_contexts(store, [item["id"] for item in top_k])
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Unable to load architectural context for %s: %s", item.get("id"), exc)
-            item["context"] = []
-            item["context_warning"] = "Architectural context unavailable for this result."
+            LOGGER.warning("Unable to batch load architectural context: %s", exc)
 
-    # Attach source code snippets (3–5 lines around the declaration) to the
-    # top results so agents have immediate context without reading the file.
-    for item in top_k:
-        if isinstance(item, dict) and item.get("file_path") and item.get("line"):
-            snippet = _read_snippet(item["file_path"], int(item["line"]))
-            if snippet:
-                item["snippet"] = snippet
+        for item in top_k:
+            if item.get("file_path") and item["file_path"] in dirty_overlay_paths:
+                item["context"] = []
+                item["context_warning"] = "Architectural context unavailable for this result."
+                item["context_source"] = "overlay_dirty"
+                continue
+            if context_by_id is not None:
+                item["context"] = context_by_id.get(item["id"], [])
+                continue
+            try:
+                item["context"] = _load_symbol_context(store, item["id"])
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Unable to load architectural context for %s: %s", item.get("id"), exc)
+                item["context"] = []
+                item["context_warning"] = "Architectural context unavailable for this result."
+
+    if include_snippets:
+        # Attach source code snippets (3–5 lines around the declaration) to the
+        # top results so agents have immediate context without reading the file.
+        for item in top_k:
+            if isinstance(item, dict) and item.get("file_path") and item.get("line"):
+                snippet = _read_snippet(item["file_path"], int(item["line"]))
+                if snippet:
+                    item["snippet"] = snippet
 
     # FR-10: Calibrate confidence labels based on name matching, not just score.
     # Exact name match → "high"; partial match → "medium"; no match → "low".

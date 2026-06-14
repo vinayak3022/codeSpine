@@ -133,18 +133,26 @@ def _update_files_in_graph(store, project_path: str, project_id: str, file_paths
     """
     indexer = JavaIndexer(store)
 
+    def _refresh_batch_catalogs() -> None:
+        nonlocal base_method_catalog, base_class_catalog, base_class_ids, base_class_methods
+        try:
+            base_method_catalog = indexer._existing_method_catalog(project_id)
+            base_class_catalog = indexer._existing_class_catalog(project_id)
+            base_class_ids = indexer._existing_class_ids_by_fqcn(project_id)
+            base_class_methods = indexer._existing_class_methods(project_id)
+        except Exception as exc:
+            LOGGER.warning("watch: DB read failed for catalogs (%s), using empty", exc)
+            base_method_catalog = {}
+            base_class_catalog = {}
+            base_class_ids = {}
+            base_class_methods = {}
+
     # Load catalogs once so call-resolution works across files in this batch.
-    try:
-        base_method_catalog = indexer._existing_method_catalog(project_id)
-        base_class_catalog = indexer._existing_class_catalog(project_id)
-        base_class_ids = indexer._existing_class_ids_by_fqcn(project_id)
-        base_class_methods = indexer._existing_class_methods(project_id)
-    except Exception as exc:
-        LOGGER.warning("watch: DB read failed for catalogs (%s), using empty", exc)
-        base_method_catalog = {}
-        base_class_catalog = {}
-        base_class_ids = {}
-        base_class_methods = {}
+    base_method_catalog: dict[str, dict] = {}
+    base_class_catalog: dict[str, list[str]] = {}
+    base_class_ids: dict[str, list[str]] = {}
+    base_class_methods: dict[str, dict[str, str]] = {}
+    _refresh_batch_catalogs()
 
     try:
         embed = store.project_has_embeddings(project_id)
@@ -197,6 +205,9 @@ def _update_files_in_graph(store, project_path: str, project_id: str, file_paths
             else:
                 # File deleted: remove its nodes/edges from the graph.
                 store.clear_file_by_path(project_id, project_path, file_path)
+                # Refresh the batch-local catalogs so later files do not resolve
+                # against symbols that were just removed.
+                _refresh_batch_catalogs()
                 deleted += 1
         except Exception as exc:
             LOGGER.warning("watch: failed to process %s: %s", file_path, exc)
@@ -205,7 +216,7 @@ def _update_files_in_graph(store, project_path: str, project_id: str, file_paths
     return {"project_id": project_id, "changed": changed, "deleted": deleted, "errors": errors}
 
 
-def _git_changed_files(repo_root: str, old_head: str, new_head: str) -> list[str]:
+def _git_changed_files(repo_root: str, old_head: str, new_head: str) -> list[str] | None:
     """Return absolute paths of Java files changed between two commits."""
     try:
         result = subprocess.run(
@@ -216,7 +227,8 @@ def _git_changed_files(repo_root: str, old_head: str, new_head: str) -> list[str
             timeout=10,
         )
         if result.returncode != 0:
-            return []
+            LOGGER.warning("watch: git diff failed: %s", result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+            return None
         files = []
         for line in result.stdout.splitlines():
             line = line.strip()
@@ -226,7 +238,90 @@ def _git_changed_files(repo_root: str, old_head: str, new_head: str) -> list[str
         return files
     except Exception as exc:
         LOGGER.warning("watch: git diff failed: %s", exc)
-        return []
+        return None
+
+
+def _reindex_commit_change(
+    store,
+    abs_path: str,
+    repo_root: str,
+    module_map: dict[str, str],
+    sorted_modules: list[str],
+    head_state: dict[str, str | None],
+    new_head: str,
+    promote_on_commit: bool,
+) -> bool:
+    """Re-index a commit change and advance stored head only on success."""
+    old_head = head_state["value"]
+    if not old_head or new_head == old_head:
+        head_state["value"] = new_head
+        return True
+
+    if not promote_on_commit:
+        head_state["value"] = new_head
+        return True
+
+    success = True
+    changed_files = _git_changed_files(repo_root, old_head, new_head)
+    if changed_files is None:
+        return False
+    if changed_files:
+        grouped: dict[str, list[str]] = {}
+        for fp in changed_files:
+            module_path = _module_for_file(fp, sorted_modules, abs_path)
+            grouped.setdefault(module_path, []).append(fp)
+        for module_path, files in sorted(grouped.items()):
+            project_id = module_map.get(module_path, os.path.basename(module_path))
+            start = time.time()
+            try:
+                result = _update_files_in_graph(store, module_path, project_id, files)
+            except Exception as exc:
+                LOGGER.error("watch: commit re-index failed for %s: %s", project_id, exc)
+                print(f"[{time.strftime('%H:%M:%S')}] {project_id}: ERROR on commit re-index — {exc}")
+                success = False
+                continue
+            elapsed = time.time() - start
+            print(
+                f"[{time.strftime('%H:%M:%S')}] {project_id}: commit re-index "
+                f"({result['changed']} changed, {result['deleted']} deleted) "
+                f"@ {new_head[:8]} in {elapsed:.1f}s"
+            )
+            if int(result.get("errors", 0)) > 0:
+                success = False
+                LOGGER.warning(
+                    "watch: commit re-index for %s completed with %s file errors",
+                    project_id,
+                    result.get("errors"),
+                )
+        if success:
+            for module_path, files in sorted(grouped.items()):
+                project_id = module_map.get(module_path, os.path.basename(module_path))
+                try:
+                    store.set_project_indexed_commit(project_id, new_head)
+                except Exception:
+                    pass
+            # Snapshot once after processing all modules for this commit.
+            # Run in background so re-index latency isn't blocked by the copy.
+            try:
+                store.snapshot_to_read_replica(background=True)
+            except Exception as exc:
+                LOGGER.warning("watch: snapshot after commit failed: %s", exc)
+    else:
+        # No Java files changed — just update the indexed commit.
+        for module_path, project_id in module_map.items():
+            try:
+                store.set_project_indexed_commit(project_id, new_head)
+            except Exception:
+                pass
+        try:
+            store.snapshot_to_read_replica(background=True)
+        except Exception as exc:
+            LOGGER.warning("watch: snapshot after commit failed: %s", exc)
+        print(f"[{time.strftime('%H:%M:%S')}] commit {new_head[:8]}: no Java changes")
+
+    if success:
+        head_state["value"] = new_head
+    return success
 
 
 # Keep the old name as a shim so existing call-sites (e.g. tests) don't break.
@@ -273,52 +368,19 @@ def run_watch_mode(
                     continue
                 old_head = head_state["value"]
                 if old_head and head != old_head:
-                    head_state["value"] = head
-                    if not promote_on_commit:
+                    # Keep the stored head at the previous value until re-index succeeds,
+                    # so a failed commit re-index is retried on the next poll.
+                    if not _reindex_commit_change(
+                        store,
+                        abs_path,
+                        repo_root,
+                        module_map,
+                        sorted_modules,
+                        head_state,
+                        head,
+                        promote_on_commit,
+                    ):
                         continue
-                    # Find exactly which files changed between commits and
-                    # re-index only those — much faster than a full re-index.
-                    changed_files = _git_changed_files(repo_root, old_head, head)
-                    if changed_files:
-                        grouped: dict[str, list[str]] = {}
-                        for fp in changed_files:
-                            module_path = _module_for_file(fp, sorted_modules, abs_path)
-                            grouped.setdefault(module_path, []).append(fp)
-                        for module_path, files in sorted(grouped.items()):
-                            project_id = module_map.get(module_path, os.path.basename(module_path))
-                            start = time.time()
-                            try:
-                                result = _update_files_in_graph(store, module_path, project_id, files)
-                            except Exception as exc:
-                                LOGGER.error("watch: commit re-index failed for %s: %s", project_id, exc)
-                                print(f"[{time.strftime('%H:%M:%S')}] {project_id}: ERROR on commit re-index — {exc}")
-                                continue
-                            elapsed = time.time() - start
-                            print(
-                                f"[{time.strftime('%H:%M:%S')}] {project_id}: commit re-index "
-                                f"({result['changed']} changed, {result['deleted']} deleted) "
-                                f"@ {head[:8]} in {elapsed:.1f}s"
-                            )
-                            try:
-                                store.set_project_indexed_commit(project_id, head)
-                            except Exception:
-                                pass
-                        # Snapshot once after processing all modules for this commit.
-                        # Run in background so re-index latency isn't blocked by the copy.
-                        try:
-                            store.snapshot_to_read_replica(background=True)
-                        except Exception as exc:
-                            LOGGER.warning("watch: snapshot after commit failed: %s", exc)
-                    else:
-                        # No Java files changed — just update the indexed commit.
-                        for module_path, project_id in module_map.items():
-                            try:
-                                store.set_project_indexed_commit(project_id, head)
-                            except Exception:
-                                pass
-                        print(
-                            f"[{time.strftime('%H:%M:%S')}] commit {head[:8]}: no Java changes"
-                        )
                 else:
                     head_state["value"] = head
             except Exception as exc:

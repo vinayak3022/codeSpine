@@ -8,7 +8,7 @@ from click.testing import CliRunner
 import pytest
 
 from codespine import __version__
-from codespine.analysis.context import build_symbol_context
+from codespine.analysis.context import build_symbol_context, resolve_symbol_focus
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
 from codespine.cli import main
@@ -197,7 +197,7 @@ def test_hybrid_search_degrades_gracefully_when_context_lookup_fails():
 
 
 def test_build_symbol_context_keeps_search_candidates_when_context_lookup_fails(monkeypatch):
-    monkeypatch.setattr("codespine.analysis.context.analyze_impact", lambda *args, **kwargs: {"resolved_to": []})
+    monkeypatch.setattr("codespine.analysis.context.analyze_impact", lambda *args, **kwargs: {"resolved_to": [], "target": "com.example.Foo", "depth_groups": {"1": [], "2": [], "3+": []}})
     monkeypatch.setattr("codespine.analysis.context.symbol_community", lambda *args, **kwargs: {"matches": []})
     monkeypatch.setattr("codespine.analysis.context.trace_execution_flows", lambda *args, **kwargs: [])
 
@@ -207,6 +207,103 @@ def test_build_symbol_context_keeps_search_candidates_when_context_lookup_fails(
     assert len(result["search_candidates"]) == 1
     assert result["search_candidates"][0]["context"] == []
     assert "context_warning" in result["search_candidates"][0]
+
+
+def test_build_symbol_context_uses_shared_focus_resolution(monkeypatch):
+    calls: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(
+        "codespine.analysis.context.resolve_symbol_focus",
+        lambda store, query, *, project=None, detail="full", k=10, search_candidates=None: calls.append((query, project))
+        or {"query": query, "focus": {"id": "s1", "name": "Foo", "fqname": "com.example.Foo"}, "focus_symbol": "com.example.Foo", "search_candidates": [{"id": "s1", "name": "Foo", "fqname": "com.example.Foo"}], "search_ms": 0},
+    )
+    monkeypatch.setattr("codespine.analysis.context.analyze_impact", lambda *args, **kwargs: {"resolved_to": [], "target": "com.example.Foo", "depth_groups": {"1": [], "2": [], "3+": []}})
+    monkeypatch.setattr("codespine.analysis.context.symbol_community", lambda *args, **kwargs: {"matches": []})
+    monkeypatch.setattr("codespine.analysis.context.trace_execution_flows", lambda *args, **kwargs: [])
+
+    result = build_symbol_context(object(), "Foo", project="app")
+
+    assert calls == [("Foo", "app")]
+    assert result["focus"]["name"] == "Foo"
+    assert result["impact"]["target"] == "com.example.Foo"
+    assert result["timings_ms"]["search"] > 0
+
+
+def test_resolve_symbol_focus_reports_nonzero_search_time_for_prefetched_candidates(monkeypatch):
+    monkeypatch.setattr("codespine.analysis.context.hybrid_search", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("hybrid_search should not run")))
+
+    result = resolve_symbol_focus(
+        object(),
+        "Foo",
+        search_candidates=[{"id": "s1", "name": "Foo", "fqname": "com.example.Foo"}],
+    )
+
+    assert result["search_ms"] > 0
+    assert result["focus_symbol"] == "com.example.Foo"
+
+
+def test_hybrid_search_detail_compact_skips_context_and_snippets_by_default(tmp_path: Path):
+    source = tmp_path / "Foo.java"
+    source.write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
+
+    class _DetailStore:
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "RETURN s.id as id" in query:
+                return [
+                    {
+                        "id": "s1",
+                        "kind": "class",
+                        "name": "Foo",
+                        "fqname": "com.example.Foo",
+                        "embedding": None,
+                        "line": 3,
+                        "file_id": "f1",
+                        "file_path": str(source),
+                        "project_id": "app",
+                        "is_test": False,
+                    }
+                ]
+            return []
+
+    result = hybrid_search(_DetailStore(), "Foo", k=1, detail="compact")
+
+    assert len(result) == 1
+    assert "context" not in result[0]
+    assert "snippet" not in result[0]
+
+
+def test_hybrid_search_detail_compact_can_opt_in_context_and_snippets(tmp_path: Path):
+    source = tmp_path / "Foo.java"
+    source.write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
+
+    class _DetailStore:
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "RETURN s.id as id" in query:
+                return [
+                    {
+                        "id": "s1",
+                        "kind": "class",
+                        "name": "Foo",
+                        "fqname": "com.example.Foo",
+                        "embedding": None,
+                        "line": 3,
+                        "file_id": "f1",
+                        "file_path": str(source),
+                        "project_id": "app",
+                        "is_test": False,
+                    }
+                ]
+            if "IN_COMMUNITY" in query:
+                return [{"symbol_id": "s1", "community_id": "comm1", "community_label": "Ordering"}]
+            if "IN_FLOW" in query:
+                return [{"symbol_id": "s1", "flow_id": "flow1", "flow_kind": "entry", "flow_depth": 0}]
+            return []
+
+    result = hybrid_search(_DetailStore(), "Foo", k=1, detail="compact", include_context=True, include_snippets=True)
+
+    assert len(result) == 1
+    assert result[0]["context"]
+    assert result[0]["snippet"].startswith("line1")
 
 
 def test_build_symbol_context_degrades_for_overlay_dirty_focus(monkeypatch):
@@ -370,13 +467,15 @@ def test_analyze_impact_scopes_traversal_by_project():
 def test_trace_execution_flows_scopes_traversal_by_project():
     class _FlowScopeStore:
         def query_records(self, query: str, params: dict | None = None) -> list[dict]:
-            if "RETURN m.id as id" in query and "f.project_id = $proj" in query:
-                return [{"id": "m_entry"}]
-            if "MATCH (a:Method)-[:CALLS]->(b:Method)" in query:
-                if "fa.project_id = $proj" in query and "fb.project_id = $proj" in query:
-                    return [{"src": "m_entry", "dst": "m_helper"}]
-                return [{"src": "m_entry", "dst": "external_method"}]
             if "RETURN m.id as id, m.name as name, m.signature as fqname" in query:
+                if "f.project_id = $proj" in query:
+                    ids = params.get("ids", []) if params else []
+                    mapping = {
+                        "m_entry": {"id": "m_entry", "name": "main", "fqname": "com.example.App#main", "file_path": "/app/Main.java", "project_id": "app", "class_fqcn": "com.example.App"},
+                        "m_helper": {"id": "m_helper", "name": "helper", "fqname": "com.example.App#helper", "file_path": "/app/Helper.java", "project_id": "app", "class_fqcn": "com.example.App"},
+                        "external_method": {"id": "external_method", "name": "external", "fqname": "com.other.Other#external", "file_path": "/other/External.java", "project_id": "other", "class_fqcn": "com.other.Other"},
+                    }
+                    return [mapping[mid] for mid in ids if mid in mapping and mapping[mid]["project_id"] == "app"]
                 ids = params.get("ids", []) if params else []
                 mapping = {
                     "m_entry": {"id": "m_entry", "name": "main", "fqname": "com.example.App#main", "file_path": "/app/Main.java", "project_id": "app", "class_fqcn": "com.example.App"},
@@ -384,6 +483,12 @@ def test_trace_execution_flows_scopes_traversal_by_project():
                     "external_method": {"id": "external_method", "name": "external", "fqname": "com.other.Other#external", "file_path": "/other/External.java", "project_id": "other", "class_fqcn": "com.other.Other"},
                 }
                 return [mapping[mid] for mid in ids if mid in mapping]
+            if "RETURN m.id as id" in query and "f.project_id = $proj" in query:
+                return [{"id": "m_entry"}]
+            if "MATCH (a:Method)-[:CALLS]->(b:Method)" in query:
+                if "fa.project_id = $proj" in query and "fb.project_id = $proj" in query:
+                    return [{"src": "m_entry", "dst": "m_helper"}]
+                return [{"src": "m_entry", "dst": "external_method"}]
             return []
 
     flows = trace_execution_flows(_FlowScopeStore(), entry_symbol="com.example.App#main", project="app")
@@ -391,6 +496,70 @@ def test_trace_execution_flows_scopes_traversal_by_project():
     assert len(flows) == 1
     assert [node["name"] for node in flows[0]["nodes"]] == ["main", "helper"]
     assert all(node["project_id"] == "app" for node in flows[0]["nodes"])
+
+
+def test_trace_execution_flows_metadata_resolution_honors_project(monkeypatch):
+    class _Store:
+        overlay_store = object()
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            if "RETURN m.id as id" in query and "f.project_id = $proj" in query:
+                return [{"id": "m_entry"}]
+            if "MATCH (a:Method)-[:CALLS]->(b:Method)" in query and "fa.project_id = $proj" in query:
+                return [{"src": "m_entry", "dst": "m_hash"}]
+            return []
+
+    def fake_merged_method_records(store, overlay_store, project: str | None = None):
+        if project == "app":
+            return [
+                {"id": "m_entry", "class_fqcn": "com.example.App", "signature": "main()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/Main.java", "name": "main"},
+                {"id": "m_hash", "class_fqcn": "com.example.App", "signature": "helper()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/Helper.java", "name": "helper"},
+            ]
+        return [
+            {"id": "m_entry", "class_fqcn": "com.example.App", "signature": "main()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/Main.java", "name": "main"},
+            {"id": "m_hash", "class_fqcn": "com.other.Other", "signature": "helper()", "file_id": "f_other", "project_id": "other", "file_path": "/repo/other/Helper.java", "name": "helper"},
+        ]
+
+    monkeypatch.setattr("codespine.analysis.impact.merged_method_records", fake_merged_method_records)
+
+    flows = trace_execution_flows(_Store(), entry_symbol="main", project="app")
+
+    assert [node["project_id"] for node in flows[0]["nodes"]] == ["app", "app"]
+    assert [node["file_path"] for node in flows[0]["nodes"]] == ["/repo/app/Main.java", "/repo/app/Helper.java"]
+
+
+def test_analyze_impact_metadata_resolution_honors_project(monkeypatch):
+    class _Store:
+        overlay_store = object()
+
+    def fake_merged_symbol_records(store, overlay_store, project: str | None = None):
+        return [
+            {"id": "s_target", "kind": "method", "name": "target", "fqname": "com.example.App#target()", "file_id": "f_app", "file_path": "/repo/app/App.java", "project_id": "app"},
+            {"id": "s_caller", "kind": "method", "name": "caller", "fqname": "com.example.App#caller()", "file_id": "f_app", "file_path": "/repo/app/App.java", "project_id": "app"},
+        ]
+
+    def fake_merged_method_records(store, overlay_store, project: str | None = None):
+        if project == "app":
+            return [
+                {"id": "m_target", "class_fqcn": "com.example.App", "signature": "target()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/App.java", "name": "target"},
+                {"id": "m_hash", "class_fqcn": "com.other.Other", "signature": "caller()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/App.java", "name": "caller"},
+            ]
+        return [
+            {"id": "m_target", "class_fqcn": "com.example.App", "signature": "target()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/App.java", "name": "target"},
+            {"id": "m_hash", "class_fqcn": "com.other.Other", "signature": "caller()", "file_id": "f_other", "project_id": "other", "file_path": "/repo/other/Other.java", "name": "caller"},
+        ]
+
+    def fake_merged_call_edges(store, overlay_store, project: str | None = None):
+        return [{"src": "m_hash", "dst": "m_target", "confidence": 0.9, "reason": "project", "edge_type": "CALLS"}]
+
+    monkeypatch.setattr("codespine.analysis.impact.merged_symbol_records", fake_merged_symbol_records)
+    monkeypatch.setattr("codespine.analysis.impact.merged_method_records", fake_merged_method_records)
+    monkeypatch.setattr("codespine.analysis.impact.merged_call_edges", fake_merged_call_edges)
+
+    impact = analyze_impact(_Store(), "target", project="app")
+
+    assert impact["impacted_callers"]["1"][0]["project_id"] == "app"
+    assert impact["impacted_callers"]["1"][0]["file_path"] == "/repo/app/App.java"
 
 
 def test_hybrid_search_returns_flow_depth_from_duckdb_context(tmp_path: Path):
@@ -483,8 +652,8 @@ def test_hybrid_search_explain_returns_provenance_envelope():
     assert results["results"][0]["retrieval_traces"]["semantic"]["rank"] == 1
     assert results["retrieval_contract"]["fusion"] == "rrf"
     assert results["retrieval_contract"]["supports_rerank"] is True
-    assert results["retrieval_contract"]["version"] == 11
-    assert results["provenance"]["version"] == 11
+    assert results["retrieval_contract"]["version"] == 12
+    assert results["provenance"]["version"] == 12
     assert results["provenance"]["package_version"] == __version__
     assert results["provenance"]["index_fingerprint"]["snapshot_mtime"] >= 0.0
     assert "overlay_mtime" in results["provenance"]["index_fingerprint"]
@@ -526,7 +695,7 @@ def test_hybrid_search_exact_match_explain_preserves_contract(monkeypatch):
     assert results["results"][0]["confidence"] == "high"
     assert results["results"][0]["confidence_reason"] == "Exact name match"
     assert results["results"][0]["retrieval_traces"] == {}
-    assert results["retrieval_contract"]["version"] == 11
+    assert results["retrieval_contract"]["version"] == 12
     assert results["retrieval_contract"]["supports_rerank"] is True
     assert set(results["provenance"]["rankers"].keys()) == {"bm25", "semantic", "fuzzy"}
 
@@ -545,16 +714,16 @@ def test_cli_search_supports_project_and_explain(monkeypatch):
 
     monkeypatch.setattr("codespine.cli._open_store", lambda read_only=True: object())
 
-    def fake_hybrid_search(store, query: str, k: int = 20, project: str | None = None, explain: bool = False):
-        captured.update({"query": query, "k": k, "project": project, "explain": explain})
+    def fake_hybrid_search(store, query: str, k: int = 20, project: str | None = None, explain: bool = False, detail: str = "full", **kwargs):
+        captured.update({"query": query, "k": k, "project": project, "explain": explain, "detail": detail})
         return {"retrieval_mode": "hybrid", "query": query, "results": [{"name": "Foo"}], "provenance": {"rankers": {}}}
 
     monkeypatch.setattr("codespine.cli.hybrid_search", fake_hybrid_search)
 
-    result = CliRunner().invoke(main, ["search", "Foo", "--project", "app", "--explain", "--json"])
+    result = CliRunner().invoke(main, ["search", "Foo", "--project", "app", "--explain", "--detail", "compact", "--json"])
 
     assert result.exit_code == 0
-    assert captured == {"query": "Foo", "k": 20, "project": "app", "explain": True}
+    assert captured == {"query": "Foo", "k": 20, "project": "app", "explain": True, "detail": "compact"}
     payload = json.loads(result.output)
     assert payload["retrieval_mode"] == "hybrid"
 
@@ -566,8 +735,8 @@ def test_mcp_search_hybrid_explain_flag_is_exposed_and_forwarded(monkeypatch):
         def query_records(self, *args, **kwargs):
             return []
 
-    def fake_hybrid_search(store, query: str, k: int = 20, project: str | None = None, explain: bool = False):
-        captured.update({"query": query, "k": k, "project": project, "explain": explain})
+    def fake_hybrid_search(store, query: str, k: int = 20, project: str | None = None, explain: bool = False, detail: str = "full", **kwargs):
+        captured.update({"query": query, "k": k, "project": project, "explain": explain, "detail": detail})
         return {"retrieval_mode": "hybrid", "results": [{"name": "Foo"}]}
 
     monkeypatch.setattr("codespine.mcp.server.hybrid_search", fake_hybrid_search)
@@ -577,9 +746,11 @@ def test_mcp_search_hybrid_explain_flag_is_exposed_and_forwarded(monkeypatch):
         tools = await mcp.list_tools()
         search_tool = next(tool for tool in tools if tool.name == "search_hybrid")
         assert "explain" in search_tool.parameters["properties"]
+        assert "detail" in search_tool.parameters["properties"]
         assert search_tool.parameters["properties"]["explain"]["default"] is False
-        await mcp.call_tool("search_hybrid", {"query": "Foo", "project": "app", "explain": True})
+        assert search_tool.parameters["properties"]["detail"]["default"] == "full"
+        await mcp.call_tool("search_hybrid", {"query": "Foo", "project": "app", "explain": True, "detail": "compact"})
 
     asyncio.run(_run())
 
-    assert captured == {"query": "Foo", "k": 20, "project": "app", "explain": True}
+    assert captured == {"query": "Foo", "k": 20, "project": "app", "explain": True, "detail": "compact"}

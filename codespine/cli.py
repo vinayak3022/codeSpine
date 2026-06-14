@@ -1515,11 +1515,12 @@ def repair_cmd(target: str, force_full: bool, as_json: bool) -> None:
 @click.option("--k", default=20, show_default=True, type=int)
 @click.option("--project", default=None)
 @click.option("--explain", is_flag=True, help="Return retrieval provenance and match reasons.")
+@click.option("--detail", type=click.Choice(["full", "compact"], case_sensitive=False), default="full", show_default=True)
 @click.option("--json", "as_json", is_flag=True)
-def search(query: str, k: int, project: str | None, explain: bool, as_json: bool) -> None:
+def search(query: str, k: int, project: str | None, explain: bool, detail: str, as_json: bool) -> None:
     """Hybrid search (BM25 + vector + fuzzy + RRF)."""
     store = _open_store(read_only=True)
-    results = hybrid_search(store, query, k=k, project=project, explain=explain)
+    results = hybrid_search(store, query, k=k, project=project, explain=explain, detail=detail.lower())
     _echo_json(results, as_json)
 
 
@@ -1527,11 +1528,12 @@ def search(query: str, k: int, project: str | None, explain: bool, as_json: bool
 @click.argument("query")
 @click.option("--max-depth", default=3, show_default=True, type=int)
 @click.option("--project", default=None)
+@click.option("--detail", type=click.Choice(["full", "compact"], case_sensitive=False), default="full", show_default=True)
 @click.option("--json", "as_json", is_flag=True)
-def context(query: str, max_depth: int, project: str | None, as_json: bool) -> None:
+def context(query: str, max_depth: int, project: str | None, detail: str, as_json: bool) -> None:
     """Get one-shot symbol context: search + impact + community + flows."""
     store = _open_store(read_only=True)
-    result = build_symbol_context(store, query, max_depth=max_depth, project=project)
+    result = build_symbol_context(store, query, max_depth=max_depth, project=project, detail=detail.lower())
     _echo_json(result, as_json)
 
 
@@ -1552,11 +1554,12 @@ def impact(symbol: str, max_depth: int, project: str | None, as_json: bool) -> N
 @click.option("--project", default=None)
 @click.option("--max-depth", default=3, show_default=True, type=int)
 @click.option("--k", default=5, show_default=True, type=int)
+@click.option("--detail", type=click.Choice(["full", "compact"], case_sensitive=False), default="full", show_default=True)
 @click.option("--json", "as_json", is_flag=True)
-def answer(question: str, project: str | None, max_depth: int, k: int, as_json: bool) -> None:
+def answer(question: str, project: str | None, max_depth: int, k: int, detail: str, as_json: bool) -> None:
     """GraphRAG answer surface with reranked evidence, citations, confidence, and observability."""
     store = _open_store(read_only=True)
-    result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
+    result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k, detail=detail.lower())
     _echo_json(result, as_json)
 
 
@@ -1607,7 +1610,8 @@ def answer_eval_cmd(
         gates = result.get("quality_gates", {})
         click.echo(
             f"GraphRAG regression suite: {summary.get('passed_count', 0)}/{summary.get('case_count', 0)} passed, "
-            f"average score {float(summary.get('average_score', 0.0)):.2f}, min score {float(summary.get('min_score', 0.0)):.2f}"
+            f"average score {float(summary.get('average_score', 0.0)):.2f}, min score {float(summary.get('min_score', 0.0)):.2f}, "
+            f"payload tokens {int(summary.get('payload_tokens_total', 0))}, answer tokens {int(summary.get('answer_tokens_total', 0))}"
         )
         if gates.get("passed"):
             click.secho("Quality gates passed.", fg="green")

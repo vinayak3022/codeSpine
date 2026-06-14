@@ -278,6 +278,23 @@ def _store_snapshot_mtime(store, project: str | None = None) -> float:
         return 0.0
 
 
+def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
+    try:
+        overlay_store = getattr(store, "overlay_store", None)
+        if overlay_store is None:
+            return 0.0
+        if project:
+            return _snapshot_mtime_for_path(overlay_store.project_path(project))
+        mtimes = []
+        for doc in overlay_store.list_projects():
+            project_id = doc.get("project_id")
+            if project_id:
+                mtimes.append(_snapshot_mtime_for_path(overlay_store.project_path(project_id)))
+        return max(mtimes, default=0.0)
+    except Exception:
+        return 0.0
+
+
 def _reload_store_instance(store):
     cls = type(store)
     params = inspect.signature(cls).parameters
@@ -373,8 +390,9 @@ def build_mcp_server(store, repo_path_provider):
     _watch: dict = {"proc": None, "path": None, "started_at": None, "interval": 30}
     _analyse: dict = {"proc": None, "path": None, "started_at": None, "log_path": None, "returncode": None}
 
-    # Per-server result cache (FR-12): LRU cache keyed by (tool, args_hash, snapshot_mtime).
-    # Invalidated automatically when the read replica sentinel file changes.
+    # Per-server result cache (FR-12): LRU cache keyed by tool args and the
+    # relevant index mtimes. Invalidated automatically when the snapshot or
+    # overlay sentinel changes.
     _result_cache = ResultCache(maxsize=256, ttl_s=300.0)
 
     def _cache_key(tool_name: str, **kwargs):
@@ -383,32 +401,50 @@ def build_mcp_server(store, repo_path_provider):
         return ResultCache.make_key(tool_name, kwargs, mtime)
 
     # FR-03: Auto-start watch if indexed projects exist and watch is not running.
+    import threading as _threading
+
+    _auto_watch_lock = _threading.Lock()
+
     def _maybe_auto_start_watch() -> None:
         try:
-            projs = store.query_records(
-                "MATCH (p:Project) RETURN p.path as path, p.id as id ORDER BY p.indexed_at DESC LIMIT 1"
-            )
-            if not projs:
-                return
-            watch_path = projs[0].get("path", "")
-            if not watch_path or not os.path.isdir(watch_path):
-                return
-            # Start watch as a background subprocess (same as start_watch tool).
-            cmd = [sys.executable, "-m", "codespine.cli", "watch", watch_path,
-                   "--interval", "30", "--allow-running"]
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            _watch["proc"] = proc
-            _watch["path"] = watch_path
-            _watch["started_at"] = time.time()
-            _LOGGER.info("Auto-started watch on %s (pid %d)", watch_path, proc.pid)
+            with _auto_watch_lock:
+                # Guard against duplicate starts if the startup hook runs more than once.
+                if _watch["proc"] is not None and _watch["proc"].poll() is None:
+                    return
+                projs = store.query_records(
+                    "MATCH (p:Project) RETURN p.path as path, p.id as id ORDER BY p.indexed_at DESC LIMIT 1"
+                )
+                if not projs:
+                    return
+                watch_path = projs[0].get("path", "")
+                if not watch_path or not os.path.isdir(watch_path):
+                    return
+                # Start watch as a background subprocess (same as start_watch tool).
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "codespine.cli",
+                    "watch",
+                    "--path",
+                    watch_path,
+                    "--global-interval",
+                    "30",
+                    "--overlay-debounce-ms",
+                    str(SETTINGS.default_overlay_debounce_ms),
+                    "--promote-on-commit",
+                ]
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                _watch["proc"] = proc
+                _watch["path"] = watch_path
+                _watch["started_at"] = time.time()
+                _LOGGER.info("Auto-started watch on %s (pid %d)", watch_path, proc.pid)
         except Exception as exc:
             _LOGGER.debug("Auto-watch skipped: %s", exc)
 
     # Trigger auto-watch in a daemon thread so server startup isn't delayed.
-    import threading as _threading
     _auto_watch_thread = _threading.Thread(target=_maybe_auto_start_watch, daemon=True, name="codespine-auto-watch")
     _auto_watch_thread.start()
 
@@ -646,14 +682,21 @@ def build_mcp_server(store, repo_path_provider):
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def search_hybrid(query: str, k: int = 20, project: str | None = None, explain: bool = False):
+    def search_hybrid(
+        query: str,
+        k: int = 20,
+        project: str | None = None,
+        explain: bool = False,
+        detail: str = "full",
+    ):
         """
         Hybrid symbol search (BM25 + vector + fuzzy, fused with RRF).
         Pass project=<project_id> to scope results to a single indexed project.
         Pass explain=True to include retrieval traces, match reasons, and confidence notes.
+        Pass detail='compact' to skip architectural context and snippets unless explicitly requested.
         Use list_projects to see available project IDs.
         """
-        results = hybrid_search(store, query, k=k, project=project, explain=explain)
+        results = hybrid_search(store, query, k=k, project=project, explain=explain, detail=detail)
         if not results:
             return _no_symbols_response()
         payload = {"available": True, **results} if explain and isinstance(results, dict) else {"available": True, "results": results}
@@ -675,7 +718,13 @@ def build_mcp_server(store, repo_path_provider):
         project scopes the target symbol lookup; cross-project callers are always included.
         """
         try:
-            _ck = _cache_key("get_impact", symbol=symbol, max_depth=max_depth, project=project)
+            _ck = _cache_key(
+                "get_impact",
+                symbol=symbol,
+                max_depth=max_depth,
+                project=project,
+                overlay_mtime=_overlay_snapshot_mtime(store, project),
+            )
             _cached = _result_cache.get(_ck)
             if _cached is not None:
                 return _cached
@@ -889,23 +938,23 @@ def build_mcp_server(store, repo_path_provider):
             return _safe_tool_response("find_injections", exc)
 
     @mcp.tool()
-    def get_symbol_context(query: str, max_depth: int = 3, project: str | None = None):
+    def get_symbol_context(query: str, max_depth: int = 3, project: str | None = None, detail: str = "full"):
         """
         One-shot deep context for a symbol: search + impact + community + flows.
         Pass project to scope the search to a single indexed module.
         """
-        result = build_symbol_context(store, query, max_depth=max_depth, project=project)
+        result = build_symbol_context(store, query, max_depth=max_depth, project=project, detail=detail)
         if not result.get("search_candidates"):
             return _no_symbols_response()
         return _staleness_meta(store, {"available": True, **result}, project, overlay_store=overlay_store)
 
     @mcp.tool()
-    def answer(question: str, project: str | None = None, max_depth: int = 3, k: int = 5):
+    def answer(question: str, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full"):
         """
         GraphRAG answer surface with reranked evidence, citations, confidence, latency observability, and cache-aware execution.
         """
         try:
-            result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k)
+            result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k, detail=detail)
             if not result.get("available"):
                 return _json(
                     result,

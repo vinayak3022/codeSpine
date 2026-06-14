@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from difflib import SequenceMatcher
 
 from codespine import __version__
 from codespine.cache.result_cache import ResultCache
-from codespine.analysis.context import build_symbol_context
+from codespine.analysis.context import build_symbol_context, resolve_symbol_focus
 
 _OBSERVABILITY_PRIMITIVES = [
     "hybrid_search",
@@ -25,7 +26,7 @@ _EVIDENCE_KIND_WEIGHTS = {
 }
 
 _GRAPH_RAG_CACHE = ResultCache(maxsize=128, ttl_s=300.0)
-_GRAPH_RAG_PROVENANCE_VERSION = 10
+_GRAPH_RAG_PROVENANCE_VERSION = 12
 
 
 def _pretty_evidence_kind(kind: str) -> str:
@@ -86,6 +87,7 @@ def _graph_rag_cache_key(
     project: str | None,
     max_depth: int,
     k: int,
+    detail: str,
     snapshot_mtime: float,
     overlay_mtime: float,
 ) -> tuple:
@@ -93,6 +95,7 @@ def _graph_rag_cache_key(
         "graph_rag_answer",
         {
             "version": _GRAPH_RAG_PROVENANCE_VERSION,
+            "detail": detail,
             "question": question,
             "project": project,
             "max_depth": max_depth,
@@ -102,6 +105,43 @@ def _graph_rag_cache_key(
         },
         0.0,
     )
+
+
+def _compact_graph_rag_response(result: dict[str, object]) -> dict[str, object]:
+    compact = dict(result)
+    supporting_context = compact.get("supporting_context")
+    if isinstance(supporting_context, dict):
+        compact["supporting_context"] = {
+            "community_label": supporting_context.get("community_label"),
+            "flow_count": supporting_context.get("flow_count"),
+            "search_candidate_count": supporting_context.get("search_candidate_count"),
+            "evidence_kinds": supporting_context.get("evidence_kinds"),
+            "evidence_sources": supporting_context.get("evidence_sources"),
+        }
+
+    observability = compact.get("observability")
+    if isinstance(observability, dict):
+        slim = {k: observability[k] for k in ("retrieval_mode", "primitives", "elapsed_ms", "project", "max_depth", "k", "search_candidates", "evidence_count", "citation_count", "evidence_rerank", "latency_ms", "cache") if k in observability}
+        evidence_rerank = slim.get("evidence_rerank")
+        if isinstance(evidence_rerank, dict):
+            slim["evidence_rerank"] = {
+                "strategy": evidence_rerank.get("strategy"),
+                "candidate_counts": evidence_rerank.get("candidate_counts"),
+            }
+        latency_ms = slim.get("latency_ms")
+        if isinstance(latency_ms, dict):
+            slim["latency_ms"] = {k: latency_ms[k] for k in ("total", "cache_lookup", "context", "evidence_build", "serialization") if k in latency_ms}
+        cache = slim.get("cache")
+        if isinstance(cache, dict):
+            slim["cache"] = {k: cache[k] for k in ("hit", "snapshot_mtime", "overlay_mtime") if k in cache}
+        compact["observability"] = slim
+        compact["observability"].pop("provenance", None)
+
+    return compact
+
+
+def _token_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9_]+", text or ""))
 
 
 def _graph_rag_provenance(
@@ -839,12 +879,23 @@ def _build_evidence(
     return evidence, citations
 
 
-def graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5) -> dict:
+def graph_rag_answer(
+    store,
+    question: str,
+    *,
+    project: str | None = None,
+    max_depth: int = 3,
+    k: int = 5,
+    detail: str = "full",
+) -> dict:
     started = time.perf_counter()
+    detail = (detail or "full").lower().strip()
+    if detail not in {"full", "compact"}:
+        raise ValueError("detail must be 'full' or 'compact'")
     snapshot_mtime = _store_snapshot_mtime(store, project)
     overlay_mtime = _overlay_snapshot_mtime(store, project)
     evidence_limit = max(0, int(k))
-    cache_key = _graph_rag_cache_key(question, project, max_depth, evidence_limit, snapshot_mtime, overlay_mtime)
+    cache_key = _graph_rag_cache_key(question, project, max_depth, evidence_limit, detail, snapshot_mtime, overlay_mtime)
     cached = _GRAPH_RAG_CACHE.get(cache_key)
     if cached is not None:
         result = json.loads(cached)
@@ -858,10 +909,11 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         result["observability"] = observability
         return result
 
-    context = build_symbol_context(store, question, max_depth=max_depth, project=project)
+    focus_resolution = resolve_symbol_focus(store, question, project=project, detail=detail, k=10)
+    context = build_symbol_context(store, question, max_depth=max_depth, project=project, detail=detail, focus_resolution=focus_resolution)
     context_ms = int((time.perf_counter() - started) * 1000)
 
-    focus = context.get("focus") or {}
+    focus = focus_resolution.get("focus") or context.get("focus") or {}
     search_candidates = list(context.get("search_candidates") or [])
     impact = context.get("impact") or {}
     community = context.get("community")
@@ -911,6 +963,8 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         }
         result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
         result["observability"]["elapsed_ms"] = context_ms
+        if detail == "compact":
+            result = _compact_graph_rag_response(result)
         _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
         return result
 
@@ -935,6 +989,8 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         }
         result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
         result["observability"]["elapsed_ms"] = context_ms
+        if detail == "compact":
+            result = _compact_graph_rag_response(result)
         _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
         return result
 
@@ -965,6 +1021,8 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
         }
         result["observability"]["cache"] = {"hit": False, "snapshot_mtime": snapshot_mtime, "overlay_mtime": overlay_mtime}
         result["observability"]["elapsed_ms"] = total_ms
+        if detail == "compact":
+            result = _compact_graph_rag_response(result)
         _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
         return result
 
@@ -1056,6 +1114,8 @@ def graph_rag_answer(store, question: str, *, project: str | None = None, max_de
     result["observability"]["elapsed_ms"] = total_ms
     result["observability"]["latency_ms"]["total"] = total_ms
     result["observability"]["latency_ms"]["cache_lookup"] = 0
+    if detail == "compact":
+        result = _compact_graph_rag_response(result)
     _GRAPH_RAG_CACHE.put(cache_key, json.dumps(result))
     return result
 
@@ -1265,9 +1325,16 @@ def evaluate_graph_rag_suite(
         case_project = case.get("project") if case.get("project") is not None else project
         case_max_depth = int(case.get("max_depth") if case.get("max_depth") is not None else max_depth)
         case_k = int(case.get("k") if case.get("k") is not None else k)
-        result = answer_fn(store, question, project=case_project, max_depth=case_max_depth, k=case_k)
+        try:
+            result = answer_fn(store, question, project=case_project, max_depth=case_max_depth, k=case_k, detail=str(case.get("detail") or "full"))
+        except TypeError as exc:
+            if "detail" not in str(exc):
+                raise
+            result = answer_fn(store, question, project=case_project, max_depth=case_max_depth, k=case_k)
         score_report = score_graph_rag_answer(result, dict(case.get("expect") or case.get("expected") or {}))
         case_score = float(score_report["score"])
+        payload_json = json.dumps(result, separators=(",", ":"), sort_keys=True)
+        answer_text = str(result.get("answer") or "")
         case_reports.append(
             {
                 "name": str(case.get("name") or f"case-{index}"),
@@ -1276,6 +1343,9 @@ def evaluate_graph_rag_suite(
                 "max_depth": case_max_depth,
                 "k": case_k,
                 "regression_score": case_score,
+                "payload_bytes": len(payload_json.encode("utf-8")),
+                "payload_tokens": _token_count(payload_json),
+                "answer_tokens": _token_count(answer_text),
                 "passed": bool(score_report["passed"]),
                 "checks": score_report["checks"],
                 "observed": score_report["observed"],
@@ -1290,6 +1360,9 @@ def evaluate_graph_rag_suite(
     average_score = round(sum(scores) / case_count, 2) if case_count else 0.0
     min_score = round(min(scores), 2) if case_count else 0.0
     pass_rate = round(passed_count / case_count, 4) if case_count else 0.0
+    payload_bytes_total = sum(int(case.get("payload_bytes") or 0) for case in case_reports)
+    payload_tokens_total = sum(int(case.get("payload_tokens") or 0) for case in case_reports)
+    answer_tokens_total = sum(int(case.get("answer_tokens") or 0) for case in case_reports)
 
     violations: list[dict[str, object]] = []
     if case_count == 0:
@@ -1327,6 +1400,11 @@ def evaluate_graph_rag_suite(
             "average_score": average_score,
             "min_score": min_score,
             "pass_rate": pass_rate,
+            "payload_bytes_total": payload_bytes_total,
+            "payload_tokens_total": payload_tokens_total,
+            "answer_tokens_total": answer_tokens_total,
+            "avg_payload_tokens": round(payload_tokens_total / case_count, 2) if case_count else 0.0,
+            "avg_answer_tokens": round(answer_tokens_total / case_count, 2) if case_count else 0.0,
         },
         "quality_gates": {
             "passed": not violations,

@@ -88,11 +88,11 @@ def test_graph_rag_answer_builds_contracts(monkeypatch):
     assert flow_citation["flow_id"] == "f1"
     assert result["observability"]["retrieval_mode"] == "graph_rag"
     assert result["observability"]["k"] == 5
-    assert result["provenance"]["version"] == 10
+    assert result["provenance"]["version"] == 12
     assert result["provenance"]["package_version"] == __version__
     assert result["provenance"]["index_fingerprint"]["snapshot_mtime"] >= 0.0
     assert "overlay_mtime" in result["provenance"]["index_fingerprint"]
-    assert result["observability"]["provenance"]["version"] == 10
+    assert result["observability"]["provenance"]["version"] == 12
     assert result["observability"]["evidence_rerank"]["strategy"] == "graph_aware_diverse"
     assert result["observability"]["evidence_rerank"]["selected"][0]["title"] == "com.example.PaymentService#processPayment"
     assert result["observability"]["evidence_rerank"]["selected"][0]["citation_id"] == "c1"
@@ -141,6 +141,56 @@ def test_graph_rag_answer_caches_by_snapshot_and_reports_latency(monkeypatch):
     assert second["observability"]["latency_ms"]["cache_lookup"] >= 0
 
 
+def test_graph_rag_answer_uses_shared_focus_resolution(monkeypatch):
+    calls: list[tuple[str, str | None]] = []
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {"id": "m1", "kind": "method", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"},
+        "search_candidates": [{"id": "m1", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"}],
+        "impact": {"impacted_callers": {"1": [], "2": [], "3+": []}, "summary": {}},
+        "community": None,
+        "flows": [],
+        "timings_ms": {"search": 1, "impact": 0, "community": 0, "flows": 0, "total": 1},
+    }
+
+    _GRAPH_RAG_CACHE.invalidate()
+    monkeypatch.setattr(
+        "codespine.graphrag.resolve_symbol_focus",
+        lambda store, query, *, project=None, detail="full", k=10, search_candidates=None: calls.append((query, project)) or {"query": query, "focus": context["focus"], "focus_symbol": context["focus"]["fqname"], "search_candidates": context["search_candidates"], "search_ms": 0},
+    )
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: context)
+
+    graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
+
+    assert calls == [("what breaks if I change Foo?", "app")]
+
+
+def test_graph_rag_answer_cache_separates_by_detail(monkeypatch):
+    context = {
+        "query": "what breaks if I change Foo?",
+        "focus": {"id": "m1", "kind": "method", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"},
+        "search_candidates": [{"id": "m1", "name": "processPayment", "fqname": "com.example.PaymentService#processPayment", "file_path": "/tmp/PaymentService.java", "line": 12, "score": 0.97, "confidence": "high"}],
+        "impact": {"impacted_callers": {"1": [], "2": [], "3+": []}, "summary": {}},
+        "community": None,
+        "flows": [],
+        "timings_ms": {"search": 1, "impact": 0, "community": 0, "flows": 0, "total": 1},
+    }
+    calls = {"count": 0}
+
+    _GRAPH_RAG_CACHE.invalidate()
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr("codespine.graphrag.resolve_symbol_focus", lambda *args, **kwargs: {"query": "what breaks if I change Foo?", "focus": context["focus"], "focus_symbol": context["focus"]["fqname"], "search_candidates": context["search_candidates"], "search_ms": 0})
+    monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
+
+    full = graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app", detail="full")
+    compact = graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app", detail="compact")
+
+    assert calls["count"] == 2
+    assert full["observability"]["provenance"]["version"] == 12
+    assert "provenance" not in compact["observability"]
+    assert compact["supporting_context"]["search_candidate_count"] == 1
+
+
 def test_graph_rag_answer_cache_invalidates_on_overlay_change(monkeypatch, tmp_path):
     context = {
         "query": "what breaks if I change Foo?",
@@ -174,6 +224,7 @@ def test_graph_rag_answer_cache_invalidates_on_overlay_change(monkeypatch, tmp_p
 
     _GRAPH_RAG_CACHE.invalidate()
     monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr("codespine.graphrag.resolve_symbol_focus", lambda *args, **kwargs: {"query": "what breaks if I change Foo?", "focus": context["focus"], "focus_symbol": context["focus"]["fqname"], "search_candidates": context["search_candidates"], "search_ms": 0})
     monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
 
     graph_rag_answer(_Store(), "what breaks if I change Foo?", project="app")
@@ -424,11 +475,31 @@ def test_graph_rag_answer_returns_unavailable_when_no_focus(monkeypatch):
     assert result["evidence_subgraph"] == {"nodes": [], "edges": []}
     assert result["supporting_context"]["search_candidate_count"] == 0
     assert result["supporting_context"]["evidence_subgraph_nodes"] == 0
-    assert result["provenance"]["version"] == 10
+    assert result["provenance"]["version"] == 12
     assert result["provenance"]["index_fingerprint"]["snapshot_mtime"] >= 0.0
-    assert result["observability"]["provenance"]["version"] == 10
-    assert result["observability"]["evidence_count"] == 0
-    assert result["observability"]["citation_count"] == 0
+    assert result["observability"]["provenance"]["version"] == 12
+
+
+def test_graph_rag_evaluation_suite_reports_payload_and_token_metrics():
+    def fake_answer(_store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full"):
+        return {
+            "available": True,
+            "abstained": False,
+            "focus": {"id": "m1", "fqname": "com.example.PaymentService#processPayment"},
+            "answer": "Best match: com.example.PaymentService#processPayment.",
+            "confidence": {"label": "high", "score": 0.9},
+            "evidence": [{"kind": "search_result", "source": "hybrid_search"}],
+            "citations": [{"id": "c1"}],
+        }
+
+    report = evaluate_graph_rag_suite(object(), {"cases": [{"question": "grounded", "expect": {"available": True}, "detail": "compact"}]}, answer_fn=fake_answer)
+
+    case = report["cases"][0]
+    assert case["payload_bytes"] > 0
+    assert case["payload_tokens"] > 0
+    assert case["answer_tokens"] > 0
+    assert report["summary"]["payload_tokens_total"] == case["payload_tokens"]
+    assert report["summary"]["answer_tokens_total"] == case["answer_tokens"]
 
 
 def test_graph_rag_scoring_uses_expected_contract_and_signal_quality():
@@ -619,16 +690,16 @@ def test_cli_answer_forwards_question_and_contract(monkeypatch):
 
     monkeypatch.setattr("codespine.cli._open_store", lambda read_only=True: object())
 
-    def fake_graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5):
-        captured.update({"question": question, "project": project, "max_depth": max_depth, "k": k})
+    def fake_graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full"):
+        captured.update({"question": question, "project": project, "max_depth": max_depth, "k": k, "detail": detail})
         return {"available": True, "answer": "ok", "confidence": {"label": "high", "score": 0.9, "reason": "x"}, "evidence": [], "citations": [], "observability": {"retrieval_mode": "graph_rag"}}
 
     monkeypatch.setattr("codespine.cli.graph_rag_answer", fake_graph_rag_answer)
 
-    result = CliRunner().invoke(main, ["answer", "what breaks if I change Foo?", "--project", "app", "--json"])
+    result = CliRunner().invoke(main, ["answer", "what breaks if I change Foo?", "--project", "app", "--detail", "compact", "--json"])
 
     assert result.exit_code == 0
-    assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5}
+    assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5, "detail": "compact"}
     payload = json.loads(result.output)
     assert payload["answer"] == "ok"
 
@@ -698,11 +769,40 @@ def test_cli_answer_eval_preserves_suite_gates_without_overrides(monkeypatch, tm
     assert payload["quality_gates"]["thresholds"] == {"min_average_score": 91.0, "min_case_score": 82.0, "min_pass_rate": 0.5}
 
 
+def test_cli_answer_eval_summary_reports_token_metrics(monkeypatch, tmp_path):
+    suite_path = tmp_path / "suite.json"
+    suite_path.write_text(json.dumps({"name": "demo", "cases": []}), encoding="utf-8")
+
+    monkeypatch.setattr("codespine.cli._open_store", lambda read_only=True: object())
+    monkeypatch.setattr(
+        "codespine.cli.evaluate_graph_rag_suite",
+        lambda *args, **kwargs: {
+            "summary": {
+                "case_count": 1,
+                "passed_count": 1,
+                "failed_count": 0,
+                "average_score": 88.0,
+                "min_score": 88.0,
+                "pass_rate": 1.0,
+                "payload_tokens_total": 12,
+                "answer_tokens_total": 4,
+            },
+            "quality_gates": {"passed": True, "thresholds": {}, "violations": []},
+            "cases": [],
+        },
+    )
+
+    result = CliRunner().invoke(main, ["answer-eval", "--suite", str(suite_path)])
+
+    assert result.exit_code == 0
+    assert "payload tokens 12, answer tokens 4" in result.output
+
+
 def test_mcp_answer_tool_is_exposed_and_forwarded(monkeypatch):
     captured: dict[str, object] = {}
 
-    def fake_graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5):
-        captured.update({"question": question, "project": project, "max_depth": max_depth, "k": k})
+    def fake_graph_rag_answer(store, question: str, *, project: str | None = None, max_depth: int = 3, k: int = 5, detail: str = "full"):
+        captured.update({"question": question, "project": project, "max_depth": max_depth, "k": k, "detail": detail})
         return {"available": True, "answer": "ok", "confidence": {"label": "high", "score": 0.9, "reason": "x"}, "evidence": [], "citations": [], "observability": {"retrieval_mode": "graph_rag"}}
 
     monkeypatch.setattr("codespine.mcp.server.graph_rag_answer", fake_graph_rag_answer)
@@ -712,11 +812,13 @@ def test_mcp_answer_tool_is_exposed_and_forwarded(monkeypatch):
         tools = await mcp.list_tools()
         answer_tool = next(tool for tool in tools if tool.name == "answer")
         assert "question" in answer_tool.parameters["properties"]
-        await mcp.call_tool("answer", {"question": "what breaks if I change Foo?", "project": "app"})
+        assert "detail" in answer_tool.parameters["properties"]
+        assert answer_tool.parameters["properties"]["detail"]["default"] == "full"
+        await mcp.call_tool("answer", {"question": "what breaks if I change Foo?", "project": "app", "detail": "compact"})
 
     asyncio.run(_run())
 
-    assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5}
+    assert captured == {"question": "what breaks if I change Foo?", "project": "app", "max_depth": 3, "k": 5, "detail": "compact"}
 
 
 def test_mcp_answer_tool_preserves_unavailable_result_shape(monkeypatch):

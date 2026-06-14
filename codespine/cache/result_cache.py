@@ -4,11 +4,11 @@ Avoids recomputing expensive analyses (impact BFS, dead-code scan, community
 lookup) when the same arguments are passed and the underlying index hasn't
 changed since the last call.
 
-Cache key: ``(tool_name, args_hash, snapshot_mtime_rounded)``
+Cache key: ``(tool_name, args_hash, snapshot_mtime_ns)``
   - ``tool_name`` — the MCP tool that produced the result
   - ``args_hash`` — SHA-1 of the JSON-serialised arguments (sorted keys)
-  - ``snapshot_mtime_rounded`` — read-replica mtime rounded to 1 s, so a new
-    snapshot invalidates all cached results for the affected store
+   - ``snapshot_mtime_ns`` — read-replica mtime at nanosecond precision, so a
+     new snapshot invalidates all cached results for the affected store
 
 TTL: entries are evicted after ``ttl_s`` seconds (default 300 s / 5 min) even
 if the cache isn't full, preventing stale results across long sessions.
@@ -80,15 +80,15 @@ class ResultCache:
             Tool arguments dict (``None`` values included so missing optional
             args don't collide with explicitly-set ones).
         snapshot_mtime:
-            Last-modified time of the read-replica sentinel file, rounded to
-            1-second precision.  A new snapshot invalidates old entries.
+            Last-modified time of the read-replica sentinel file.  The key
+            preserves nanosecond precision so rapid snapshots do not collide.
         """
         try:
             args_bytes = json.dumps(args, sort_keys=True, default=str).encode()
         except Exception:
             args_bytes = str(args).encode()
         args_hash = hashlib.sha1(args_bytes).hexdigest()[:16]
-        return (tool_name, args_hash, round(snapshot_mtime, 0))
+        return (tool_name, args_hash, int(round(snapshot_mtime * 1_000_000_000)))
 
     # ------------------------------------------------------------------
     # Cache operations

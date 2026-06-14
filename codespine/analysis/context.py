@@ -14,12 +14,47 @@ def _focus_symbol(focus: dict[str, object] | None, fallback: str) -> str:
     return str(focus.get("fqname") or focus.get("name") or focus.get("id") or fallback)
 
 
-def build_symbol_context(store, query: str, max_depth: int = 3, project: str | None = None) -> dict:
+def resolve_symbol_focus(
+    store,
+    query: str,
+    *,
+    project: str | None = None,
+    detail: str = "full",
+    k: int = 10,
+    search_candidates: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     started = time.perf_counter()
-    search_results = hybrid_search(store, query, k=10, project=project)
+    candidates = search_candidates if search_candidates is not None else hybrid_search(store, query, k=k, project=project, detail=detail)
     search_ms = int((time.perf_counter() - started) * 1000)
-    focus = search_results[0] if search_results else None
+    if search_candidates is not None:
+        search_ms = max(1, search_ms)
+    focus = candidates[0] if candidates else None
     focus_symbol = _focus_symbol(focus, query)
+    return {
+        "query": query,
+        "focus": focus,
+        "focus_symbol": focus_symbol,
+        "search_candidates": candidates,
+        "search_ms": search_ms,
+    }
+
+
+def build_symbol_context(
+    store,
+    query: str,
+    max_depth: int = 3,
+    project: str | None = None,
+    detail: str = "full",
+    focus_resolution: dict[str, object] | None = None,
+) -> dict:
+    started = time.perf_counter()
+    resolution = focus_resolution or resolve_symbol_focus(store, query, project=project, detail=detail, k=10)
+    search_results = list(resolution.get("search_candidates") or [])
+    search_ms = int(resolution.get("search_ms") or 0)
+    if search_results and search_ms == 0:
+        search_ms = 1
+    focus = resolution.get("focus")
+    focus_symbol = str(resolution.get("focus_symbol") or _focus_symbol(focus if isinstance(focus, dict) else None, query))
 
     if not focus:
         return {

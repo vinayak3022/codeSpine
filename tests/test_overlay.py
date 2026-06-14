@@ -500,6 +500,40 @@ def test_overlay_impact_includes_dirty_call_edges(isolated_settings, tmp_path: P
     assert any(item.get("name") == "a" for item in all_direct)
 
 
+def test_overlay_impact_metadata_resolution_honors_project(monkeypatch):
+    class _Store:
+        overlay_store = object()
+
+    def fake_merged_symbol_records(store, overlay_store, project: str | None = None):
+        return [
+            {"id": "s_target", "kind": "method", "name": "target", "fqname": "com.example.App#target()", "file_id": "f_app", "file_path": "/repo/app/App.java", "project_id": "app"},
+            {"id": "s_caller", "kind": "method", "name": "caller", "fqname": "com.example.App#caller()", "file_id": "f_app", "file_path": "/repo/app/App.java", "project_id": "app"},
+        ]
+
+    def fake_merged_method_records(store, overlay_store, project: str | None = None):
+        if project == "app":
+            return [
+                {"id": "m_target", "class_fqcn": "com.example.App", "signature": "target()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/App.java", "name": "target"},
+                {"id": "m_hash", "class_fqcn": "com.other.Other", "signature": "caller()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/App.java", "name": "caller"},
+            ]
+        return [
+            {"id": "m_target", "class_fqcn": "com.example.App", "signature": "target()", "file_id": "f_app", "project_id": "app", "file_path": "/repo/app/App.java", "name": "target"},
+            {"id": "m_hash", "class_fqcn": "com.other.Other", "signature": "caller()", "file_id": "f_other", "project_id": "other", "file_path": "/repo/other/Other.java", "name": "caller"},
+        ]
+
+    def fake_merged_call_edges(store, overlay_store, project: str | None = None):
+        return [{"src": "m_hash", "dst": "m_target", "confidence": 0.9, "reason": "project", "edge_type": "CALLS"}]
+
+    monkeypatch.setattr("codespine.analysis.impact.merged_symbol_records", fake_merged_symbol_records)
+    monkeypatch.setattr("codespine.analysis.impact.merged_method_records", fake_merged_method_records)
+    monkeypatch.setattr("codespine.analysis.impact.merged_call_edges", fake_merged_call_edges)
+
+    impact = analyze_impact(_Store(), "target", project="app")
+
+    assert impact["impacted_callers"]["1"][0]["project_id"] == "app"
+    assert impact["impacted_callers"]["1"][0]["file_path"] == "/repo/app/App.java"
+
+
 def test_overlay_status_reports_promotion_pending(isolated_settings, tmp_path: Path):
     root = tmp_path / "project"
     java_file = root / "src" / "main" / "java" / "com" / "example" / "App.java"
