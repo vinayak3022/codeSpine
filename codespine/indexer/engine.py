@@ -524,6 +524,8 @@ class JavaIndexer:
                         class_methods.setdefault(c_id, {})
 
                         cls_symbol_id = symbol_id("class", cls.fqcn, scope)
+                        cls_anns = " ".join(a.split(".")[-1] for a in cls.annotations) if cls.annotations else ""
+                        cls_ifaces = ", ".join(cls.interfaces) if cls.interfaces else ""
                         symbol_rows.append(
                             {
                                 "id": cls_symbol_id,
@@ -534,7 +536,9 @@ class JavaIndexer:
                                 "line": cls.line,
                                 "col": cls.col,
                                 "embedding": embed_text(
-                                    f"class {cls.fqcn}, scope: {scope}"
+                                    f"type: class, name: {cls.fqcn}, annotations: {cls_anns}"
+                                    f"{', interfaces: ' + cls_ifaces if cls_ifaces else ''}"
+                                    f", package: {cls.package}, project: {scope}"
                                 ) if embed else None,
                             }
                         )
@@ -595,7 +599,9 @@ class JavaIndexer:
                                     "line": fld.line,
                                     "col": fld.col,
                                     "embedding": embed_text(
-                                        f"field {fqfield} {fld.type_name}, scope: {scope}"
+                                        f"type: field, name: {fld.name}, "
+                                        f"qualified name: {fqfield}, "
+                                        f"type: {fld.type_name}, project: {scope}"
                                     ) if embed else None,
                                 }
                             )
@@ -626,7 +632,9 @@ class JavaIndexer:
                                     "line": method.line,
                                     "col": method.col,
                                     "embedding": embed_text(
-                                        f"method {fqname} returns {method.return_type}, scope: {scope}"
+                                        f"type: method, name: {fqname} "
+                                        f"returns {method.return_type}"
+                                        f", project: {scope}"
                                     ) if embed else None,
                                 }
                             )

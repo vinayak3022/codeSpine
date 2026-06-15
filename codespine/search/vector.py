@@ -164,13 +164,17 @@ def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
 def _search_query_text(query: str) -> str:
     """Build structured query text for semantic search.
 
-    Wraps the raw user query in a template that aligns with the structured
-    document embeddings produced by ``_build_embedding_text`` at index time.
+    Produces text in the same format as the index-time embedding templates
+    in engine.py, so that query vectors align with document vectors.
+
     Identifier-like queries (no spaces, camelCase) are treated as symbol
     lookups; free-text queries are passed through with a generic prefix.
     """
     if " " not in query.strip():
-        return f"type: symbol, name: {query.strip()}"
+        return (
+            f"type: symbol, name: {query.strip()}, "
+            f"qualified name: {query.strip()}"
+        )
     return f"query: {query.strip()}"
 
 
