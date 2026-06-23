@@ -109,8 +109,8 @@ def _index_guard(store) -> str | None:
     try:
         project_rows = store.query_records("MATCH (p:Project) RETURN count(p) as n")
         symbol_rows = store.query_records("MATCH (s:Symbol) RETURN count(s) as n")
-        projects = int((project_rows[0].get("n") if project_rows else 0) or 0)
-        symbols = int((symbol_rows[0].get("n") if symbol_rows else 0) or 0)
+        projects = _sum_count_rows(project_rows)
+        symbols = _sum_count_rows(symbol_rows)
         if projects > 0 and symbols == 0:
             return _no_symbols_response(
                 "Index appears empty or corrupted (projects exist but 0 symbols are readable). "
@@ -369,14 +369,10 @@ class _StoreProxy:
 
     def __init__(self, store) -> None:
         object.__setattr__(self, "_store", store)
-        object.__setattr__(self, "_sentinel", SETTINGS.db_snapshot_path + ".updated")
         object.__setattr__(self, "_last_mtime", self._sentinel_mtime())
 
     def _sentinel_mtime(self) -> float:
-        try:
-            return os.path.getmtime(object.__getattribute__(self, "_sentinel"))
-        except FileNotFoundError:
-            return 0.0
+        return _store_snapshot_mtime(object.__getattribute__(self, "_store"))
 
     def _maybe_reload(self) -> None:
         current = self._sentinel_mtime()

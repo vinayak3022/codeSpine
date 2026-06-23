@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from codespine.mcp.server import build_mcp_server, _reload_store_instance, _store_snapshot_mtime
+from codespine.mcp.server import build_mcp_server, _index_guard, _reload_store_instance, _store_snapshot_mtime
 
 
 class _FakeRouter:
@@ -213,3 +213,15 @@ def test_get_impact_cache_invalidates_on_overlay_changes(monkeypatch, tmp_path: 
     asyncio.run(_run())
 
     assert calls["count"] == 2
+
+
+def test_index_guard_sums_sharded_count_rows():
+    class _Store:
+        def query_records(self, query: str, params: dict | None = None):
+            if "MATCH (p:Project)" in query:
+                return [{"n": 0}, {"n": 1}]
+            if "MATCH (s:Symbol)" in query:
+                return [{"n": 0}, {"n": 5}]
+            return []
+
+    assert _index_guard(_Store()) is None
