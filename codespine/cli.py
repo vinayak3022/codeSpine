@@ -252,8 +252,31 @@ def _open_store(read_only: bool = True) -> ShardedGraphStore:
     (DuckDB or KùzuDB) is selected transparently.  Direct ``GraphStore(...)``
     calls were tied to the legacy single-DB KùzuDB layout and will fail on
     any machine running the default DuckDB backend with sharded storage.
+
+    Attempts auto-repair on corruption (unless read-only).
     """
-    return ShardedGraphStore(read_only=read_only)
+    try:
+        return ShardedGraphStore(read_only=read_only)
+    except Exception as exc:
+        if read_only or not SETTINGS.auto_repair_on_startup:
+            raise
+        LOGGER.warning("Store open failed (%s) — attempting auto-repair", exc)
+        # Individual shards auto-repair in their constructors; a top-level
+        # failure is likely shard-dir-level.  Force-reset the entire store.
+        try:
+            from codespine.sharding import ShardRouter
+            router = ShardRouter()
+            for idx in range(router.num_shards):
+                from codespine.db.duckdb_store import _remove_path as _rp
+                db_path = router.db_path(idx)
+                snap_path = router.snapshot_path(idx)
+                _rp(db_path)
+                _rp(snap_path)
+            return ShardedGraphStore(read_only=read_only)
+        except Exception as repair_exc:
+            raise RuntimeError(
+                f"Store open + auto-repair failed: {exc}; {repair_exc}"
+            ) from repair_exc
 
 
 def _discover_modules(abs_path: str) -> tuple[list[str], list[tuple[str, str]], bool]:
@@ -2791,13 +2814,18 @@ def start() -> None:
 
 @main.command("supervise-mcp", hidden=True)
 def supervise_mcp() -> None:
-    """Run MCP under a tiny self-healing supervisor with restart backoff."""
-    stopping = False
+    """Run MCP under a tiny self-healing supervisor with restart backoff.
+
+    Includes liveness health checks: if the child process's heartbeat goes
+    stale for ``supervisor_health_max_failures × supervisor_health_interval_s``
+    seconds, the supervisor sends SIGTERM and lets the restart backoff handle
+    recovery.
+    """
+    stopping: list[bool] = [False]
     child: subprocess.Popen | None = None
 
-    def _handle_stop(signum, frame):  # noqa: ARG001
-        nonlocal stopping, child
-        stopping = True
+    def _handle_stop(signum: int, frame: object) -> None:  # noqa: ARG001
+        stopping[0] = True
         if child is not None and child.poll() is None:
             try:
                 child.terminate()
@@ -2807,9 +2835,16 @@ def supervise_mcp() -> None:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
+    # ── Health-check settings ────────────────────────────────────────
+    _health_interval = SETTINGS.supervisor_health_interval_s
+    _max_failures = SETTINGS.supervisor_health_max_failures
+
     restart_count = 0
     backoff = 1.0
-    while not stopping:
+    consecutive_failures = 0
+    last_heartbeat_check = 0.0
+
+    while not stopping[0]:
         child = subprocess.Popen(
             [sys.executable, "-m", "codespine.cli", "run-mcp"],
             stdout=open(SETTINGS.log_file, "a", encoding="utf-8"),
@@ -2823,18 +2858,69 @@ def supervise_mcp() -> None:
                 "last_started_at": time.time(),
                 "backoff_s": backoff,
                 "status": "running",
+                "mcp_heartbeat": time.time(),  # initial — will be overwritten by child
             }
         )
-        code = child.wait()
-        if stopping:
+        consecutive_failures = 0
+        last_heartbeat_check = time.time()
+
+        # ── Wait loop with health checks ─────────────────────────────
+        while not stopping[0]:
+            try:
+                # Check child is still alive (non-blocking).
+                code = child.poll()
+                if code is not None:
+                    LOGGER.info("MCP child exited (code %s); restarting.", code)
+                    break  # exit wait loop → restart
+
+                # Periodically check heartbeat.
+                now = time.time()
+                if _health_interval > 0 and (now - last_heartbeat_check) >= _health_interval:
+                    last_heartbeat_check = now
+                    state = _read_runtime_state()
+                    hb = state.get("mcp_heartbeat", 0.0)
+                    if hb and (now - float(hb)) > _health_interval * 2:
+                        consecutive_failures += 1
+                        LOGGER.warning(
+                            "MCP heartbeat stale (%.0fs ago) — failure %d/%d",
+                            now - float(hb),
+                            consecutive_failures,
+                            _max_failures,
+                        )
+                        if _max_failures > 0 and consecutive_failures >= _max_failures:
+                            LOGGER.warning("MCP heartbeat lost — terminating unresponsive child.")
+                            try:
+                                child.terminate()
+                                child.wait(timeout=5)
+                            except Exception:
+                                try:
+                                    child.kill()
+                                except Exception:
+                                    pass
+                            break  # exit wait loop → restart
+                    else:
+                        # Heartbeat is fresh → reset failure counter.
+                        consecutive_failures = 0
+
+                time.sleep(1)
+            except KeyboardInterrupt:
+                stopping[0] = True
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+                break
+
+        if stopping[0]:
             break
+
         restart_count += 1
         _write_runtime_state(
             {
                 "supervisor_pid": os.getpid(),
                 "child_pid": None,
                 "restart_count": restart_count,
-                "last_exit_code": code,
+                "last_exit_code": code if code is not None else -1,
                 "backoff_s": backoff,
                 "status": "restarting",
                 "last_failure_at": time.time(),
@@ -2842,6 +2928,7 @@ def supervise_mcp() -> None:
         )
         time.sleep(backoff)
         backoff = min(backoff * 2.0, 30.0)
+
     _clear_runtime_state()
 
 
@@ -2998,7 +3085,50 @@ def import_index(input_path: str) -> None:
 
 @main.command("run-mcp", hidden=True)
 def run_mcp() -> None:
-    """Run MCP server in stdio mode."""
+    """Run MCP server in stdio mode with health heartbeat and graceful shutdown."""
+    # ── Heartbeat thread: writes a liveness timestamp every 5 s ──────
+    _mcp_stopping: list[bool] = [False]
+    _mcp_heartbeat_interval = max(int(os.environ.get("CODESPINE_HEARTBEAT_SECS", "5")), 1)
+
+    def _heartbeat_loop() -> None:
+        while not _mcp_stopping[0]:
+            try:
+                state = _read_runtime_state()
+                state["mcp_heartbeat"] = time.time()
+                state["mcp_pid"] = os.getpid()
+                _write_runtime_state(state)
+            except Exception:
+                pass
+            time.sleep(_mcp_heartbeat_interval)
+
+    _hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="codespine-mcp-heartbeat")
+    _hb_thread.start()
+
+    # ── Graceful shutdown on SIGTERM / SIGINT ───────────────────────
+    def _mcp_shutdown(signum: int, frame: object) -> None:  # noqa: ARG001
+        if _mcp_stopping[0]:
+            os._exit(0)  # second signal → immediate exit
+        _mcp_stopping[0] = True
+        # Best-effort DB checkpoint before exit.
+        try:
+            store = _open_store(read_only=False)
+            store.snapshot_all(background=False)
+        except Exception:
+            pass
+        # Clear heartbeat from runtime state.
+        try:
+            state = _read_runtime_state()
+            state.pop("mcp_heartbeat", None)
+            state.pop("mcp_pid", None)
+            state["status"] = "stopped"
+            _write_runtime_state(state)
+        except Exception:
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _mcp_shutdown)
+    signal.signal(signal.SIGINT, _mcp_shutdown)
+
     store = _open_store(read_only=True)
     mcp = build_mcp_server(store, repo_path_provider=_current_repo_path)
     mcp.run()

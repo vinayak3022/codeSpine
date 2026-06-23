@@ -9,7 +9,7 @@ from codespine.overlay.merge import _load_overlay_docs, merged_symbol_records
 from codespine.search.bm25 import rank_bm25
 from codespine.search.fuzzy import rank_fuzzy
 from codespine.search.rrf import reciprocal_rank_fusion
-from codespine.search.vector import _load_model, rank_cross_encoder, rank_semantic
+from codespine.search.vector import _load_model, rank_cross_encoder, rank_semantic, rank_semantic_sql
 
 LOGGER = logging.getLogger(__name__)
 
@@ -283,6 +283,7 @@ def hybrid_search(
     detail: str = "full",
     include_context: bool | None = None,
     include_snippets: bool | None = None,
+    pool_size: int | None = None,
 ) -> list[dict] | dict:
     overlay_store = getattr(store, "overlay_store", None)
     if overlay_store is not None:
@@ -346,7 +347,13 @@ def hybrid_search(
 
         bm25_rank = rank_bm25(query, lexical_docs)
         fuzzy_rank = rank_fuzzy(query, fuzzy_docs)
-        semantic_rank = rank_semantic(query, vector_docs)
+        # Try SQL-native vector search pushdown for lower latency (P1.4).
+        _pool = pool_size or SETTINGS.semantic_candidate_pool
+        _sql_rank = rank_semantic_sql(store, query, pool_size=_pool)
+        if _sql_rank is not None:
+            semantic_rank = _sql_rank
+        else:
+            semantic_rank = rank_semantic(query, vector_docs)
 
         bm25_trace_by_id, bm25_traces = _rank_trace_map(bm25_rank, trace_limit)
         fuzzy_trace_by_id, fuzzy_traces = _rank_trace_map(fuzzy_rank, trace_limit)

@@ -1,13 +1,19 @@
+"""FastMCP server for CodeSpine — 50+ tools for code intelligence.
+
+Split from a 3331-line monolith into ``_helpers.py`` (shared utilities),
+``_telemetry.py``, and separate ``tools_*.py`` modules.
+"""
+
 from __future__ import annotations
 
-import json as _json_mod
-import inspect
 import logging
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections import defaultdict
 
 from fastmcp import FastMCP
 
@@ -28,7 +34,13 @@ from codespine.health import index_health
 from codespine.graphrag import graph_rag_answer
 from codespine.overlay.git_state import current_head
 from codespine.overlay.merge import overlay_summary
-from codespine.project_state import derive_project_status, list_project_states, load_project_state, snapshot_info, synthetic_project_state
+from codespine.project_state import (
+    derive_project_status,
+    list_project_states,
+    load_project_state,
+    snapshot_info,
+    synthetic_project_state,
+)
 from codespine.search.hybrid import hybrid_search
 from codespine.tasks import active_tasks
 from codespine.watch.watcher import (
@@ -38,356 +50,28 @@ from codespine.watch.watcher import (
 )
 from codespine.cache.result_cache import ResultCache
 
-
-def _json(data: dict, *, preserve_empty_keys: set[str] | frozenset[str] = frozenset()) -> str:
-    """Serialize response dict to a JSON string.
-
-    FastMCP double-serialises dict return values on many transports (SSE,
-    stdio) producing duplicate JSON payloads that waste ~50 K tokens/session.
-    Returning a pre-serialised string guarantees a single TextContent block.
-
-    Strips None values and empty containers to keep payloads compact.
-    """
-    cleaned = {
-        k: v
-        for k, v in data.items()
-        if v is not None and (k in preserve_empty_keys or (v != [] and v != {}))
-    }
-    return _json_mod.dumps(cleaned, separators=(",", ":"))
-
-
-def _safe_tool_response(fn_name: str, exc: Exception) -> str:
-    """Return a structured JSON error string — never a raw stack trace."""
-    msg = str(exc)
-    # Detect OOM / buffer pool exhaustion.
-    is_oom = isinstance(exc, MemoryError) or any(
-        m in msg.lower() for m in ("buffer pool", "out of memory", "oom", "cannot allocate")
-    )
-    return _json({
-        "available": False,
-        "error": "Analysis truncated due to memory limits." if is_oom else f"Tool error: {msg[:300]}",
-        "truncated": is_oom,
-        "tool": fn_name,
-    })
-
-
-def _git_available(path: str) -> bool:
-    """Return True if path is inside a git repository."""
-    try:
-        r = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            cwd=path,
-            capture_output=True,
-            timeout=5,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _resolve_repo_path(store, project: str | None, repo_path_provider) -> str:
-    """Resolve the filesystem path for a given project_id, falling back to cwd."""
-    if project:
-        try:
-            recs = store.query_records(
-                "MATCH (p:Project) WHERE p.id = $pid RETURN p.path as path LIMIT 1",
-                {"pid": project},
-            )
-            if recs and recs[0].get("path"):
-                return recs[0]["path"]
-        except Exception:
-            pass
-    return repo_path_provider()
-
-
-def _no_symbols_response(note: str = "No symbols indexed. Run 'codespine analyse <path>' first.") -> str:
-    return _json({"available": False, "note": note})
-
-
-def _index_guard(store) -> str | None:
-    """Return a JSON failure when the index appears empty or corrupted."""
-    try:
-        project_rows = store.query_records("MATCH (p:Project) RETURN count(p) as n")
-        symbol_rows = store.query_records("MATCH (s:Symbol) RETURN count(s) as n")
-        projects = _sum_count_rows(project_rows)
-        symbols = _sum_count_rows(symbol_rows)
-        if projects > 0 and symbols == 0:
-            return _no_symbols_response(
-                "Index appears empty or corrupted (projects exist but 0 symbols are readable). "
-                "Run 'codespine health' and 'codespine repair --full <path>' or restart after stopping stale watch processes."
-            )
-    except Exception as exc:
-        return _no_symbols_response(f"Index is unavailable: {str(exc)[:200]}")
-    return None
-
-
-def _normalize_symbol_input(raw: str) -> str:
-    """Normalize a symbol string so that various user input formats work.
-
-    Handles:
-      - ``com.example.MyClass#myMethod(int,String)`` → ``myMethod(int,String)``
-      - ``MyClass#myMethod``                         → ``myMethod``
-      - ``myMethod(int,String)``                     → unchanged
-      - ``myMethod``                                 → unchanged
-    """
-    s = raw.strip()
-    if "#" in s:
-        s = s[s.index("#") + 1:]
-    return s
-
-
-def _preferred_symbol_inputs(raw: str) -> list[str]:
-    original = raw.strip()
-    normalized = _normalize_symbol_input(raw)
-    candidates: list[str] = []
-    if original:
-        candidates.append(original)
-    if normalized and normalized != original:
-        candidates.append(normalized)
-    return candidates
-
-
-def _parse_indexed_at(raw) -> int:
-    """Robustly parse an indexed_at value that may be str, int, float, or None."""
-    if raw is None:
-        return 0
-    try:
-        val = int(float(str(raw)))
-        # Sanity check: must look like a Unix timestamp (> year 2000)
-        return val if val > 946684800 else 0
-    except (ValueError, TypeError):
-        return 0
-
-
-# Module-level watch health flag, updated by build_mcp_server() on watch start/stop.
-# Used by _staleness_meta() to adjust stale-warning messaging.
-_WATCH_ACTIVE: bool = False
-
-
-def _staleness_meta(
-    store,
-    response: dict,
-    project: str | None = None,
-    overlay_store=None,
-    deep_scope: bool = False,
-    compact: bool = True,
-    preserve_empty_keys: set[str] | frozenset[str] = frozenset(),
-    watch_is_active: bool | None = None,
-) -> str:
-    """Inject index staleness metadata into every tool response and serialise.
-
-    In compact mode (the default) only fields that carry actionable information
-    are included — stale_warning when the index is > 1 h old, and overlay
-    status only when files are actually dirty.  This saves ~200-400 tokens per
-    call compared to always emitting all metadata fields.
-
-    Stale warnings are placed FIRST in the response dict so they are seen
-    immediately by LLM consumers.
-
-    Returns a JSON string (not a dict) to avoid FastMCP double-serialisation.
-    """
-    prefix: dict = {}
-    try:
-        if project:
-            recs = store.query_records(
-                "MATCH (p:Project) WHERE p.id = $pid RETURN p.indexed_at as ts",
-                {"pid": project},
-            )
-        else:
-            recs = store.query_records(
-                "MATCH (p:Project) RETURN p.indexed_at as ts ORDER BY p.indexed_at ASC LIMIT 1"
-            )
-            if recs:
-                ts = _parse_indexed_at(recs[0].get("ts"))
-                if ts:
-                    age = int(time.time()) - ts
-                    if age > 3600:
-                        if watch_is_active if watch_is_active is not None else _WATCH_ACTIVE:
-                            # Watch is active; downgrade warning to a note.
-                            prefix["stale_warning"] = (
-                                f"A snapshot from {age // 3600}h {(age % 3600) // 60}m ago is being served; "
-                                "watch daemon is active and results will refresh within ~30s."
-                            )
-                        else:
-                            # Stale warning goes FIRST so LLMs see it immediately.
-                            prefix["stale_warning"] = (
-                                f"Index is {age // 3600}h {(age % 3600) // 60}m old. "
-                                "Run analyse_project() or start_watch() to refresh."
-                            )
-                if not compact:
-                    response["index_age_seconds"] = age
-                    response["indexed_at_epoch"] = ts
-    except Exception:
-        pass
-
-    if overlay_store is not None:
-        try:
-            summary = overlay_summary(overlay_store, project=project)
-            if compact:
-                # Only surface overlay info when there are actually dirty files.
-                if summary.get("overlay_present"):
-                    response["overlay_dirty_projects"] = summary.get("dirty_projects", [])
-                    response["overlay_dirty_files"] = summary.get("dirty_file_count", 0)
-                    if summary.get("deleted_file_count"):
-                        response["overlay_deleted_files"] = summary["deleted_file_count"]
-            else:
-                response.update(summary)
-            if project and not compact:
-                meta = store.get_project_metadata(project) or {}
-                response["base_indexed_commit"] = meta.get("indexed_commit", "")
-                response["working_head_commit"] = current_head(meta.get("path") or response.get("path") or "")
-            if deep_scope and summary.get("overlay_present"):
-                response["overlay_excluded"] = True
-                response["note"] = "Results reflect committed index only; uncommitted overlay changes are excluded."
-        except Exception:
-            pass
-
-    # Merge prefix (stale warning first) with the rest of the response.
-    final = {**prefix, **response}
-    return _json(final, preserve_empty_keys=preserve_empty_keys)
-
-
-def _project_inventory(store) -> list[dict]:
-    state_by_id = {item.get("project_id"): item for item in list_project_states() if item.get("project_id")}
-    try:
-        projects = store.list_project_metadata() if hasattr(store, "list_project_metadata") else store.query_records(
-            "MATCH (p:Project) RETURN p.id as id, p.path as path, p.indexed_at as indexed_at"
-        )
-    except Exception:
-        projects = []
-    meta_by_id = {item.get("id"): item for item in projects if item.get("id")}
-    project_ids = sorted({pid for pid in list(meta_by_id) + list(state_by_id) if pid})
-    out: list[dict] = []
-    for pid in project_ids:
-        project = meta_by_id.get(pid, {})
-        state = state_by_id.get(pid) or synthetic_project_state(pid, path=project.get("path", ""))
-        snap = snapshot_info(pid, store.router if hasattr(store, "router") else None)
-        out.append(
-            {
-                "project_id": pid,
-                "path": state.get("path") or project.get("path"),
-                "indexed_at": project.get("indexed_at"),
-                "project_state": derive_project_status(state, snap),
-                "core_state": state.get("core_state"),
-                "deep_state": state.get("deep_state"),
-                "last_error": state.get("last_error"),
-                "repair_hint": state.get("repair_hint"),
-                "snapshot_valid": snap.get("snapshot_valid"),
-                "write_db_valid": snap.get("write_db_valid"),
-            }
-        )
-    return out
-
-
-def _sum_count_rows(rows: list[dict]) -> int:
-    total = 0
-    for row in rows or []:
-        if "count" in row:
-            total += int(row["count"] or 0)
-        elif "n" in row:
-            total += int(row["n"] or 0)
-        elif "total" in row:
-            total += int(row["total"] or 0)
-        elif "linked" in row:
-            total += int(row["linked"] or 0)
-        else:
-            total += int(next(iter(row.values()), 0) or 0)
-    return total
-
-
-def _snapshot_mtime_for_path(path: str) -> float:
-    try:
-        if path and os.path.exists(path):
-            return os.path.getmtime(path)
-    except OSError:
-        pass
-    return 0.0
-
-
-def _store_snapshot_mtime(store, project: str | None = None) -> float:
-    try:
-        router = getattr(store, "router", None)
-        if router is not None and hasattr(router, "all_shards") and hasattr(router, "snapshot_path"):
-            shard_ids = list(router.all_shards())
-            mtimes = [
-                _snapshot_mtime_for_path(router.snapshot_path(idx) + ".updated")
-                for idx in shard_ids
-            ]
-            return max(mtimes, default=0.0)
-        snapshot_path = getattr(store, "_snapshot_path", "")
-        return _snapshot_mtime_for_path(snapshot_path + ".updated")
-    except Exception:
-        return 0.0
-
-
-def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
-    try:
-        overlay_store = getattr(store, "overlay_store", None)
-        if overlay_store is None:
-            return 0.0
-        if project:
-            return _snapshot_mtime_for_path(overlay_store.project_path(project))
-        mtimes = []
-        for doc in overlay_store.list_projects():
-            project_id = doc.get("project_id")
-            if project_id:
-                mtimes.append(_snapshot_mtime_for_path(overlay_store.project_path(project_id)))
-        return max(mtimes, default=0.0)
-    except Exception:
-        return 0.0
-
-
-def _reload_store_instance(store):
-    cls = type(store)
-    params = inspect.signature(cls).parameters
-    kwargs = {}
-    if "read_only" in params:
-        kwargs["read_only"] = True
-    if "backend" in params and hasattr(store, "backend"):
-        kwargs["backend"] = getattr(store, "backend")
-    if "db_path_override" in params and hasattr(store, "_db_path"):
-        kwargs["db_path_override"] = getattr(store, "_db_path")
-    if "snapshot_path_override" in params and hasattr(store, "_snapshot_path"):
-        kwargs["snapshot_path_override"] = getattr(store, "_snapshot_path")
-    if "num_shards" in params and hasattr(store, "router"):
-        kwargs["num_shards"] = getattr(store.router, "num_shards", None)
-    if "shards_dir" in params and hasattr(store, "router"):
-        kwargs["shards_dir"] = getattr(store.router, "shards_dir", None)
-    return cls(**kwargs)
-
-
-class _StoreProxy:
-    """Wraps a GraphStore and hot-reloads from the read replica when the
-    post-analyse sentinel file is touched.
-
-    After `codespine analyse` finishes it copies the write DB to
-    ``~/.codespine_db_read`` and writes ``~/.codespine_db_read.updated``.
-    This proxy checks that sentinel's mtime before every attribute access and
-    silently swaps in a fresh read-only GraphStore so the MCP daemon picks up
-    the new index without restarting.
-    """
-
-    def __init__(self, store) -> None:
-        object.__setattr__(self, "_store", store)
-        object.__setattr__(self, "_last_mtime", self._sentinel_mtime())
-
-    def _sentinel_mtime(self) -> float:
-        return _store_snapshot_mtime(object.__getattribute__(self, "_store"))
-
-    def _maybe_reload(self) -> None:
-        current = self._sentinel_mtime()
-        if current > object.__getattribute__(self, "_last_mtime"):
-            try:
-                new_store = _reload_store_instance(object.__getattribute__(self, "_store"))
-                object.__setattr__(self, "_store", new_store)
-                object.__setattr__(self, "_last_mtime", current)
-                _LOGGER.info("MCP: hot-reloaded %s from updated snapshot", type(new_store).__name__)
-            except Exception as exc:
-                _LOGGER.warning("MCP: hot-reload failed: %s", exc)
-
-    def __getattr__(self, name: str):
-        self._maybe_reload()
-        return getattr(object.__getattribute__(self, "_store"), name)
+# Import shared helpers extracted to reduce the monolith.
+from codespine.mcp._helpers import (
+    MCPTelemetry,
+    _StoreProxy,
+    _get_watch_active,
+    _git_available,
+    _index_guard,
+    _json,
+    _no_symbols_response,
+    _normalize_symbol_input,
+    _parse_indexed_at,
+    _preferred_symbol_inputs,
+    _project_inventory,
+    _reload_store_instance,
+    _resolve_repo_path,
+    _safe_tool_response,
+    _set_watch_active,
+    _staleness_meta,
+    _store_snapshot_mtime,
+    _sum_count_rows,
+    _overlay_snapshot_mtime,
+)
 
 
 def build_mcp_server(store, repo_path_provider):
@@ -402,6 +86,8 @@ def build_mcp_server(store, repo_path_provider):
     # pre-serialised to a JSON string (single TextContent block).
     import functools as _functools
 
+    _telemetry = MCPTelemetry()
+
     class _JsonMCP:
         """Thin proxy that wraps tool functions to return JSON strings."""
         def __getattr__(self, name):
@@ -412,10 +98,16 @@ def build_mcp_server(store, repo_path_provider):
             def wrapper(fn):
                 @_functools.wraps(fn)
                 def json_fn(*a, **kw):
-                    result = fn(*a, **kw)
-                    if isinstance(result, dict):
-                        return _json(result)
-                    return result
+                    t0 = time.perf_counter()
+                    try:
+                        result = fn(*a, **kw)
+                        _telemetry.record_call(fn.__name__, time.perf_counter() - t0)
+                        if isinstance(result, dict):
+                            return _json(result)
+                        return result
+                    except Exception:
+                        _telemetry.record_call(fn.__name__, time.perf_counter() - t0, error=True)
+                        raise
                 return original_decorator(json_fn)
             return wrapper
 
@@ -478,7 +170,7 @@ def build_mcp_server(store, repo_path_provider):
                 _watch["proc"] = proc
                 _watch["path"] = watch_path
                 _watch["started_at"] = time.time()
-                _WATCH_ACTIVE = True
+                _set_watch_active(True)
                 _LOGGER.info("Auto-started watch on %s (pid %d)", watch_path, proc.pid)
         except Exception as exc:
             _LOGGER.debug("Auto-watch skipped: %s", exc)
@@ -495,6 +187,39 @@ def build_mcp_server(store, repo_path_provider):
     def ping():
         """Verify the MCP server is alive. Call this first to confirm connectivity."""
         return _json({"status": "ok", "version": __version__})
+
+    @mcp.tool()
+    def health_check():
+        """Detailed health probe — DB connectivity, index state, telemetry, uptime.
+        Returns a structured health report for monitoring / supervisor use.
+        """
+        guard = _index_guard(store)
+        projects = _project_inventory(store)
+        db_ok = guard is None
+        symbols_ok = False
+        try:
+            sym_q = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
+            symbols_ok = _sum_count_rows(sym_q) > 0
+        except Exception:
+            pass
+        telem = _telemetry.snapshot()
+        return _json({
+            "status": "ok" if db_ok else "degraded",
+            "version": __version__,
+            "db_connectivity": db_ok,
+            "symbols_available": symbols_ok,
+            "project_count": len(projects),
+            "telemetry": telem,
+            "watch_active": _get_watch_active(),
+            "uptime_s": telem["uptime_s"],
+        })
+
+    @mcp.tool()
+    def get_telemetry():
+        """Server-side call telemetry — call counts, error rates, average latency per tool.
+        Useful for debugging performance issues and monitoring server health.
+        """
+        return _json({"available": True, **_telemetry.snapshot()})
 
     @mcp.tool()
     def get_capabilities():
@@ -727,18 +452,21 @@ def build_mcp_server(store, repo_path_provider):
         project: str | None = None,
         explain: bool = False,
         detail: str = "full",
+        pool_size: int | None = None,
     ):
         """
         Hybrid symbol search (BM25 + vector + fuzzy, fused with RRF).
         Pass project=<project_id> to scope results to a single indexed project.
         Pass explain=True to include retrieval traces, match reasons, and confidence notes.
         Pass detail='compact' to skip architectural context and snippets unless explicitly requested.
+        Pass pool_size to override the semantic candidate pool (default: config value).
         Use list_projects to see available project IDs.
         """
         guard = _index_guard(store)
         if guard is not None:
             return guard
-        results = hybrid_search(store, query, k=k, project=project, explain=explain, detail=detail)
+        _pool = pool_size or int(os.environ.get("CODESPINE_CANDIDATE_POOL", "0")) or None
+        results = hybrid_search(store, query, k=k, project=project, explain=explain, detail=detail, pool_size=_pool)
         if not results:
             return _no_symbols_response()
         payload = {"available": True, **results} if explain and isinstance(results, dict) else {"available": True, "results": results}
@@ -1577,7 +1305,7 @@ def build_mcp_server(store, repo_path_provider):
         _watch["path"] = abs_path
         _watch["started_at"] = time.time()
         _watch["interval"] = global_interval
-        _WATCH_ACTIVE = True
+        _set_watch_active(True)
 
         return {
             "available": True,
@@ -1617,7 +1345,7 @@ def build_mcp_server(store, repo_path_provider):
         _watch["proc"] = None
         _watch["path"] = None
         _watch["started_at"] = None
-        _WATCH_ACTIVE = False
+        _set_watch_active(False)
         return {"available": True, "running": False, "stopped_path": path}
 
     @mcp.tool()
@@ -3232,10 +2960,22 @@ def build_mcp_server(store, repo_path_provider):
     # Advanced / raw access
     # ------------------------------------------------------------------
 
-    @mcp.tool()
-    def run_cypher(query: str):
-        """Run a raw Cypher query against the graph. For advanced exploration."""
-        records = store.query_records(query)
-        return {"available": True, "records": records, "count": len(records)}
+    # ── Module-based tool registrations ──────────────────────────────────
+    # These provide the same tools as the inline definitions above but are
+    # maintained in dedicated modules.  FastMCP emits a warning on duplicate
+    # registration and the last registration wins, so module tools override
+    # inlines.  Move a tool definition from server.py to a module when it
+    # has been verified.
+    try:
+        from codespine.mcp._tools_search import register_tools as _reg_search
+        _reg_search(mcp, store, repo_path_provider, _telemetry, overlay_store, _result_cache, _watch, _cache_key)
+    except Exception as exc:
+        _LOGGER.warning("Failed to register search tools: %s", exc)
+
+    try:
+        from codespine.mcp._tools_analysis import register_tools as _reg_analysis
+        _reg_analysis(mcp, store, repo_path_provider, _telemetry, overlay_store, _result_cache, _watch, _cache_key)
+    except Exception as exc:
+        _LOGGER.warning("Failed to register analysis tools: %s", exc)
 
     return _raw_mcp

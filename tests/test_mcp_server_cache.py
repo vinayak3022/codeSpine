@@ -201,6 +201,7 @@ def test_get_impact_cache_invalidates_on_overlay_changes(monkeypatch, tmp_path: 
         return {"resolved_to": [{"id": symbol}], "target": symbol, "depth_groups": {"1": [], "2": [], "3+": []}, "summary": {"direct": 0, "indirect": 0, "transitive": 0, "self_callers": 0}}
 
     monkeypatch.setattr("codespine.mcp.server.analyze_impact", fake_analyze_impact)
+    monkeypatch.setattr("codespine.mcp._tools_analysis.analyze_impact", fake_analyze_impact)
 
     async def _run():
         mcp = build_mcp_server(_Store(), lambda: str(tmp_path))

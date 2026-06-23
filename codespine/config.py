@@ -41,5 +41,18 @@ class Settings:
     default_global_interval_s: int = 30
     default_overlay_debounce_ms: int = 1500
 
+    # Query-time candidate pool for semantic search (0 = use SQL-native pushdown limit)
+    # Can be set per-query via CODESPINE_CANDIDATE_POOL env var or the pool_size param.
+    query_candidate_pool: int = 5000
+
+    # Health-check ping interval in seconds for the supervisor process (0 = disabled).
+    supervisor_health_interval_s: int = 10
+
+    # Max consecutive failed health pings before restart (0 = disabled).
+    supervisor_health_max_failures: int = 3
+
+    # Whether to attempt automatic DB repair on corruption at startup.
+    auto_repair_on_startup: bool = True
+
 
 SETTINGS = Settings()

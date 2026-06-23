@@ -315,11 +315,34 @@ class DuckDBStore:
             self._ensure_schema()
             return
 
-        self._conn: duckdb.DuckDBPyConnection = duckdb.connect(
-            db_file, read_only=read_only
-        )
-        if not read_only:
+        # Read-replica failover: if the write DB is absent/corrupt but a
+        # snapshot exists, serve from the snapshot (read-only callers).
+        if read_only and not is_valid_duckdb_database_path(db_file):
+            snap = self._snapshot_path
+            if is_valid_duckdb_database_path(snap):
+                LOGGER.warning("Read-replica failover: serving from snapshot %s", snap)
+                self._conn = duckdb.connect(snap, read_only=True)
+                return
+
+        try:
+            self._conn = duckdb.connect(db_file, read_only=read_only)
+        except Exception as exc:
+            if read_only or not SETTINGS.auto_repair_on_startup:
+                raise
+            LOGGER.warning(
+                "DB open failed (%s) — attempting auto-repair for %s",
+                exc, db_file,
+            )
+            # Destroy the corrupt file and rebuild from empty schema.
+            for p in (self._db_path, self._snapshot_path):
+                _remove_path(p)
+            os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+            self._conn = duckdb.connect(self._db_path)
             self._ensure_schema()
+            LOGGER.info("Auto-repair completed — empty DB created at %s", self._db_path)
+        else:
+            if not read_only:
+                self._ensure_schema()
 
     # ------------------------------------------------------------------
     # Schema

@@ -756,6 +756,7 @@ def test_mcp_search_hybrid_explain_flag_is_exposed_and_forwarded(monkeypatch):
         return {"retrieval_mode": "hybrid", "results": [{"name": "Foo"}]}
 
     monkeypatch.setattr("codespine.mcp.server.hybrid_search", fake_hybrid_search)
+    monkeypatch.setattr("codespine.mcp._tools_search.hybrid_search", fake_hybrid_search)
 
     async def _run():
         mcp = build_mcp_server(_NoopStore(), lambda: ".")

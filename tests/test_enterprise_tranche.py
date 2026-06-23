@@ -80,6 +80,7 @@ def test_mcp_flow_tool_routes_through_metadata_path(monkeypatch):
         }
 
     monkeypatch.setattr("codespine.mcp.server.trace_flows_analysis", fake_trace_flows)
+    monkeypatch.setattr("codespine.mcp._tools_analysis.trace_flows_analysis", fake_trace_flows)
 
     async def _run() -> None:
         mcp = build_mcp_server(_Store(), lambda: ".")

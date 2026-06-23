@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import threading
 from functools import lru_cache
 
 from codespine.config import SETTINGS
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _hash_vector(text: str, dim: int) -> list[float]:
@@ -187,6 +190,67 @@ def rank_semantic(query: str, docs: list[tuple[str, list[float] | None]]) -> lis
         ranked.append((doc_id, cosine_similarity(qv, emb)))
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked
+
+
+def rank_semantic_sql(
+    store,
+    query: str,
+    *,
+    pool_size: int = 5000,
+) -> list[tuple[str, float]] | None:
+    """Rank symbols by DuckDB SQL-native cosine similarity.
+
+    Pushes vector distance computation to the SQL engine instead of loading
+    all embeddings into Python.  Returns ``None`` when the SQL path is not
+    supported (older DuckDB, Kuzu backend, empty index) — callers should
+    fall back to Python ``rank_semantic()`` in that case.
+
+    Returns ``[(doc_id, score), ...]`` sorted descending, limited to *pool_size*,
+    or ``None`` if the SQL path is unavailable.
+    """
+    qv = embed_text(_search_query_text(query))
+    if not qv:
+        return None
+    dim = SETTINGS.vector_dim
+
+    # Try DuckDB SQL-native path via list_cosine_similarity.
+    try:
+        rows = store.query_records(
+            f"""
+            SELECT s.id,
+                   list_cosine_similarity(s.embedding, $qv::FLOAT[{dim}]) AS score
+            FROM symbols s
+            WHERE s.embedding IS NOT NULL
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            {"qv": qv, "limit": pool_size},
+        )
+        if rows:
+            return [(row["id"], float(row["score"])) for row in rows]
+    except Exception:
+        pass
+
+    # Fallback: try array_distance (negated for higher=better).
+    try:
+        rows = store.query_records(
+            f"""
+            SELECT s.id,
+                   -array_distance(s.embedding, $qv::FLOAT[{dim}]) AS score
+            FROM symbols s
+            WHERE s.embedding IS NOT NULL
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            {"qv": qv, "limit": pool_size},
+        )
+        if rows:
+            return [(row["id"], float(row["score"])) for row in rows]
+    except Exception:
+        pass
+
+    # SQL path not available — caller will fall back to Python rank_semantic.
+    return None
 
 
 # ---------------------------------------------------------------------------

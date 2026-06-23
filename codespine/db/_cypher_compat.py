@@ -9,24 +9,27 @@ Supported constructs
 - Node patterns            MATCH (alias:Label) or (a:L {prop: $v})
 - Anonymous nodes          (:Label) in NOT-EXISTS subqueries
 - Relationship patterns    (a)-[r:REL]->(b) directed
-- Undirected edges         (a)-[r:REL]-(b)  → OR of both directions
-- Virtual FK edges         (a)-[:HAS_METHOD]->(b) → b.class_id = a.id (no edge table)
+- Undirected edges         (a)-[r:REL]-(b)  -> OR of both directions
+- Virtual FK edges         (a)-[:HAS_METHOD]->(b) -> b.class_id = a.id (no edge table)
 - Multi-hop patterns       (a)-[:R1]->(x)-[:R2]->(b)
 - Anonymous destination    (a)-[:CALLS]->()
 - Multi-MATCH + WITH       Multiple MATCH clauses joined by WITH pipeline stages
 - WHERE                    =, <>, IN, CONTAINS, lower(), coalesce(),
                            IS NULL, IS NOT NULL, >=, <=
 - NOT EXISTS subqueries    NOT EXISTS { MATCH (:N)-[:R]->(m) }
-- WITH … ORDER BY          Kuzu paging construct → plain ORDER BY
+- WITH ... ORDER BY          Kuzu paging construct -> plain ORDER BY
 - DISTINCT, ORDER BY, LIMIT
-- Aggregates               count(n) → count(*)
+- Aggregates               count(n) -> count(*)
 - Literal values           'string' in RETURN (e.g. 'method' as kind)
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Schema mappings
@@ -330,6 +333,13 @@ def _translate(cypher: str) -> str:
         if entry not in seen:
             from_parts.append(entry)
             seen.add(entry)
+    if not from_parts:
+        _LOGGER.warning(
+            "Unmatched Cypher pattern - falling back to empty result. "
+            "Add a translation rule in _cypher_compat.py if this query should "
+            "return data. Query (truncated): %.200s",
+            cypher,
+        )
     from_str = ", ".join(from_parts) if from_parts else "(SELECT 1 WHERE 1=0) _empty(x)"
 
     # ── Assemble ──────────────────────────────────────────────────────────
