@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+from pathlib import Path
 
 import click
 import psutil
@@ -83,7 +84,7 @@ def _is_running() -> bool:
         with open(SETTINGS.pid_file, "r", encoding="utf-8") as f:
             pid = int(f.read().strip())
         proc = psutil.Process(pid)
-        if not _is_codespine_process(proc, expected_subcommand="run-mcp"):
+        if not (_is_codespine_process(proc, expected_subcommand="run-mcp") or _is_codespine_process(proc, expected_subcommand="supervise-mcp")):
             _safe_remove_pid_file()
             return False
         return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
@@ -155,6 +156,89 @@ def _cleanup_orphan_codespine_processes(*subcommands: str) -> list[int]:
         except Exception:
             continue
     return sorted(set(killed))
+
+
+def _count_codespine_processes(*subcommands: str) -> int:
+    wanted = tuple(s.lower() for s in subcommands if s)
+    count = 0
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if not _is_codespine_process(proc):
+                continue
+            joined = " ".join(proc.cmdline()).lower()
+            if wanted and not any(sub in joined for sub in wanted):
+                continue
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _runtime_state_path() -> str:
+    return os.path.expanduser("~/.codespine_runtime.json")
+
+
+def _write_runtime_state(payload: dict) -> None:
+    path = _runtime_state_path()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _read_runtime_state() -> dict:
+    path = _runtime_state_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _clear_runtime_state() -> None:
+    try:
+        os.remove(_runtime_state_path())
+    except OSError:
+        pass
+
+
+def _run_subprocess_with_retries(
+    cmd: list[str],
+    *,
+    log_file,
+    attempts: int = 3,
+    initial_backoff_s: float = 1.0,
+    on_attempt=None,
+) -> subprocess.CompletedProcess:
+    last_proc = None
+    backoff = initial_backoff_s
+    for attempt in range(1, attempts + 1):
+        if on_attempt is not None:
+            try:
+                on_attempt(attempt, attempts, backoff if attempt > 1 else 0.0)
+            except Exception:
+                pass
+        proc = subprocess.run(
+            cmd,
+            cwd=os.getcwd(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        last_proc = proc
+        if proc.returncode == 0:
+            return proc
+        if attempt < attempts:
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+    assert last_proc is not None
+    return last_proc
 
 
 def _current_repo_path() -> str:
@@ -1459,7 +1543,7 @@ def continue_background(path: str, task_id: str | None) -> None:
     )
     try:
         with open(SETTINGS.log_file, "a", encoding="utf-8") as log:
-            proc = subprocess.run(
+            proc = _run_subprocess_with_retries(
                 [
                     sys.executable,
                     "-m",
@@ -1468,10 +1552,18 @@ def continue_background(path: str, task_id: str | None) -> None:
                     abs_path,
                     "--allow-running",
                 ],
-                cwd=os.getcwd(),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
+                log_file=log,
+                attempts=3,
+                initial_backoff_s=2.0,
+                on_attempt=lambda attempt, total, backoff: update_task(
+                    task_id,
+                    attempt=attempt,
+                    detail=(
+                        f"Background core indexing attempt {attempt}/{total}"
+                        if attempt == 1
+                        else f"Retrying background core indexing ({attempt}/{total}) after {backoff:.1f}s"
+                    ),
+                ),
             )
         if proc.returncode == 0:
             finish_task(task_id, "succeeded", "Background core indexing complete")
@@ -1543,7 +1635,7 @@ def repair_background(path: str, mode: str, task_id: str | None) -> None:
     )
     try:
         with open(SETTINGS.log_file, "a", encoding="utf-8") as log:
-            proc = subprocess.run(
+            proc = _run_subprocess_with_retries(
                 [
                     sys.executable,
                     "-m",
@@ -1553,10 +1645,18 @@ def repair_background(path: str, mode: str, task_id: str | None) -> None:
                     "--full",
                     "--allow-running",
                 ],
-                cwd=os.getcwd(),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
+                log_file=log,
+                attempts=3,
+                initial_backoff_s=2.0,
+                on_attempt=lambda attempt, total, backoff: update_task(
+                    task_id,
+                    attempt=attempt,
+                    detail=(
+                        f"Background full repair attempt {attempt}/{total}"
+                        if attempt == 1
+                        else f"Retrying full repair ({attempt}/{total}) after {backoff:.1f}s"
+                    ),
+                ),
             )
         if proc.returncode == 0:
             finish_task(task_id, "succeeded", "Background full repair complete")
@@ -2365,6 +2465,7 @@ def status(as_json: bool) -> None:
         overlay = []
     tasks = active_tasks(limit=10)
     project_rows = _project_summaries()
+    runtime_state = _read_runtime_state()
     try:
         health_summary = index_health(store).get("summary", {})
     except Exception:
@@ -2387,6 +2488,8 @@ def status(as_json: bool) -> None:
         "overlay_dir": SETTINGS.overlay_dir,
         "overlay_projects": overlay,
         "background_tasks": tasks,
+        "runtime": runtime_state,
+        "watch_processes": _count_codespine_processes("watch"),
         "projects": project_rows,
         "health_summary": health_summary,
     }
@@ -2401,6 +2504,12 @@ def status(as_json: bool) -> None:
             click.echo("For IDE:   codespine mcp  (stdio mode)")
         else:
             click.echo(f"\nMCP server running (PID {pid}). Stop with: codespine stop")
+        if runtime_state:
+            click.echo(
+                f"Supervisor: restarts={int(runtime_state.get('restart_count', 0))} "
+                f"status={runtime_state.get('status', '-')} "
+                f"child_pid={runtime_state.get('child_pid') or '-'}"
+            )
         if tasks:
             click.echo("\nBackground tasks:")
             for task in tasks:
@@ -2666,9 +2775,10 @@ def start() -> None:
         )
 
     proc = subprocess.Popen(
-        [sys.executable, "-m", "codespine.cli", "run-mcp"],
+        [sys.executable, "-m", "codespine.cli", "supervise-mcp"],
         stdout=open(SETTINGS.log_file, "a", encoding="utf-8"),
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
     time.sleep(1)
     if proc.poll() is not None:
@@ -2677,6 +2787,62 @@ def start() -> None:
     with open(SETTINGS.pid_file, "w", encoding="utf-8") as f:
         f.write(str(proc.pid))
     click.secho("CodeSpine MCP active", fg="cyan")
+
+
+@main.command("supervise-mcp", hidden=True)
+def supervise_mcp() -> None:
+    """Run MCP under a tiny self-healing supervisor with restart backoff."""
+    stopping = False
+    child: subprocess.Popen | None = None
+
+    def _handle_stop(signum, frame):  # noqa: ARG001
+        nonlocal stopping, child
+        stopping = True
+        if child is not None and child.poll() is None:
+            try:
+                child.terminate()
+            except Exception:
+                pass
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    restart_count = 0
+    backoff = 1.0
+    while not stopping:
+        child = subprocess.Popen(
+            [sys.executable, "-m", "codespine.cli", "run-mcp"],
+            stdout=open(SETTINGS.log_file, "a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+        )
+        _write_runtime_state(
+            {
+                "supervisor_pid": os.getpid(),
+                "child_pid": child.pid,
+                "restart_count": restart_count,
+                "last_started_at": time.time(),
+                "backoff_s": backoff,
+                "status": "running",
+            }
+        )
+        code = child.wait()
+        if stopping:
+            break
+        restart_count += 1
+        _write_runtime_state(
+            {
+                "supervisor_pid": os.getpid(),
+                "child_pid": None,
+                "restart_count": restart_count,
+                "last_exit_code": code,
+                "backoff_s": backoff,
+                "status": "restarting",
+                "last_failure_at": time.time(),
+            }
+        )
+        time.sleep(backoff)
+        backoff = min(backoff * 2.0, 30.0)
+    _clear_runtime_state()
 
 
 @main.command()
