@@ -33,6 +33,7 @@ from codespine.diff.branch_diff import compare_branches
 from codespine.health import index_health, project_health, smoke_test_index
 from codespine.indexer.engine import JavaIndexer
 from codespine.mcp.server import build_mcp_server
+from codespine.overlay.git_state import git_repo_root
 from codespine.project_state import (
     derive_project_status,
     list_project_states,
@@ -81,9 +82,79 @@ def _is_running() -> bool:
     try:
         with open(SETTINGS.pid_file, "r", encoding="utf-8") as f:
             pid = int(f.read().strip())
-        return psutil.pid_exists(pid)
+        proc = psutil.Process(pid)
+        if not _is_codespine_process(proc, expected_subcommand="run-mcp"):
+            _safe_remove_pid_file()
+            return False
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except Exception:
+        _safe_remove_pid_file()
+        return False
+
+
+def _safe_remove_pid_file() -> None:
+    try:
+        if os.path.exists(SETTINGS.pid_file):
+            os.remove(SETTINGS.pid_file)
+    except OSError:
+        pass
+
+
+def _is_codespine_process(proc: psutil.Process, expected_subcommand: str | None = None) -> bool:
+    try:
+        cmdline = proc.cmdline()
     except Exception:
         return False
+    joined = " ".join(cmdline).lower()
+    if "codespine.cli" not in joined and "codespine" not in joined:
+        return False
+    if expected_subcommand and expected_subcommand.lower() not in joined:
+        return False
+    return True
+
+
+def _terminate_process_tree(proc: psutil.Process, timeout: float = 5.0) -> list[int]:
+    killed: list[int] = []
+    try:
+        children = proc.children(recursive=True)
+    except Exception:
+        children = []
+    targets = children + [proc]
+    for item in targets:
+        try:
+            item.terminate()
+        except Exception:
+            pass
+    gone, alive = psutil.wait_procs(targets, timeout=timeout)
+    for item in gone:
+        try:
+            killed.append(item.pid)
+        except Exception:
+            pass
+    for item in alive:
+        try:
+            item.kill()
+            killed.append(item.pid)
+        except Exception:
+            pass
+    return killed
+
+
+def _cleanup_orphan_codespine_processes(*subcommands: str) -> list[int]:
+    killed: list[int] = []
+    wanted = tuple(s.lower() for s in subcommands if s)
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if not _is_codespine_process(proc):
+                continue
+            cmdline_parts = [part.lower() for part in proc.cmdline()]
+            joined = " ".join(cmdline_parts)
+            if wanted and not any(sub in joined or sub in cmdline_parts for sub in wanted):
+                continue
+            killed.extend(_terminate_process_tree(proc, timeout=2.0))
+        except Exception:
+            continue
+    return sorted(set(killed))
 
 
 def _current_repo_path() -> str:
@@ -1753,7 +1824,8 @@ def diff(range_spec: str, as_json: bool) -> None:
     if ".." not in range_spec:
         raise click.ClickException("Range must be in format <base>..<head>")
     base_ref, head_ref = range_spec.split("..", 1)
-    result = compare_branches(os.getcwd(), base_ref, head_ref)
+    repo = git_repo_root(os.getcwd()) or os.getcwd()
+    result = compare_branches(repo, base_ref, head_ref)
     _echo_json(result, as_json)
 
 
@@ -2584,14 +2656,24 @@ def start() -> None:
         click.secho("CodeSpine already active.", fg="yellow")
         return
 
-    if os.path.exists(SETTINGS.pid_file):
-        os.remove(SETTINGS.pid_file)
+    orphaned = _cleanup_orphan_codespine_processes("run-mcp")
+    zombie_watchers = _cleanup_orphan_codespine_processes("watch")
+    _safe_remove_pid_file()
+    if orphaned or zombie_watchers:
+        click.secho(
+            f"Cleaned up stale CodeSpine processes: {len(set(orphaned + zombie_watchers))}",
+            fg="yellow",
+        )
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "codespine.cli", "run-mcp"],
         stdout=open(SETTINGS.log_file, "a", encoding="utf-8"),
         stderr=subprocess.STDOUT,
     )
+    time.sleep(1)
+    if proc.poll() is not None:
+        click.secho(f"CodeSpine failed to start (exit {proc.returncode}). Check {SETTINGS.log_file}.", fg="red")
+        return
     with open(SETTINGS.pid_file, "w", encoding="utf-8") as f:
         f.write(str(proc.pid))
     click.secho("CodeSpine MCP active", fg="cyan")
@@ -2612,19 +2694,25 @@ def mcp() -> None:
 @main.command()
 def stop() -> None:
     """Stop MCP background server."""
-    if not os.path.exists(SETTINGS.pid_file):
-        click.echo("Nothing to stop.")
-        return
-    try:
-        with open(SETTINGS.pid_file, "r", encoding="utf-8") as f:
-            pid = int(f.read().strip())
-        os.kill(pid, signal.SIGTERM)
-        click.echo(f"Stopped {pid}")
-    except Exception:
+    stopped: list[int] = []
+    stale_pid = False
+    if os.path.exists(SETTINGS.pid_file):
+        try:
+            with open(SETTINGS.pid_file, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            stopped.extend(_terminate_process_tree(psutil.Process(pid)))
+        except Exception:
+            stale_pid = True
+        finally:
+            _safe_remove_pid_file()
+    stopped.extend(_cleanup_orphan_codespine_processes("run-mcp", "watch"))
+    stopped = sorted(set(stopped))
+    if stopped:
+        click.echo(f"Stopped {', '.join(str(pid) for pid in stopped)}")
+    elif stale_pid:
         click.echo("Stale PID removed")
-    finally:
-        if os.path.exists(SETTINGS.pid_file):
-            os.remove(SETTINGS.pid_file)
+    else:
+        click.echo("Nothing to stop.")
 
 
 @main.command()

@@ -104,6 +104,23 @@ def _no_symbols_response(note: str = "No symbols indexed. Run 'codespine analyse
     return _json({"available": False, "note": note})
 
 
+def _index_guard(store) -> str | None:
+    """Return a JSON failure when the index appears empty or corrupted."""
+    try:
+        project_rows = store.query_records("MATCH (p:Project) RETURN count(p) as n")
+        symbol_rows = store.query_records("MATCH (s:Symbol) RETURN count(s) as n")
+        projects = int((project_rows[0].get("n") if project_rows else 0) or 0)
+        symbols = int((symbol_rows[0].get("n") if symbol_rows else 0) or 0)
+        if projects > 0 and symbols == 0:
+            return _no_symbols_response(
+                "Index appears empty or corrupted (projects exist but 0 symbols are readable). "
+                "Run 'codespine health' and 'codespine repair --full <path>' or restart after stopping stale watch processes."
+            )
+    except Exception as exc:
+        return _no_symbols_response(f"Index is unavailable: {str(exc)[:200]}")
+    return None
+
+
 def _normalize_symbol_input(raw: str) -> str:
     """Normalize a symbol string so that various user input formats work.
 
@@ -722,6 +739,9 @@ def build_mcp_server(store, repo_path_provider):
         Pass detail='compact' to skip architectural context and snippets unless explicitly requested.
         Use list_projects to see available project IDs.
         """
+        guard = _index_guard(store)
+        if guard is not None:
+            return guard
         results = hybrid_search(store, query, k=k, project=project, explain=explain, detail=detail)
         if not results:
             return _no_symbols_response()
@@ -994,6 +1014,9 @@ def build_mcp_server(store, repo_path_provider):
         One-shot deep context for a symbol: search + impact + community + flows.
         Pass project to scope the search to a single indexed module.
         """
+        guard = _index_guard(store)
+        if guard is not None:
+            return guard
         result = build_symbol_context(store, query, max_depth=max_depth, project=project, detail=detail)
         if not result.get("search_candidates"):
             return _no_symbols_response()
@@ -1013,6 +1036,9 @@ def build_mcp_server(store, repo_path_provider):
           deep      – If True, enrich with community member symbols and flow path details (default False).
         """
         try:
+            guard = _index_guard(store)
+            if guard is not None:
+                return guard
             result = graph_rag_answer(store, question, project=project, max_depth=max_depth, k=k, detail=detail, deep=deep)
             if not result.get("available"):
                 return _json(
@@ -1446,7 +1472,10 @@ def build_mcp_server(store, repo_path_provider):
                     "from the indexed project path. Use list_projects() to see available IDs."
                 ),
             }
-        result = compare_branches_analysis(repo, base_ref, head_ref)
+        try:
+            result = compare_branches_analysis(repo, base_ref, head_ref)
+        except Exception as exc:
+            return {"available": False, "note": f"Branch diff failed: {str(exc)[:200]}", "repo_path": repo}
         return {"available": True, **result}
 
     # ------------------------------------------------------------------
@@ -2216,6 +2245,9 @@ def build_mcp_server(store, repo_path_provider):
           "dead code in billing module"            → detect_dead_code
         """
         q = question.lower().strip()
+        guard = _index_guard(store)
+        if guard is not None:
+            return guard
         dispatched_to = "search_hybrid"
         interpreted_as = f"semantic search for: {question}"
 

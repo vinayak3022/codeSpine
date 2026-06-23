@@ -635,6 +635,7 @@ class JavaIndexer:
                                         f"type: method, name: {fqname} "
                                         f"returns {method.return_type}"
                                         f", project: {scope}"
+                                        f"{', body: ' + method.body_text if getattr(method, 'body_text', '') else ''}"
                                     ) if embed else None,
                                 }
                             )

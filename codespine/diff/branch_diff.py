@@ -12,6 +12,7 @@ import tree_sitter_java as tsjava
 from tree_sitter import Language, Parser, Query
 
 from codespine.indexer.java_parser import parse_java_source
+from codespine.overlay.git_state import git_repo_root
 
 JAVA_LANGUAGE = Language(tsjava.language())
 PARSER = Parser(JAVA_LANGUAGE)
@@ -223,6 +224,21 @@ def _git_changed_files(repo_path: str, base_ref: str, head_ref: str) -> list[dic
     return changes
 
 
+def _write_ref_file(repo_path: str, ref: str, rel_path: str, out_root: str) -> bool:
+    abs_path = os.path.join(out_root, rel_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    proc = subprocess.run(
+        ["git", "-C", repo_path, "show", f"{ref}:{rel_path}"],
+        check=False,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return False
+    with open(abs_path, "wb") as fh:
+        fh.write(proc.stdout)
+    return True
+
+
 def _group_by_semantic_id(records: list[dict]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
     for rec in records:
@@ -259,19 +275,34 @@ def _diff_semantic_records(base_records: list[dict], head_records: list[dict]) -
 
 
 def compare_branches(repo_path: str, base_ref: str, head_ref: str) -> dict:
+    repo_path = git_repo_root(repo_path) or repo_path
     temp_dir = tempfile.mkdtemp(prefix="codespine-diff-")
     base_dir = os.path.join(temp_dir, "base")
     head_dir = os.path.join(temp_dir, "head")
 
     try:
-        subprocess.run(["git", "-C", repo_path, "worktree", "add", "--detach", base_dir, base_ref], check=True, capture_output=True)
-        subprocess.run(["git", "-C", repo_path, "worktree", "add", "--detach", head_dir, head_ref], check=True, capture_output=True)
-
         changes = _git_changed_files(repo_path, base_ref, head_ref)
+        worktree_ready = True
+        subprocess.run(["git", "-C", repo_path, "worktree", "prune"], check=False, capture_output=True)
+        try:
+            subprocess.run(["git", "-C", repo_path, "worktree", "add", "--detach", base_dir, base_ref], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo_path, "worktree", "add", "--detach", head_dir, head_ref], check=True, capture_output=True)
+        except Exception:
+            worktree_ready = False
+            os.makedirs(base_dir, exist_ok=True)
+            os.makedirs(head_dir, exist_ok=True)
+            for change in changes:
+                base_rel = change.get("base")
+                head_rel = change.get("head")
+                if base_rel:
+                    _write_ref_file(repo_path, base_ref, base_rel, base_dir)
+                if head_rel:
+                    _write_ref_file(repo_path, head_ref, head_rel, head_dir)
+
         added: list[dict] = []
         removed: list[dict] = []
         modified: list[dict] = []
-        warnings: list[str] = []
+        warnings: list[str] = [] if worktree_ready else ["git worktree unavailable; used blob fallback"]
 
         for change in changes:
             status = change["status"]

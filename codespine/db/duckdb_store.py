@@ -39,6 +39,20 @@ from codespine.config import SETTINGS
 LOGGER = logging.getLogger(__name__)
 
 _VECTOR_DIM = SETTINGS.vector_dim  # 384
+_LOCK_RETRY_DELAYS_S = (0.05, 0.1, 0.25, 0.5)
+
+
+def _is_retryable_duckdb_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "lock",
+        "locked",
+        "busy",
+        "database is locked",
+        "conflicting lock",
+        "another process",
+        "io error",
+    ))
 
 
 def _remove_path(path: str) -> None:
@@ -361,11 +375,31 @@ class DuckDBStore:
 
     def execute(self, sql: str, params: dict[str, Any] | None = None):
         """Execute a SQL statement.  Params are passed as a list in positional order."""
-        if params:
-            # Convert dict params to list (DuckDB uses $1, $2 or positional ?)
-            self._conn.execute(sql, list(params.values()) if isinstance(params, dict) else params)
-        else:
-            self._conn.execute(sql)
+        def _run():
+            if params:
+                self._conn.execute(sql, list(params.values()) if isinstance(params, dict) else params)
+            else:
+                self._conn.execute(sql)
+        self._with_lock_retry(_run, op_name="execute")
+
+    def _with_lock_retry(self, fn, *, op_name: str):
+        last_exc: Exception | None = None
+        for idx, delay in enumerate((0.0, *_LOCK_RETRY_DELAYS_S)):
+            if delay:
+                time.sleep(delay)
+            try:
+                return fn()
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if not _is_retryable_duckdb_error(exc) or idx >= len(_LOCK_RETRY_DELAYS_S):
+                    raise
+                LOGGER.warning("DuckDB %s retry %s after lock error: %s", op_name, idx + 1, exc)
+                try:
+                    self._conn.execute("CHECKPOINT")
+                except Exception:
+                    pass
+        if last_exc is not None:
+            raise last_exc
 
     def query_records(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute a SQL (or Cypher) query and return rows as a list of dicts.
@@ -389,16 +423,15 @@ class DuckDBStore:
             use_named_params = True
 
         try:
-            if params:
-                if use_named_params and isinstance(params, dict):
-                    # Named $param style — DuckDB accepts dict directly
-                    rel = self._conn.execute(query, params)
-                else:
-                    # Positional ? style — DuckDB requires a list
+            def _run_query():
+                if params:
+                    if use_named_params and isinstance(params, dict):
+                        return self._conn.execute(query, params)
                     param_vals = list(params.values()) if isinstance(params, dict) else list(params)
-                    rel = self._conn.execute(query, param_vals)
-            else:
-                rel = self._conn.execute(query)
+                    return self._conn.execute(query, param_vals)
+                return self._conn.execute(query)
+
+            rel = self._with_lock_retry(_run_query, op_name="query")
             cols = [d[0] for d in rel.description or []]
             return [dict(zip(cols, row)) for row in rel.fetchall()]
         except Exception as exc:  # noqa: BLE001
@@ -414,14 +447,14 @@ class DuckDBStore:
         """Bulk insert using DuckDB's executemany (fast batch path)."""
         if not rows:
             return
-        self._conn.executemany(sql, rows)
+        self._with_lock_retry(lambda: self._conn.executemany(sql, rows), op_name="executemany")
 
     @contextmanager
     def transaction(self):
-        self._conn.execute("BEGIN TRANSACTION")
+        self._with_lock_retry(lambda: self._conn.execute("BEGIN TRANSACTION"), op_name="begin")
         try:
             yield
-            self._conn.execute("COMMIT")
+            self._with_lock_retry(lambda: self._conn.execute("COMMIT"), op_name="commit")
         except Exception:
             try:
                 self._conn.execute("ROLLBACK")

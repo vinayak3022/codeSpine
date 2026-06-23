@@ -111,3 +111,33 @@ def test_compare_branches_orders_changed_files_first_and_fails_soft(monkeypatch)
     assert result["modified"] == []
     assert [item["file"] for item in result["added"]] == ["src/Added.java"]
     assert result["warnings"] == ["src/Broken.java: parse failure"]
+
+
+def test_compare_branches_falls_back_when_worktree_add_fails(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:5] == ["git", "-C", "/repo", "worktree", "add"]:
+            raise RuntimeError("worktree locked")
+        if cmd[:4] == ["git", "-C", "/repo", "show"]:
+            return SimpleNamespace(returncode=0, stdout=b"class A {}", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(branch_diff.subprocess, "run", fake_run)
+    monkeypatch.setattr(branch_diff, "git_repo_root", lambda path: "/repo")
+    monkeypatch.setattr(
+        branch_diff,
+        "_git_changed_files",
+        lambda *args, **kwargs: [{"status": "M", "base": "src/A.java", "head": "src/A.java"}],
+    )
+
+    def fake_manifest(repo_path: str, rel_path: str):
+        calls.append((repo_path.rsplit("/", 1)[-1], rel_path))
+        return ([], [])
+
+    monkeypatch.setattr(branch_diff, "_manifest_for_file", fake_manifest)
+
+    result = branch_diff.compare_branches("/repo", "base", "head")
+
+    assert calls == [("base", "src/A.java"), ("head", "src/A.java")]
+    assert "git worktree unavailable; used blob fallback" in result["warnings"]

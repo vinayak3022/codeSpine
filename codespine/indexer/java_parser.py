@@ -28,6 +28,7 @@ class ParsedMethod:
     line: int
     col: int
     body_hash: str
+    body_text: str = ""
     calls: list["ParsedCall"] = field(default_factory=list)
     local_types: dict[str, str] = field(default_factory=dict)
     # DI metadata — set for @Provides/@Bean methods.
@@ -156,6 +157,13 @@ def _normalize_java_bytes(source: bytes) -> str:
     text = _RE_LINE_COMMENT.sub("", text)
     text = _RE_WHITESPACE.sub(" ", text).strip()
     return text
+
+
+def _semantic_body_text(node, *, max_chars: int = 600) -> str:
+    if node is None:
+        return ""
+    text = _normalize_java_bytes(node.text)
+    return text[:max_chars]
 
 
 def _node_type_name(node) -> str:
@@ -539,6 +547,7 @@ def parse_java_source(source: bytes) -> ParsedFile:
                 line=m_node.start_point[0] + 1,
                 col=m_node.start_point[1] + 1,
                 body_hash=_hash_node(m_node) if m_node.child_by_field_name("body") else "",
+                body_text=_semantic_body_text(m_node.child_by_field_name("body")),
                 local_types=_extract_local_types(m_node) if m_node.child_by_field_name("body") else {},
                 provides_type=provides_type,
                 injected_params=_extract_parameter_di(m_params_node),
