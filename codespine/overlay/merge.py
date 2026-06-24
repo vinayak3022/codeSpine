@@ -16,10 +16,16 @@ def _within_project_path(doc: dict[str, Any], file_path: str | None) -> bool:
         return False
 
 def _load_overlay_docs(overlay_store, project: str | None = None) -> list[dict[str, Any]]:
+    if overlay_store is None:
+        return []
     if project:
+        if not hasattr(overlay_store, "load_project"):
+            return []
         doc = overlay_store.load_project(project)
         if doc.get("dirty_files") or doc.get("deleted_files"):
             return [doc]
+        return []
+    if not hasattr(overlay_store, "list_projects"):
         return []
     docs = []
     for doc in overlay_store.list_projects():

@@ -43,7 +43,9 @@ def _module_for_file(file_path: str, sorted_modules: list[str], default_root: st
 
 
 def get_overlay_status(store, project: str | None = None) -> list[dict]:
-    overlay_store: OverlayStore = store.overlay_store
+    overlay_store: OverlayStore | None = getattr(store, "overlay_store", None)
+    if overlay_store is None:
+        return []
     statuses = overlay_store.status(project)
     out: list[dict] = []
     for item in statuses:

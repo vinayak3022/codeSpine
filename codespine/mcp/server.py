@@ -78,6 +78,9 @@ def build_mcp_server(store, repo_path_provider):
     store = _StoreProxy(store)
     _raw_mcp = FastMCP("codespine")
     overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is None:
+        from codespine.overlay.store import OverlayStore
+        overlay_store = OverlayStore()
 
     # ── Anti-duplicate-JSON wrapper ────────────────────────────────────
     # FastMCP double-serialises dict return values on many transports,

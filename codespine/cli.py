@@ -2282,6 +2282,16 @@ def _show_background_tasks(include_finished: bool, limit: int, as_json: bool) ->
             click.echo(f"{'':<12}  {'':<10}  {'':<10}  {'':>8}  repair: {repair_hint}")
 
 
+def _index_guard_simple(store) -> str | None:
+    try:
+        rows = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
+        if rows and int(rows[0].get("count", 0) or 0) > 0:
+            return None
+        return "Index appears empty. Run codespine analyse <path>."
+    except Exception as exc:
+        return f"Index is unavailable: {exc}"
+
+
 def _project_summaries() -> list[dict]:
     sg = ShardedGraphStore(read_only=True)
     meta_by_id = {project.get("id", ""): project for project in sg.list_project_metadata() if project.get("id")}
@@ -2875,7 +2885,19 @@ def supervise_mcp() -> None:
 
     while not stopping[0]:
         child = subprocess.Popen(
-            [sys.executable, "-m", "codespine.cli", "run-mcp"],
+            [
+                sys.executable,
+                "-m",
+                "codespine.cli",
+                "run-mcp",
+                "--transport",
+                "streamable-http",
+                "--host",
+                SETTINGS.mcp_http_host,
+                "--port",
+                str(SETTINGS.mcp_http_port),
+            ],
+            stdin=subprocess.DEVNULL,
             stdout=open(SETTINGS.log_file, "a", encoding="utf-8"),
             stderr=subprocess.STDOUT,
         )
@@ -2887,6 +2909,8 @@ def supervise_mcp() -> None:
                 "last_started_at": time.time(),
                 "backoff_s": backoff,
                 "status": "running",
+                "transport": "streamable-http",
+                "endpoint": f"http://{SETTINGS.mcp_http_host}:{SETTINGS.mcp_http_port}/mcp",
                 "mcp_heartbeat": time.time(),  # initial — will be overwritten by child
             }
         )
@@ -2994,7 +3018,7 @@ def serve() -> None:
 @main.command()
 def mcp() -> None:
     """Run MCP server in foreground (stdio)."""
-    run_mcp()
+    run_mcp(transport="stdio", host=None, port=None)
 
 
 @main.command()
@@ -3137,8 +3161,11 @@ def import_index(input_path: str) -> None:
 
 
 @main.command("run-mcp", hidden=True)
-def run_mcp() -> None:
-    """Run MCP server in stdio mode with health heartbeat and graceful shutdown."""
+@click.option("--transport", default="stdio", type=click.Choice(["stdio", "streamable-http", "http", "sse"]))
+@click.option("--host", default=None)
+@click.option("--port", default=None, type=int)
+def run_mcp(transport: str = "stdio", host: str | None = None, port: int | None = None) -> None:
+    """Run MCP server with health heartbeat and graceful shutdown."""
     # ── Heartbeat thread: writes a liveness timestamp every 5 s ──────
     _mcp_stopping: list[bool] = [False]
     _mcp_heartbeat_interval = max(int(os.environ.get("CODESPINE_HEARTBEAT_SECS", "5")), 1)
@@ -3195,7 +3222,16 @@ def run_mcp() -> None:
         )
         sys.exit(2)  # non-zero so the supervisor doesn't loop
     mcp = build_mcp_server(_mcp_store, repo_path_provider=_current_repo_path)
-    mcp.run()
+    _transport = transport or "stdio"
+    if _transport == "stdio":
+        mcp.run(transport="stdio", show_banner=False)
+    else:
+        mcp.run(
+            transport=_transport,
+            host=host or SETTINGS.mcp_http_host,
+            port=port or SETTINGS.mcp_http_port,
+            show_banner=False,
+        )
 
 
 if __name__ == "__main__":

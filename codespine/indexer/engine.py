@@ -96,6 +96,64 @@ class JavaIndexer:
         self.store = store
 
     @staticmethod
+    def detect_enclosing_multi_module_root(root_path: str) -> str | None:
+        """Return the top-most Maven/Gradle reactor root that encloses *root_path*.
+
+        This lets direct indexing of a sub-module (for example
+        ``vision/vision-server``) canonicalise to the parent reactor
+        (``vision``) so project IDs stay stable as ``vision::vision-server``
+        instead of sometimes drifting to just ``vision-server``.
+        """
+        import re
+
+        current = os.path.abspath(root_path)
+        candidate: str | None = None
+        while True:
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+
+            matched = False
+            parent_pom = os.path.join(parent, "pom.xml")
+            if os.path.isfile(parent_pom):
+                try:
+                    with open(parent_pom, "rb") as f:
+                        content = f.read().decode("utf-8", errors="replace")
+                    if "<modules>" in content:
+                        for module in re.findall(r"<module>(.*?)</module>", content):
+                            module_path = os.path.abspath(os.path.join(parent, module.strip()))
+                            if os.path.realpath(module_path) == os.path.realpath(current):
+                                candidate = parent
+                                current = parent
+                                matched = True
+                                break
+                except OSError:
+                    pass
+            if matched:
+                continue
+
+            for settings_name in ("settings.gradle", "settings.gradle.kts"):
+                settings_path = os.path.join(parent, settings_name)
+                if not os.path.isfile(settings_path):
+                    continue
+                try:
+                    with open(settings_path, "rb") as f:
+                        content = f.read().decode("utf-8", errors="replace")
+                    child_name = os.path.basename(current)
+                    if f":{child_name}" in content or child_name in content:
+                        candidate = parent
+                        current = parent
+                        matched = True
+                        break
+                except OSError:
+                    pass
+            if matched:
+                continue
+            current = parent
+
+        return os.path.abspath(candidate) if candidate else None
+
+    @staticmethod
     def detect_projects_in_workspace(root_path: str) -> list[str]:
         """Detect independent projects under a workspace folder (e.g. ~/IdeaProjects/).
 
@@ -106,6 +164,7 @@ class JavaIndexer:
         Returns a list of project root directories (absolute paths).
         """
         root_path = os.path.abspath(root_path)
+        root_path = JavaIndexer.detect_enclosing_multi_module_root(root_path) or root_path
         build_markers = {
             "pom.xml", "build.gradle", "build.gradle.kts",
             "settings.gradle", "settings.gradle.kts",
@@ -208,7 +267,11 @@ class JavaIndexer:
             except Exception:
                 pass
             if project_id is None:
-                project_id = os.path.basename(root_path)
+                reactor_root = JavaIndexer.detect_enclosing_multi_module_root(root_path)
+                if reactor_root and os.path.realpath(reactor_root) != os.path.realpath(root_path):
+                    project_id = f"{os.path.basename(reactor_root)}::{os.path.basename(root_path)}"
+                else:
+                    project_id = os.path.basename(root_path)
         current_files = self._collect_java_files(root_path)
         self._emit(progress, "scan_done", files_found=len(current_files))
         db_files = self.store.project_file_hashes(project_id) if not full else {}

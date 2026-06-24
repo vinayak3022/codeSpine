@@ -55,6 +55,10 @@ class Settings:
     # (0 = unlimited, default 12 ≈ ~10 minutes at 1-2-4-…-30s backoff window).
     supervisor_max_restarts: int = 12
 
+    # Background MCP daemon transport / bind address.
+    mcp_http_host: str = "127.0.0.1"
+    mcp_http_port: int = 8766
+
     # Whether to attempt automatic DB repair on corruption at startup.
     auto_repair_on_startup: bool = True
 

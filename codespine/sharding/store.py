@@ -127,10 +127,13 @@ class ShardedGraphStore:
                 db_path = self.router.db_path(idx)
                 snap_path = self.router.snapshot_path(idx)
 
-                # In read-only mode, skip shards whose DB hasn't been created
-                # yet — Kuzu refuses to create an empty DB under read_only=True.
+                # Kùzu cannot open a missing DB in read-only mode, but DuckDB
+                # can safely fall back to an in-memory empty view.  Returning
+                # None here for DuckDB breaks read-only startup because callers
+                # such as overlay_store then resolve to None and later crash.
                 if self.read_only and not os.path.exists(db_path) and not os.path.exists(snap_path):
-                    return None
+                    if self.backend != "duckdb":
+                        return None
 
                 # Ensure parent directory exists before opening the DB.
                 os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -356,7 +359,11 @@ class ShardedGraphStore:
     @property
     def overlay_store(self):
         """Expose the overlay store from shard 0 for backward compat."""
-        return self._get_shard(0).overlay_store
+        shard0 = self._get_shard(0)
+        if shard0 is not None and hasattr(shard0, "overlay_store"):
+            return shard0.overlay_store
+        from codespine.overlay.store import OverlayStore
+        return OverlayStore()
 
     @staticmethod
     def stable_id(*parts: str) -> str:
