@@ -374,12 +374,9 @@ def _cleanup_duplicate_projects(store: ShardedGraphStore) -> int:
                 continue
             LOGGER.info("Removing duplicate project entry '%s' (keeping '%s')", dup_id, survivor)
             try:
-                store.query_records(
-                    "MATCH (p:Project) WHERE p.id = $pid DELETE p",
-                    {"pid": dup_id},
-                )
-            except Exception:
-                pass
+                store.clear_project(dup_id)
+            except Exception as exc:
+                LOGGER.warning("Failed to clear duplicate project %s: %s", dup_id, exc)
             try:
                 delete_project_state(dup_id)
             except Exception:

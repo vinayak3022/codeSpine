@@ -781,6 +781,18 @@ class JavaIndexer:
             elapsed=time.perf_counter() - _db_start,
         )
 
+        parsed_ok = sum(1 for pr in parse_results if pr.get("parsed") is not None)
+        if current_files and parsed_ok > 0 and classes_indexed == 0 and methods_indexed == 0:
+            raise RuntimeError(
+                "Indexing produced zero classes/methods from parsed Java files. "
+                "Check parser compatibility or inspect logged parse results."
+            )
+        if current_files and parsed_ok == 0:
+            raise RuntimeError(
+                "Indexing produced zero parsed Java files. "
+                "Files may be timing out, oversized, or unparsable in this environment."
+            )
+
         def _deadline_expired() -> bool:
             return budget_exhausted or (deadline is not None and time.perf_counter() >= deadline)
 

@@ -75,3 +75,68 @@ def test_find_symbol_handles_missing_overlay_store_without_none_regression() -> 
         assert payload["by_project"]["app"]["classes"][0]["name"] == "TransactionService"
 
     asyncio.run(_run())
+
+
+def test_cleanup_duplicate_projects_uses_clear_project_not_cypher_delete(monkeypatch):
+    import codespine.cli as cli
+
+    class _Overlay:
+        def clear_project(self, project_id):
+            cleared.append(("overlay", project_id))
+
+    class _Store:
+        overlay_store = _Overlay()
+
+        def query_records(self, query, params=None):
+            if "count(f)" in query:
+                return [{"c": 1 if params and params.get("pid") == "keep" else 0}]
+            raise AssertionError(f"unexpected query: {query}")
+
+        def clear_project(self, project_id):
+            cleared.append(("store", project_id))
+
+        def snapshot_to_read_replica(self):
+            cleared.append(("snapshot", None))
+
+    cleared = []
+    monkeypatch.setattr(
+        cli,
+        "list_project_states",
+        lambda: [
+            {"project_id": "keep", "path": "/repo/app"},
+            {"project_id": "dup", "path": "/repo/app"},
+        ],
+    )
+    monkeypatch.setattr("codespine.project_state.delete_project_state", lambda pid: cleared.append(("state", pid)))
+
+    removed = cli._cleanup_duplicate_projects(_Store())
+
+    assert removed == 1
+    assert ("store", "dup") in cleared
+    assert ("state", "dup") in cleared
+    assert ("overlay", "dup") in cleared
+    assert ("snapshot", None) in cleared
+
+
+def test_index_project_raises_when_no_symbols_extracted_from_parsed_files(monkeypatch, tmp_path):
+    import pytest
+    from codespine.db.duckdb_store import DuckDBStore
+    from codespine.indexer.engine import JavaIndexer
+
+    root = tmp_path / "app"
+    root.mkdir()
+    java_file = root / "App.java"
+    java_file.write_text("class App {}\n", encoding="utf-8")
+
+    class _Parsed:
+        package = ""
+        imports = []
+        classes = []
+
+    monkeypatch.setattr("codespine.indexer.engine.parse_java_source", lambda _src: _Parsed())
+
+    store = DuckDBStore(read_only=False, db_path_override=str(tmp_path / "db"), snapshot_path_override=str(tmp_path / "db_read"))
+    indexer = JavaIndexer(store)
+
+    with pytest.raises(RuntimeError, match="zero classes/methods"):
+        indexer.index_project(str(root), full=True, embed=False)
