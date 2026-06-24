@@ -1,6 +1,6 @@
 # CodeSpine
 
-**v1.0.15** — Local Java code intelligence for coding agents, backed by a graph database.
+**v1.2.9** — Local Java code intelligence for coding agents, backed by a graph database.
 
 CodeSpine cuts token burn for coding agents working on Java codebases.
 
@@ -30,7 +30,15 @@ File changes are written directly to the graph and are immediately queryable —
 pip install codespine
 ```
 
-Default install includes the CLI, MCP server, Java indexer, watch mode, health checks, background task tracking, and graph/search commands.
+Default install includes:
+- CLI
+- Java indexer
+- MCP server
+- background daemon supervisor
+- browser UI (`codespine ui`)
+- watch mode
+- health / status / repair commands
+- hybrid search + graph analysis tools
 
 Optional semantic search (sentence-transformers):
 
@@ -38,20 +46,14 @@ Optional semantic search (sentence-transformers):
 pip install "codespine[ml]"
 ```
 
-Add the local index explorer UI:
+Optional extras remain available for compatibility:
 
 ```bash
-pip install "codespine[ui]"
+pip install "codespine[ui]"    # no-op compatibility extra
+pip install "codespine[full]"  # all extras
 ```
 
-The current lite UI is dependency-free and served locally by CodeSpine; the `ui` extra is the stable add-on install target for the browser explorer.
-Quotes are required in zsh: use `pip install "codespine[ui]"`, not `pip install codespine[ui]`.
-
-Everything at once (ml + community detection):
-
-```bash
-pip install "codespine[full]"
-```
+Quotes are required in zsh.
 
 ### One-time model download (for semantic search)
 
@@ -69,14 +71,21 @@ Downloads and caches the embedding model. Only needed once. After this, `--embed
 # 1. Index a project
 codespine analyse /path/to/java-project
 
-# 2. (Optional) Run the expensive deep passes: communities, flows, dead code, coupling
+# 2. (Optional) Run deep analysis in the foreground
 codespine analyse /path/to/java-project --complete --deep
 
 # 3. (Optional) Add semantic embeddings for concept-level search
 codespine analyse /path/to/java-project --embed
 
-# 4. Start MCP server (foreground; your IDE manages the process)
+# 4. IDE / MCP foreground mode (stdio)
 codespine mcp
+
+# 5. Background local daemon mode
+codespine start
+codespine status
+
+# 6. Browser UI
+codespine ui --open
 ```
 
 Typical output:
@@ -103,6 +112,38 @@ Publishing read replica...     MCP will reload automatically
 ```
 
 Each analysis phase streams live progress. The final step publishes a read replica so the MCP daemon picks up the new index without restarting.
+
+
+## Local Daemon and UI
+
+CodeSpine supports two MCP execution modes:
+
+### Foreground MCP (for IDEs / MCP clients)
+```bash
+codespine mcp
+```
+This uses **stdio** and is the right mode for Claude Desktop / local MCP client integration.
+
+### Background daemon (for local service mode)
+```bash
+codespine start
+codespine status
+codespine stop
+```
+This uses a supervised background MCP process and auto-restart logic.
+
+### Browser UI
+```bash
+codespine ui --open
+```
+The built-in UI is dependency-free and now includes:
+- **Dashboard** — health, stats, recent tasks
+- **Projects** — searchable/sortable project inventory with repair actions
+- **Search** — hybrid symbol / semantic search
+- **Analysis** — impact, dead code, communities
+- **Ask AI** — GraphRAG-style Q&A
+- **Diff** — branch comparison
+- **Settings** — theme + environment info
 
 ---
 
@@ -251,11 +292,21 @@ For a production benchmark on real codebases, run the same workflow on a medium 
 
 ## MCP Configuration
 
-Foreground server:
+### Foreground MCP server (recommended for IDE clients)
 
 ```bash
 codespine mcp
 ```
+
+### Background MCP daemon
+
+```bash
+codespine start
+codespine status
+codespine stop
+```
+
+The background daemon is for local service workflows; IDE MCP clients should still use `codespine mcp`.
 
 Minimal `mcp.json` / Claude Desktop config:
 
