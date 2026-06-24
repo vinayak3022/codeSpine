@@ -502,23 +502,32 @@ class DuckDBStore:
     # ------------------------------------------------------------------
 
     def upsert_project(self, project_id: str, path: str) -> None:
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO projects (id, path, language, indexed_at, indexed_commit, overlay_dirty)
-            VALUES (?, ?, 'java', ?, '', false)
-            """,
-            [project_id, path, str(int(time.time()))],
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                """
+                INSERT OR REPLACE INTO projects (id, path, language, indexed_at, indexed_commit, overlay_dirty)
+                VALUES (?, ?, 'java', ?, '', false)
+                """,
+                [project_id, path, str(int(time.time()))],
+            ),
+            op_name="upsert_project",
         )
 
     def set_project_overlay_dirty(self, project_id: str, dirty: bool) -> None:
-        self._conn.execute(
-            "UPDATE projects SET overlay_dirty=? WHERE id=?", [bool(dirty), project_id]
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                "UPDATE projects SET overlay_dirty=? WHERE id=?", [bool(dirty), project_id]
+            ),
+            op_name="set_project_overlay_dirty",
         )
 
     def set_project_indexed_commit(self, project_id: str, commit: str) -> None:
-        self._conn.execute(
-            "UPDATE projects SET indexed_commit=?, indexed_at=? WHERE id=?",
-            [commit, str(int(time.time())), project_id],
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                "UPDATE projects SET indexed_commit=?, indexed_at=? WHERE id=?",
+                [commit, str(int(time.time())), project_id],
+            ),
+            op_name="set_project_indexed_commit",
         )
 
     def get_project_metadata(self, project_id: str) -> dict[str, Any] | None:
@@ -553,38 +562,50 @@ class DuckDBStore:
 
     def clear_project(self, project_id: str) -> None:
         with self.transaction():
-            self._conn.execute(
-                """
-                DELETE FROM symbols WHERE file_id IN (SELECT id FROM files WHERE project_id=?)
-                """,
-                [project_id],
+            self._with_lock_retry(
+                lambda: self._conn.execute(
+                    """
+                    DELETE FROM symbols WHERE file_id IN (SELECT id FROM files WHERE project_id=?)
+                    """,
+                    [project_id],
+                ),
+                op_name="clear_project_symbols",
             )
-            self._conn.execute(
-                """
-                DELETE FROM calls WHERE source_id IN (
-                    SELECT m.id FROM methods m
-                    JOIN classes c ON m.class_id = c.id
-                    JOIN files f ON c.file_id = f.id
-                    WHERE f.project_id = ?
-                )
-                """,
-                [project_id],
+            self._with_lock_retry(
+                lambda: self._conn.execute(
+                    """
+                    DELETE FROM calls WHERE source_id IN (
+                        SELECT m.id FROM methods m
+                        JOIN classes c ON m.class_id = c.id
+                        JOIN files f ON c.file_id = f.id
+                        WHERE f.project_id = ?
+                    )
+                    """,
+                    [project_id],
+                ),
+                op_name="clear_project_calls",
             )
-            self._conn.execute(
-                """
-                DELETE FROM methods WHERE class_id IN (
-                    SELECT c.id FROM classes c
-                    JOIN files f ON c.file_id = f.id WHERE f.project_id = ?
-                )
-                """,
-                [project_id],
+            self._with_lock_retry(
+                lambda: self._conn.execute(
+                    """
+                    DELETE FROM methods WHERE class_id IN (
+                        SELECT c.id FROM classes c
+                        JOIN files f ON c.file_id = f.id WHERE f.project_id = ?
+                    )
+                    """,
+                    [project_id],
+                ),
+                op_name="clear_project_methods",
             )
-            self._conn.execute(
-                "DELETE FROM classes WHERE file_id IN (SELECT id FROM files WHERE project_id=?)",
-                [project_id],
+            self._with_lock_retry(
+                lambda: self._conn.execute(
+                    "DELETE FROM classes WHERE file_id IN (SELECT id FROM files WHERE project_id=?)",
+                    [project_id],
+                ),
+                op_name="clear_project_classes",
             )
-            self._conn.execute("DELETE FROM files WHERE project_id=?", [project_id])
-            self._conn.execute("DELETE FROM projects WHERE id=?", [project_id])
+            self._with_lock_retry(lambda: self._conn.execute("DELETE FROM files WHERE project_id=?", [project_id]), op_name="clear_project_files")
+            self._with_lock_retry(lambda: self._conn.execute("DELETE FROM projects WHERE id=?", [project_id]), op_name="clear_project_project")
 
     # ------------------------------------------------------------------
     # File operations
@@ -598,15 +619,18 @@ class DuckDBStore:
             return
         # Use IN with unnest for bulk delete.
         ph = ", ".join("?" * len(file_ids))
-        self._conn.execute(f"DELETE FROM symbols WHERE file_id IN ({ph})", file_ids)
+        self._with_lock_retry(lambda: self._conn.execute(f"DELETE FROM symbols WHERE file_id IN ({ph})", file_ids), op_name="clear_files_symbols")
         # Methods: go via classes
-        self._conn.execute(
-            f"DELETE FROM methods WHERE class_id IN "
-            f"(SELECT id FROM classes WHERE file_id IN ({ph}))",
-            file_ids,
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                f"DELETE FROM methods WHERE class_id IN "
+                f"(SELECT id FROM classes WHERE file_id IN ({ph}))",
+                file_ids,
+            ),
+            op_name="clear_files_methods",
         )
-        self._conn.execute(f"DELETE FROM classes WHERE file_id IN ({ph})", file_ids)
-        self._conn.execute(f"DELETE FROM files WHERE id IN ({ph})", file_ids)
+        self._with_lock_retry(lambda: self._conn.execute(f"DELETE FROM classes WHERE file_id IN ({ph})", file_ids), op_name="clear_files_classes")
+        self._with_lock_retry(lambda: self._conn.execute(f"DELETE FROM files WHERE id IN ({ph})", file_ids), op_name="clear_files_files")
 
     def upsert_files_batch(self, records: list[dict[str, Any]], create_mode: bool = False) -> None:
         if not records:
@@ -767,15 +791,15 @@ class DuckDBStore:
     # ------------------------------------------------------------------
 
     def clear_communities(self) -> None:
-        self._conn.execute("DELETE FROM community_members")
-        self._conn.execute("DELETE FROM communities")
+        self._with_lock_retry(lambda: self._conn.execute("DELETE FROM community_members"), op_name="clear_community_members")
+        self._with_lock_retry(lambda: self._conn.execute("DELETE FROM communities"), op_name="clear_communities")
 
     def clear_flows(self) -> None:
-        self._conn.execute("DELETE FROM flow_members")
-        self._conn.execute("DELETE FROM flows")
+        self._with_lock_retry(lambda: self._conn.execute("DELETE FROM flow_members"), op_name="clear_flow_members")
+        self._with_lock_retry(lambda: self._conn.execute("DELETE FROM flows"), op_name="clear_flows")
 
     def clear_coupling(self) -> None:
-        self._conn.execute("DELETE FROM co_changed_with")
+        self._with_lock_retry(lambda: self._conn.execute("DELETE FROM co_changed_with"), op_name="clear_coupling")
 
     def clear_analysis_artifacts(self) -> None:
         self.clear_communities()
@@ -783,9 +807,12 @@ class DuckDBStore:
         self.clear_coupling()
 
     def set_community(self, community_id: str, label: str, cohesion: float, symbol_ids: list[str]) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO communities (id, label, cohesion) VALUES (?, ?, ?)",
-            [community_id, label, float(cohesion)],
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                "INSERT OR REPLACE INTO communities (id, label, cohesion) VALUES (?, ?, ?)",
+                [community_id, label, float(cohesion)],
+            ),
+            op_name="set_community",
         )
         if symbol_ids:
             rows = [[sid, community_id] for sid in symbol_ids]
@@ -795,9 +822,12 @@ class DuckDBStore:
             )
 
     def set_flow(self, flow_id: str, entry_symbol_id: str, kind: str, symbols_at_depth: list[tuple[str, int]]) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO flows (id, entry_symbol_id, kind) VALUES (?, ?, ?)",
-            [flow_id, entry_symbol_id, kind],
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                "INSERT OR REPLACE INTO flows (id, entry_symbol_id, kind) VALUES (?, ?, ?)",
+                [flow_id, entry_symbol_id, kind],
+            ),
+            op_name="set_flow",
         )
         if symbols_at_depth:
             rows = [[sid, flow_id, int(depth)] for sid, depth in symbols_at_depth]
@@ -807,9 +837,12 @@ class DuckDBStore:
             )
 
     def upsert_coupling(self, file_a: str, file_b: str, strength: float, cochanges: int, days: int) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO co_changed_with (file_a, file_b, strength, cochanges, days) VALUES (?, ?, ?, ?, ?)",
-            [file_a, file_b, float(strength), int(cochanges), int(days)],
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                "INSERT OR REPLACE INTO co_changed_with (file_a, file_b, strength, cochanges, days) VALUES (?, ?, ?, ?, ?)",
+                [file_a, file_b, float(strength), int(cochanges), int(days)],
+            ),
+            op_name="upsert_coupling",
         )
 
     # ------------------------------------------------------------------

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -99,6 +100,15 @@ def _safe_remove_pid_file() -> None:
             os.remove(SETTINGS.pid_file)
     except OSError:
         pass
+
+
+def _port_is_in_use(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex((host, port)) == 0
+    except OSError:
+        return False
 
 
 def _is_codespine_process(proc: psutil.Process, expected_subcommand: str | None = None) -> bool:
@@ -351,32 +361,61 @@ def _cleanup_duplicate_projects(store: ShardedGraphStore) -> int:
             "Found %d project entries for path %s — cleaning up duplicates",
             len(entries), canon,
         )
-        # Sort by number of indexed files (descending) so the fullest entry survives.
-        def _count_files(state: dict) -> int:
+        def _canonical_project_id_for_path(path_str: str) -> str:
+            abs_p = os.path.abspath(path_str)
+            reactor_root = JavaIndexer.detect_enclosing_multi_module_root(abs_p)
+            if reactor_root and os.path.realpath(reactor_root) != os.path.realpath(abs_p):
+                return f"{os.path.basename(reactor_root)}::{os.path.basename(abs_p)}"
+            return os.path.basename(abs_p)
+
+        canonical_id = _canonical_project_id_for_path(canon)
+
+        # Prefer the richest, healthiest, and most canonical entry.
+        def _survivor_score(state: dict) -> tuple[int, int, int, int, int, int]:
             try:
                 pid = state.get("project_id", "")
                 if not pid:
-                    return 0
-                rows = store.query_records(
+                    return (0, 0, 0, 0, 0, 0)
+                files_rows = store.query_records(
                     "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as c",
                     {"pid": pid},
                 )
-                return int(rows[0].get("c", 0)) if rows else 0
+                methods_rows = store.query_records(
+                    "MATCH (m:Method), (c:Class), (f:File) WHERE m.class_id = c.id AND c.file_id = f.id AND f.project_id = $pid RETURN count(m) as c",
+                    {"pid": pid},
+                )
+                symbols_rows = store.query_records(
+                    "MATCH (s:Symbol), (f:File) WHERE s.file_id = f.id AND f.project_id = $pid RETURN count(s) as c",
+                    {"pid": pid},
+                )
+                snap = snapshot_info(pid, store.router if hasattr(store, 'router') else None)
+                return (
+                    int(files_rows[0].get("c", 0)) if files_rows else 0,
+                    int(methods_rows[0].get("c", 0)) if methods_rows else 0,
+                    int(symbols_rows[0].get("c", 0)) if symbols_rows else 0,
+                    1 if snap.get("snapshot_valid") else 0,
+                    1 if snap.get("write_db_valid") else 0,
+                    1 if pid == canonical_id else 0,
+                )
             except Exception:
-                return 0
+                return (0, 0, 0, 0, 0, 0)
 
-        entries.sort(key=_count_files, reverse=True)
-        # Keep first (richest) entry, delete the rest.
+        entries.sort(key=_survivor_score, reverse=True)
+        # Keep first (richest / healthiest / canonical) entry, delete the rest.
         survivor = entries[0]["project_id"]
         for dup in entries[1:]:
             dup_id = dup["project_id"]
             if dup_id == survivor:
                 continue
             LOGGER.info("Removing duplicate project entry '%s' (keeping '%s')", dup_id, survivor)
+            cleared_ok = False
             try:
                 store.clear_project(dup_id)
+                cleared_ok = True
             except Exception as exc:
                 LOGGER.warning("Failed to clear duplicate project %s: %s", dup_id, exc)
+            if not cleared_ok:
+                continue
             try:
                 delete_project_state(dup_id)
             except Exception:
@@ -593,6 +632,27 @@ def _db_size_bytes(path: str) -> int:
             except OSError:
                 pass
     return total
+
+
+def _shard_storage_bytes(kind: str = "db") -> int:
+    router = ShardRouter()
+    total = 0
+    for idx in router.all_shards():
+        if kind == "db":
+            total += _db_size_bytes(router.db_path(idx))
+        elif kind == "db_read":
+            total += _db_size_bytes(router.snapshot_path(idx))
+    return total
+
+
+def _shard_storage_paths(kind: str = "db") -> list[str]:
+    router = ShardRouter()
+    out: list[str] = []
+    for idx in router.all_shards():
+        p = router.db_path(idx) if kind == "db" else router.snapshot_path(idx)
+        if os.path.exists(p):
+            out.append(p)
+    return out
 
 
 def _format_elapsed(seconds: float | None) -> str:
@@ -2532,17 +2592,21 @@ def status(as_json: bool) -> None:
 
     # Check for stale PID file
     stale_pid = pid is not None and not running
-    has_snapshot = os.path.exists(SETTINGS.db_snapshot_path)
+    db_paths = _shard_storage_paths("db")
+    read_paths = _shard_storage_paths("db_read")
+    has_snapshot = bool(read_paths)
 
     payload = {
         "running": running,
         "pid": pid,
         "stale_pid": stale_pid,
         "pid_file": SETTINGS.pid_file,
-        "db_path": SETTINGS.db_path,
-        "db_size_bytes": _db_size_bytes(SETTINGS.db_path),
-        "read_replica": SETTINGS.db_snapshot_path if has_snapshot else None,
-        "read_replica_size_bytes": _db_size_bytes(SETTINGS.db_snapshot_path) if has_snapshot else 0,
+        "db_path": SETTINGS.shards_dir,
+        "db_paths": db_paths,
+        "db_size_bytes": _shard_storage_bytes("db"),
+        "read_replica": SETTINGS.shards_dir if has_snapshot else None,
+        "read_replica_paths": read_paths,
+        "read_replica_size_bytes": _shard_storage_bytes("db_read") if has_snapshot else 0,
         "log_file": SETTINGS.log_file,
         "overlay_dir": SETTINGS.overlay_dir,
         "overlay_projects": overlay,
@@ -2641,7 +2705,15 @@ def clean(force: bool) -> None:
     if not force and not click.confirm("Remove local CodeSpine DB, PID, and logs?"):
         click.echo("Aborted.")
         return
-    for path in [SETTINGS.pid_file, SETTINGS.log_file, SETTINGS.db_path, SETTINGS.overlay_dir]:
+    for path in [
+        SETTINGS.pid_file,
+        SETTINGS.log_file,
+        SETTINGS.db_path,
+        SETTINGS.db_snapshot_path,
+        SETTINGS.shards_dir,
+        SETTINGS.overlay_dir,
+        SETTINGS.index_meta_dir,
+    ]:
         if not os.path.exists(path):
             continue
         if os.path.isdir(path):
@@ -2832,6 +2904,14 @@ def start() -> None:
             f"Cleaned up stale CodeSpine processes: {len(set(orphaned + zombie_watchers))}",
             fg="yellow",
         )
+
+    if _port_is_in_use(SETTINGS.mcp_http_host, SETTINGS.mcp_http_port):
+        click.secho(
+            f"CodeSpine MCP port {SETTINGS.mcp_http_host}:{SETTINGS.mcp_http_port} is already in use. "
+            "Stop the conflicting process or change the configured MCP daemon port.",
+            fg="red",
+        )
+        return
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "codespine.cli", "supervise-mcp"],

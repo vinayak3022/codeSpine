@@ -517,3 +517,39 @@ def test_sharded_store_stats_flow_with_stale_kuzu_dirs(tmp_path: Path):
     sg = ShardedGraphStore(read_only=True, shards_dir=str(shards_dir), backend="duckdb")
     # This is what `codespine stats` does — it must not raise.
     assert sg.list_project_metadata() == []
+
+
+
+def test_project_and_analysis_writes_use_lock_retry(tmp_path: Path, monkeypatch):
+    s = _store(tmp_path)
+    calls: list[str] = []
+    original = s._with_lock_retry
+
+    def _wrapped(fn, *, op_name: str):
+        calls.append(op_name)
+        return original(fn, op_name=op_name)
+
+    monkeypatch.setattr(s, '_with_lock_retry', _wrapped)
+
+    s.upsert_project('p', '/p')
+    s.set_project_overlay_dirty('p', True)
+    s.set_project_indexed_commit('p', 'abc123')
+    s.clear_communities()
+    s.clear_flows()
+    s.clear_coupling()
+    s.set_community('comm', 'x', 0.5, [])
+    s.set_flow('flow', 'entry', 'downstream', [])
+    s.upsert_coupling('a', 'b', 0.4, 2, 7)
+    s.clear_files_batch([])
+    s.clear_project('p')
+
+    assert 'upsert_project' in calls
+    assert 'set_project_overlay_dirty' in calls
+    assert 'set_project_indexed_commit' in calls
+    assert 'clear_community_members' in calls
+    assert 'clear_flow_members' in calls
+    assert 'clear_coupling' in calls
+    assert 'set_community' in calls
+    assert 'set_flow' in calls
+    assert 'upsert_coupling' in calls
+    assert 'clear_project_project' in calls

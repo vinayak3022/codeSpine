@@ -118,18 +118,17 @@ def test_cleanup_duplicate_projects_uses_clear_project_not_cypher_delete(monkeyp
     assert ("snapshot", None) in cleared
 
 
-def test_index_project_raises_when_no_symbols_extracted_from_parsed_files(monkeypatch, tmp_path):
-    import pytest
+def test_index_project_allows_valid_java_files_with_no_classes(monkeypatch, tmp_path):
     from codespine.db.duckdb_store import DuckDBStore
     from codespine.indexer.engine import JavaIndexer
 
     root = tmp_path / "app"
     root.mkdir()
-    java_file = root / "App.java"
-    java_file.write_text("class App {}\n", encoding="utf-8")
+    java_file = root / "package-info.java"
+    java_file.write_text("@Deprecated\npackage example;\n", encoding="utf-8")
 
     class _Parsed:
-        package = ""
+        package = "example"
         imports = []
         classes = []
 
@@ -138,5 +137,112 @@ def test_index_project_raises_when_no_symbols_extracted_from_parsed_files(monkey
     store = DuckDBStore(read_only=False, db_path_override=str(tmp_path / "db"), snapshot_path_override=str(tmp_path / "db_read"))
     indexer = JavaIndexer(store)
 
-    with pytest.raises(RuntimeError, match="zero classes/methods"):
-        indexer.index_project(str(root), full=True, embed=False)
+    result = indexer.index_project(str(root), full=True, embed=False)
+    assert result.files_found == 1
+    assert result.classes_indexed == 0
+    assert result.methods_indexed == 0
+
+
+
+def test_status_reports_sharded_storage(monkeypatch):
+    import json as _json
+    import types
+    from click.testing import CliRunner
+    import codespine.cli as cli
+
+    monkeypatch.setattr(cli, '_is_running', lambda: True)
+    monkeypatch.setattr(cli, '_open_store', lambda read_only=True: object())
+    monkeypatch.setattr(cli, 'get_overlay_status', lambda store: [])
+    monkeypatch.setattr(cli, 'active_tasks', lambda limit=10: [])
+    monkeypatch.setattr(cli, '_project_summaries', lambda: [])
+    monkeypatch.setattr(cli, '_read_runtime_state', lambda: {})
+    monkeypatch.setattr(cli, 'index_health', lambda store: {'summary': {}})
+    monkeypatch.setattr(cli, '_count_codespine_processes', lambda _: 0)
+    monkeypatch.setattr(cli, '_shard_storage_paths', lambda kind='db': ['/tmp/shards/0/db'] if kind == 'db' else ['/tmp/shards/0/db_read'])
+    monkeypatch.setattr(cli, '_shard_storage_bytes', lambda kind='db': 123 if kind == 'db' else 45)
+    monkeypatch.setattr(cli, 'SETTINGS', types.SimpleNamespace(
+        pid_file='/tmp/pid', log_file='/tmp/log', shards_dir='/tmp/shards', overlay_dir='/tmp/overlay',
+        mcp_http_host='127.0.0.1', mcp_http_port=8766,
+    ))
+
+    result = CliRunner().invoke(cli.main, ['status', '--json'])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload['db_path'] == '/tmp/shards'
+    assert payload['db_paths'] == ['/tmp/shards/0/db']
+    assert payload['db_size_bytes'] == 123
+    assert payload['read_replica'] == '/tmp/shards'
+    assert payload['read_replica_paths'] == ['/tmp/shards/0/db_read']
+    assert payload['read_replica_size_bytes'] == 45
+
+
+
+def test_clean_removes_shards_dir(monkeypatch, tmp_path):
+    import types
+    from click.testing import CliRunner
+    import codespine.cli as cli
+
+    shards = tmp_path / 'shards'
+    shards.mkdir()
+    (shards / '0').mkdir()
+    (shards / '0' / 'db').write_text('x', encoding='utf-8')
+    snap = tmp_path / 'db_read'
+    snap.write_text('x', encoding='utf-8')
+    overlay = tmp_path / 'overlay'
+    overlay.mkdir()
+
+    monkeypatch.setattr(cli, 'SETTINGS', types.SimpleNamespace(
+        pid_file=str(tmp_path / 'pid'),
+        log_file=str(tmp_path / 'log'),
+        db_path=str(tmp_path / 'legacy_db'),
+        db_snapshot_path=str(snap),
+        shards_dir=str(shards),
+        overlay_dir=str(overlay),
+        index_meta_dir=str(tmp_path / 'meta'),
+    ))
+
+    result = CliRunner().invoke(cli.main, ['clean', '--force'])
+    assert result.exit_code == 0
+    assert not shards.exists()
+    assert not snap.exists()
+    assert not overlay.exists()
+
+
+
+def test_plan_incremental_forces_reindex_when_db_empty_but_meta_cache_present(tmp_path):
+    from codespine.indexer.engine import JavaIndexer
+
+    root = tmp_path / 'app'
+    root.mkdir()
+    f = root / 'A.java'
+    f.write_text('class A {}\n', encoding='utf-8')
+
+    class _Store:
+        pass
+
+    indexer = JavaIndexer(_Store())
+    to_reindex, deleted, meta = indexer._plan_incremental(
+        'app',
+        str(root),
+        [str(f)],
+        {},
+        {'stale': {'mtime_ns': 1, 'size': 1, 'hash': 'abc'}},
+    )
+    assert to_reindex == [str(f)]
+    assert deleted == []
+    assert meta == {}
+
+
+
+def test_start_fails_cleanly_when_mcp_port_in_use(monkeypatch):
+    from click.testing import CliRunner
+    import codespine.cli as cli
+
+    monkeypatch.setattr(cli, '_is_running', lambda: False)
+    monkeypatch.setattr(cli, '_cleanup_orphan_codespine_processes', lambda *args: [])
+    monkeypatch.setattr(cli, '_safe_remove_pid_file', lambda: None)
+    monkeypatch.setattr(cli, '_port_is_in_use', lambda host, port: True)
+
+    result = CliRunner().invoke(cli.main, ['start'])
+    assert result.exit_code == 0
+    assert 'already in use' in result.output

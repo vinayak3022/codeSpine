@@ -782,15 +782,20 @@ class JavaIndexer:
         )
 
         parsed_ok = sum(1 for pr in parse_results if pr.get("parsed") is not None)
-        if current_files and parsed_ok > 0 and classes_indexed == 0 and methods_indexed == 0:
-            raise RuntimeError(
-                "Indexing produced zero classes/methods from parsed Java files. "
-                "Check parser compatibility or inspect logged parse results."
-            )
+        parsed_with_classes = sum(
+            1
+            for pr in parse_results
+            if pr.get("parsed") is not None and getattr(pr.get("parsed"), "classes", None)
+        )
         if current_files and parsed_ok == 0:
             raise RuntimeError(
                 "Indexing produced zero parsed Java files. "
                 "Files may be timing out, oversized, or unparsable in this environment."
+            )
+        if current_files and parsed_with_classes > 0 and classes_indexed == 0 and methods_indexed == 0:
+            raise RuntimeError(
+                "Indexing produced zero classes/methods from parsed Java files. "
+                "Check parser compatibility or inspect logged parse results."
             )
 
         def _deadline_expired() -> bool:
@@ -993,6 +998,10 @@ class JavaIndexer:
             file_id(project_id, os.path.relpath(fp, root_path))
             for fp in files
         }
+        # If the DB looks empty but a stale meta-cache exists, force a rebuild of
+        # every current file instead of trusting cached file metadata.
+        if files and not db_files and meta_cache:
+            return list(files), [], {}
         deleted_file_ids = [fid for fid in db_files if fid not in current_ids]
         to_reindex: list[str] = []
 
