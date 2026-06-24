@@ -79,20 +79,24 @@ class ShardedGraphStore:
 
         In write mode this always returns a valid store (creating the DB if
         needed).  In read-only mode, if the shard DB has never been written to,
-        this also creates it (returning an empty-but-valid store) so that
-        callers can safely query it without crashing.
+        this returns an in-memory read-only store so callers can safely query
+        without crashing — **never** falling back to a writable connection
+        that could cause DuckDB lock contention with a concurrent writer.
         """
         idx = self.router.shard_for(project_id)
         store = self._get_shard(idx)
         if store is None:
-            # Fallback: create an empty writable DB so callers never crash.
+            # Read-only + no DB on disk → in-memory empty store, NOT a write
+            # connection.  Opening a writable DB just to serve empty results
+            # causes DuckDB lock contention with concurrent ``codespine
+            # analyse`` processes.
             with self._lock:
                 if idx not in self._pool:
                     db_path = self.router.db_path(idx)
                     snap_path = self.router.snapshot_path(idx)
                     os.makedirs(os.path.dirname(db_path), exist_ok=True)
                     self._pool[idx] = self._open_store(
-                        read_only=False,  # create empty DB
+                        read_only=True,  # never fall back to write mode!
                         db_path=db_path,
                         snap_path=snap_path,
                     )

@@ -478,11 +478,13 @@ def hybrid_search(
                 if snippet:
                     item["snippet"] = snippet
 
-    # FR-10: Calibrate confidence labels based on name matching, not just score.
-    # Exact name match → "high"; partial match → "medium"; no match → "low".
+    # FR-10: Calibrate confidence labels based on name matching + RRF score.
+    # Exact name match → "high"; high RRF score (>0.3) → "medium"; else → "low".
     # This prevents exact-match results being incorrectly labelled "low_confidence"
-    # when the embedding model is not installed.
+    # when the embedding model is not installed, and also gives meaningful confidence
+    # to semantic-only matches (free-form queries like "state machine implementations").
     has_exact_match = False
+    _has_high_score = False
     for item in top_k:
         if not isinstance(item, dict) or "score" not in item:
             continue
@@ -493,14 +495,19 @@ def hybrid_search(
             has_exact_match = True
         elif query_lower in item_name or query_lower in item_fqname:
             item["confidence"] = "medium"
+            _has_high_score = True
+        elif isinstance(item.get("score"), (int, float)) and item["score"] > 0.3:
+            # Semantic/fuzzy matches with meaningful scores → "medium" (not "low").
+            item["confidence"] = "medium"
+            _has_high_score = True
         else:
             item["confidence"] = "low"
 
     low_confidence_note: str | None = None
 
-    # Only add low-confidence warning when there are no exact matches AND all
-    # RRF scores are below the noise threshold.
-    if not has_exact_match and top_k and isinstance(top_k[0], dict) and top_k[0].get("score", 1.0) < _LOW_CONFIDENCE_THRESHOLD:
+    # Only add low-confidence warning when there are no exact/high-scored matches
+    # AND all RRF scores are below the noise threshold.
+    if not has_exact_match and not _has_high_score and top_k and isinstance(top_k[0], dict) and top_k[0].get("score", 1.0) < _LOW_CONFIDENCE_THRESHOLD:
         has_model = _load_model() is not None
         for item in top_k:
             if isinstance(item, dict) and "score" in item:

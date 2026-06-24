@@ -51,6 +51,10 @@ class Settings:
     # Max consecutive failed health pings before restart (0 = disabled).
     supervisor_health_max_failures: int = 3
 
+    # Max restart attempts before the supervisor enters degraded mode and exits
+    # (0 = unlimited, default 12 ≈ ~10 minutes at 1-2-4-…-30s backoff window).
+    supervisor_max_restarts: int = 12
+
     # Whether to attempt automatic DB repair on corruption at startup.
     auto_repair_on_startup: bool = True
 

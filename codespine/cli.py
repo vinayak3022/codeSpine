@@ -282,6 +282,19 @@ def _open_store(read_only: bool = True) -> ShardedGraphStore:
 def _discover_modules(abs_path: str) -> tuple[list[str], list[tuple[str, str]], bool]:
     project_roots = JavaIndexer.detect_projects_in_workspace(abs_path)
     is_workspace = not (len(project_roots) == 1 and project_roots[0] == abs_path)
+
+    # Build existing path → project_id map to prevent duplicate entries for
+    # the same physical path (common in multi-module Maven/Gradle projects
+    # where the same module can be discovered through different roots).
+    existing_by_path: dict[str, str] = {}
+    try:
+        for state in list_project_states():
+            p = state.get("path")
+            if p:
+                existing_by_path[os.path.abspath(p)] = state.get("project_id")
+    except Exception:
+        pass
+
     modules_with_ids: list[tuple[str, str]] = []
     for proj_root in project_roots:
         proj_name = os.path.basename(proj_root)
@@ -289,10 +302,98 @@ def _discover_modules(abs_path: str) -> tuple[list[str], list[tuple[str, str]], 
         is_multi_module = not (len(module_dirs) == 1 and module_dirs[0] == proj_root)
         if is_multi_module:
             for module_path in module_dirs:
-                modules_with_ids.append((module_path, f"{proj_name}::{os.path.basename(module_path)}"))
+                abs_module = os.path.abspath(module_path)
+                # Dedup: reuse existing project ID if this path was already indexed.
+                if abs_module in existing_by_path:
+                    module_id = existing_by_path[abs_module]
+                    LOGGER.info(
+                        "Dedup project ID '%s' for path %s (reusing existing entry)",
+                        module_id, abs_module,
+                    )
+                else:
+                    module_id = f"{proj_name}::{os.path.basename(module_path)}"
+                modules_with_ids.append((module_path, module_id))
         else:
+            abs_root = os.path.abspath(proj_root)
+            if abs_root in existing_by_path:
+                proj_name = existing_by_path[abs_root]
+                LOGGER.info(
+                    "Dedup project ID '%s' for path %s (reusing existing entry)",
+                    proj_name, abs_root,
+                )
             modules_with_ids.append((proj_root, proj_name))
     return project_roots, modules_with_ids, is_workspace
+
+
+def _cleanup_duplicate_projects(store: ShardedGraphStore) -> int:
+    """Remove duplicate project entries that share the same physical path.
+
+    Scans all project states, groups by canonical (absolute) path, and removes
+    duplicates, keeping only the most complete project entry (most files
+    indexed).  Returns the number of duplicates removed.
+    """
+    from codespine.project_state import delete_project_state
+
+    # Index projects by canonical path.
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for state in list_project_states():
+        p = state.get("path")
+        if not p:
+            continue
+        canon = os.path.abspath(p)
+        by_path.setdefault(canon, []).append(state)
+
+    removed = 0
+    for canon, entries in by_path.items():
+        if len(entries) <= 1:
+            continue
+        LOGGER.warning(
+            "Found %d project entries for path %s — cleaning up duplicates",
+            len(entries), canon,
+        )
+        # Sort by number of indexed files (descending) so the fullest entry survives.
+        def _count_files(state: dict) -> int:
+            try:
+                pid = state.get("project_id", "")
+                if not pid:
+                    return 0
+                rows = store.query_records(
+                    "MATCH (f:File) WHERE f.project_id = $pid RETURN count(f) as c",
+                    {"pid": pid},
+                )
+                return int(rows[0].get("c", 0)) if rows else 0
+            except Exception:
+                return 0
+
+        entries.sort(key=_count_files, reverse=True)
+        # Keep first (richest) entry, delete the rest.
+        survivor = entries[0]["project_id"]
+        for dup in entries[1:]:
+            dup_id = dup["project_id"]
+            if dup_id == survivor:
+                continue
+            LOGGER.info("Removing duplicate project entry '%s' (keeping '%s')", dup_id, survivor)
+            try:
+                store.query_records(
+                    "MATCH (p:Project) WHERE p.id = $pid DELETE p",
+                    {"pid": dup_id},
+                )
+            except Exception:
+                pass
+            try:
+                delete_project_state(dup_id)
+            except Exception:
+                pass
+            # Also clear any overlay data for this orphaned project.
+            try:
+                store.overlay_store.clear_project(dup_id)
+            except Exception:
+                pass
+            removed += 1
+
+    if removed:
+        store.snapshot_to_read_replica()
+    return removed
 
 
 def _set_project_states(modules_with_ids: list[tuple[str, str]], **fields: object) -> None:
@@ -1038,6 +1139,13 @@ def analyse(
 
     # The indexer is initialised per-module below with the right shard store.
     # We keep a single ShardedGraphStore to fan-out cross-module linking later.
+
+    # ── Clean up any duplicate project entries from prior runs ──────────
+    # Multi-module projects (Maven/Gradle) can create duplicate project IDs
+    # for the same physical path when discovered through different roots.
+    dup_count = _cleanup_duplicate_projects(sg)
+    if dup_count:
+        click.secho(f"Cleaned up {dup_count} duplicate project entr{'y' if dup_count == 1 else 'ies'}.", fg="yellow")
 
     # --- Workspace → project → module detection ---
     # Level 1: workspace (e.g. ~/IdeaProjects/) may contain independent projects.
@@ -2915,6 +3023,30 @@ def supervise_mcp() -> None:
             break
 
         restart_count += 1
+
+        # ── Max-restart guard: exit instead of looping forever ──────
+        _max_restarts = SETTINGS.supervisor_max_restarts
+        if _max_restarts > 0 and restart_count >= _max_restarts:
+            LOGGER.critical(
+                "MCP child exited %d times (max %d) — entering degraded mode. "
+                "Run 'codespine analyse' to re-index, then 'codespine stop && codespine start'.",
+                restart_count,
+                _max_restarts,
+            )
+            _write_runtime_state(
+                {
+                    "supervisor_pid": os.getpid(),
+                    "child_pid": None,
+                    "restart_count": restart_count,
+                    "last_exit_code": code if code is not None else -1,
+                    "backoff_s": backoff,
+                    "status": "degraded",
+                    "last_failure_at": time.time(),
+                    "degraded_reason": f"exceeded max {_max_restarts} restarts",
+                }
+            )
+            break
+
         _write_runtime_state(
             {
                 "supervisor_pid": os.getpid(),
@@ -3109,10 +3241,11 @@ def run_mcp() -> None:
         if _mcp_stopping[0]:
             os._exit(0)  # second signal → immediate exit
         _mcp_stopping[0] = True
-        # Best-effort DB checkpoint before exit.
+        # Best-effort DB checkpoint via the existing read-only store.
+        # DO NOT open a write-mode store here — that can cause DuckDB
+        # lock contention and prevent a clean shutdown.
         try:
-            store = _open_store(read_only=False)
-            store.snapshot_all(background=False)
+            _mcp_store.snapshot_all(background=False)
         except Exception:
             pass
         # Clear heartbeat from runtime state.
@@ -3129,8 +3262,18 @@ def run_mcp() -> None:
     signal.signal(signal.SIGTERM, _mcp_shutdown)
     signal.signal(signal.SIGINT, _mcp_shutdown)
 
-    store = _open_store(read_only=True)
-    mcp = build_mcp_server(store, repo_path_provider=_current_repo_path)
+    _mcp_store = _open_store(read_only=True)
+    # Health check before serving: verify the store can execute a query.
+    try:
+        _mcp_store.query_records("MATCH (s:Symbol) RETURN count(s) as count LIMIT 1")
+    except Exception as _health_exc:
+        LOGGER.critical(
+            "MCP store health-check failed: %s — refusing to serve. "
+            "Run 'codespine analyse' to create the index first.",
+            _health_exc,
+        )
+        sys.exit(2)  # non-zero so the supervisor doesn't loop
+    mcp = build_mcp_server(_mcp_store, repo_path_provider=_current_repo_path)
     mcp.run()
 
 

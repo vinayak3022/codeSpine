@@ -198,12 +198,15 @@ def _manifest_for_file(repo_path: str, rel_path: str) -> tuple[list[dict], list[
 
 
 def _git_changed_files(repo_path: str, base_ref: str, head_ref: str) -> list[dict[str, str]]:
-    proc = subprocess.run(
-        ["git", "-C", repo_path, "diff", "--name-status", "--find-renames", base_ref, head_ref],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_path, "diff", "--name-status", "--find-renames", base_ref, head_ref],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []  # Not a git repo or invalid refs → empty diff
     changes: list[dict[str, str]] = []
     for raw_line in proc.stdout.splitlines():
         line = raw_line.strip()
