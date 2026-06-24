@@ -2336,164 +2336,8 @@ def _project_summaries() -> list[dict]:
 
 
 def _ui_html() -> str:
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CodeSpine Index Explorer</title>
-  <style>
-    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; color: #202124; background: #f7f9fb; }
-    header { padding: 24px 28px 18px; background: #ffffff; border-bottom: 1px solid #d9e1ea; }
-    h1 { margin: 0 0 6px; font-size: 26px; font-weight: 720; letter-spacing: 0; }
-    main { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.8fr); gap: 18px; padding: 18px 28px 32px; }
-    section { min-width: 0; }
-    .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
-    input { width: min(420px, 100%); padding: 10px 12px; border: 1px solid #c8d3df; border-radius: 6px; font-size: 14px; }
-    button { padding: 10px 14px; border: 1px solid #1b6f79; border-radius: 6px; background: #1b6f79; color: white; cursor: pointer; }
-    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #d9e1ea; }
-    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #e7edf3; font-size: 14px; vertical-align: top; }
-    th { background: #eef4f8; font-weight: 680; }
-    .muted { color: #65727f; }
-    .stack { display: grid; gap: 18px; }
-    .panel { background: white; border: 1px solid #d9e1ea; padding: 14px; }
-    .panel h2 { margin: 0 0 10px; font-size: 18px; letter-spacing: 0; }
-    .task { border-top: 1px solid #e7edf3; padding: 10px 0; }
-    .task:first-of-type { border-top: 0; }
-    .task-actions { display: flex; gap: 8px; margin-top: 8px; }
-    .task-actions button { padding: 7px 10px; font-size: 13px; }
-    .metric { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 7px 0; border-top: 1px solid #e7edf3; }
-    .metric:first-of-type { border-top: 0; }
-    .status { display: inline-block; padding: 2px 8px; border-radius: 6px; background: #e7f4ea; color: #137333; font-size: 12px; }
-    .status.failed { background: #fce8e6; color: #a50e0e; }
-    .status.running, .status.queued { background: #e8f0fe; color: #174ea6; }
-    .status.warning { background: #fef7e0; color: #b06000; }
-    .status.critical { background: #fce8e6; color: #a50e0e; }
-    .status.partial, .status.degraded { background: #fef7e0; color: #b06000; }
-    .status.repair_required { background: #fce8e6; color: #a50e0e; }
-    .status.ready, .status.succeeded { background: #e7f4ea; color: #137333; }
-    .status.enriching { background: #e8f0fe; color: #174ea6; }
-    .actions { display: flex; gap: 8px; }
-    .secondary { background: white; color: #1b6f79; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 14px; } header { padding: 18px 14px; } }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>CodeSpine Index Explorer</h1>
-    <div class="muted">Local view of core readiness, repair state, and background work.</div>
-  </header>
-  <main>
-    <section>
-      <div class="toolbar">
-        <input id="filter" placeholder="Filter projects by id or path">
-        <button id="refresh">Refresh</button>
-      </div>
-      <table>
-        <thead><tr><th>Project</th><th>State</th><th>Shard</th><th>Files</th><th>Classes</th><th>Methods</th><th>Calls</th><th>Path</th><th>Actions</th></tr></thead>
-        <tbody id="projects"><tr><td colspan="9" class="muted">Loading...</td></tr></tbody>
-      </table>
-    </section>
-    <aside class="stack">
-      <section class="panel">
-        <h2>Index Health</h2>
-        <div id="health" class="muted">Loading...</div>
-      </section>
-      <section class="panel">
-        <h2>Background Tasks</h2>
-        <div id="tasks" class="muted">Loading...</div>
-      </section>
-      <section class="panel">
-        <h2>Install</h2>
-        <div class="muted">Use <code>codespine background</code> for the same task state in the terminal. Repair actions here call the same local CLI flows.</div>
-      </section>
-    </aside>
-  </main>
-  <script>
-    let projects = [];
-    async function getJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(url); return await r.json(); }
-    async function postJSON(url, body) {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      if (!r.ok) throw new Error(await r.text());
-      return await r.json();
-    }
-    function renderProjects() {
-      const q = document.getElementById('filter').value.toLowerCase();
-      const rows = projects.filter(p => (`${p.id || ''} ${p.path || ''}`).toLowerCase().includes(q));
-      document.getElementById('projects').innerHTML = rows.length ? rows.map(p => `
-        <tr>
-          <td>${p.id || ''}</td>
-          <td><span class="status ${p.project_state || ''}">${p.project_state || '-'}</span></td>
-          <td>${p.shard}</td>
-          <td>${p.files}</td>
-          <td>${p.classes}</td>
-          <td>${p.methods}</td>
-          <td>${p.calls}</td>
-          <td class="muted">${p.path || ''}${p.last_error ? `<div>${p.last_error}</div>` : ''}</td>
-          <td>
-            <div class="actions">
-              <button class="secondary" onclick="repairProject('${p.id || p.path || ''}', 'auto')">Repair</button>
-              <button onclick="repairProject('${p.id || p.path || ''}', 'full')">Reindex</button>
-            </div>
-          </td>
-        </tr>
-      `).join('') : '<tr><td colspan="9" class="muted">No projects found.</td></tr>';
-    }
-    function renderTasks(tasks) {
-      const el = document.getElementById('tasks');
-      if (!tasks.length) { el.innerHTML = 'No background tasks.'; return; }
-      el.innerHTML = tasks.map(t => `
-        <div class="task">
-          <div><span class="status ${t.status}">${t.status}</span> <span class="status ${t.result_status || ''}">${t.result_status || 'pending'}</span> <strong>${t.last_phase || t.phase || t.kind}</strong></div>
-          <div class="muted">${t.label || ''}</div>
-          <div class="muted">${t.path || ''}</div>
-          <div class="muted">Progress: ${typeof t.progress === 'number' ? Math.round(t.progress * 100) + '%' : '-'}</div>
-          ${t.detail ? `<div>${t.detail}</div>` : ''}
-          ${t.repair_hint ? `<div class="muted">Repair: ${t.repair_hint}</div>` : ''}
-          ${t.status === 'failed' ? `<div class="task-actions"><button class="secondary" onclick="repairProject('${t.project_id || t.path || ''}', 'auto')">Repair</button><button onclick="repairProject('${t.project_id || t.path || ''}', 'full')">Reindex</button></div>` : ''}
-        </div>
-      `).join('');
-    }
-    function renderHealth(health) {
-      const el = document.getElementById('health');
-      const summary = health.summary || {};
-      const projects = health.projects || [];
-      const critical = summary.critical_count || 0;
-      const anomalies = summary.anomaly_count || 0;
-      const status = critical ? 'critical' : anomalies ? 'warning' : '';
-      const worst = critical ? 'critical' : anomalies ? 'warning' : 'ok';
-      const lowest = projects.reduce((min, p) => Math.min(min, Number(p.call_edge_coverage || 0)), projects.length ? 1 : 0);
-      const coverage = projects.length ? `${Math.round(lowest * 1000) / 10}%` : '-';
-      el.innerHTML = `
-        <div><span class="status ${status}">${worst}</span></div>
-        <div class="metric"><span>Projects</span><strong>${summary.project_count || 0}</strong></div>
-        <div class="metric"><span>Anomalies</span><strong>${anomalies}</strong></div>
-        <div class="metric"><span>Lowest call coverage</span><strong>${coverage}</strong></div>
-        ${projects.flatMap(p => (p.anomalies || []).map(a => `<div class="task"><strong>${p.project_id}</strong><div>${a.message || ''}</div></div>`)).join('')}
-      `;
-    }
-    async function repairProject(target, mode) {
-      if (!target) return;
-      const payload = await postJSON('/api/repair', { project_id: target, mode });
-      alert(`Started ${payload.mode} repair\\nTask: ${payload.task_id}`);
-      await refresh();
-    }
-    async function refresh() {
-      const [p, t, h] = await Promise.all([getJSON('/api/projects'), getJSON('/api/tasks'), getJSON('/api/health')]);
-      projects = p; renderProjects(); renderTasks(t); renderHealth(h);
-    }
-    document.getElementById('filter').addEventListener('input', renderProjects);
-    document.getElementById('refresh').addEventListener('click', refresh);
-    refresh(); setInterval(refresh, 5000);
-  </script>
-</body>
-</html>"""
-
+    from codespine.mcp._ui_html import UI_HTML
+    return UI_HTML
 
 @main.command("ui")
 @click.option("--host", default="127.0.0.1", show_default=True)
@@ -2501,6 +2345,7 @@ def _ui_html() -> str:
 @click.option("--open/--no-open", "open_browser", default=False, show_default=True)
 def ui(host: str, port: int, open_browser: bool) -> None:
     """Serve a lightweight local read-only index explorer."""
+    from codespine import __version__
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: object) -> None:
@@ -2535,7 +2380,83 @@ def ui(host: str, port: int, open_browser: bool) -> None:
                     "tasks": list_tasks(include_finished=True, limit=30),
                     "projects": _project_summaries(),
                     "health": index_health(_open_store(read_only=True)),
+                    "version": __version__,
                 })
+                return
+            if parsed.path == "/api/search":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                q = (params.get("q") or [""])[0]
+                project = (params.get("project") or [None])[0]
+                k = int((params.get("k") or ["20"])[0])
+                store = _open_store(read_only=True)
+                guard = _index_guard_simple(store)
+                if guard:
+                    self._json({"error": guard})
+                    return
+                results = hybrid_search(store, q, k=k, project=project or None, detail="full")
+                self._json({"results": results})
+                return
+            if parsed.path == "/api/impact":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                symbol = (params.get("symbol") or [""])[0]
+                project = (params.get("project") or [None])[0]
+                depth = int((params.get("depth") or ["4"])[0])
+                if not symbol:
+                    self._json({"error": "symbol parameter required"})
+                    return
+                store = _open_store(read_only=True)
+                result = analyze_impact(store, symbol, max_depth=depth, project=project or None)
+                self._json(result)
+                return
+            if parsed.path == "/api/deadcode":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                project = (params.get("project") or [None])[0]
+                limit = int((params.get("limit") or ["200"])[0])
+                strict = (params.get("strict") or ["false"])[0] == "true"
+                store = _open_store(read_only=True)
+                result = detect_dead_code(store, limit=limit, project=project or None, strict=strict)
+                self._json({"results": result})
+                return
+            if parsed.path == "/api/ask":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                question = (params.get("question") or [""])[0]
+                project = (params.get("project") or [None])[0]
+                if not question:
+                    self._json({"error": "question parameter required"})
+                    return
+                store = _open_store(read_only=True)
+                answer = graph_rag_answer(store, question, project=project or None)
+                self._json(answer)
+                return
+            if parsed.path == "/api/diff":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                base_ref = (params.get("base") or [""])[0]
+                head_ref = (params.get("head") or [""])[0]
+                repo_path = (params.get("project") or [""])[0]
+                if not base_ref or not head_ref or not repo_path:
+                    self._json({"error": "base, head, and project parameters required"})
+                    return
+                result = compare_branches(repo_path, base_ref, head_ref)
+                self._json(result)
+                return
+            if parsed.path == "/api/communities":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                project = (params.get("project") or [None])[0]
+                store = _open_store(read_only=True)
+                results = detect_communities(store, project=project or None)
+                self._json({"results": results})
                 return
             self._send(b"not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
 
