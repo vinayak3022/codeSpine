@@ -404,7 +404,10 @@ def build_mcp_server(store, repo_path_provider):
     @mcp.tool()
     def list_projects():
         """List all indexed projects with their symbol and file counts."""
-        projects = _project_inventory(store)
+        projects = [
+            p for p in _project_inventory(store)
+            if not (p.get("state_only") and not p.get("snapshot_valid") and not p.get("write_db_valid"))
+        ]
         if not projects:
             return {"available": False, "note": "No projects indexed yet. Run 'codespine analyse <path>'."}
         now = int(time.time())

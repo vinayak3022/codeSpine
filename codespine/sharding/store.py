@@ -295,14 +295,16 @@ class ShardedGraphStore:
     # Snapshot all shards
     # ------------------------------------------------------------------
 
-    def snapshot_all(self, background: bool = False) -> None:
+    def snapshot_all(self, background: bool = False) -> dict[int, bool]:
         """Snapshot every open shard.
 
         In background mode all snapshots run concurrently in daemon threads
         (one per shard) rather than sequentially.
         """
-        for store in self.open_shards():
-            store.snapshot_to_read_replica(background=background)
+        results: dict[int, bool] = {}
+        for idx, store in list(self._pool.items()):
+            results[idx] = bool(store.snapshot_to_read_replica(background=background))
+        return results
 
     # ------------------------------------------------------------------
     # Global reset / status
@@ -333,8 +335,8 @@ class ShardedGraphStore:
 
     def snapshot_to_read_replica(self, background: bool = False) -> bool:
         """Alias for ``snapshot_all`` — matches GraphStore's API."""
-        self.snapshot_all(background=background)
-        return True
+        results = self.snapshot_all(background=background)
+        return all(results.values()) if results else True
 
     def describe(self) -> dict:
         """Return a human-readable description of the shard topology."""

@@ -6,6 +6,7 @@ import os
 import signal
 import socket
 import subprocess
+import shutil
 import sys
 import threading
 import time
@@ -441,6 +442,12 @@ def _record_snapshot_for_projects(modules_with_ids: list[tuple[str, str]]) -> No
     for module_path, project_id in modules_with_ids:
         update_project_state(project_id, path=module_path)
         record_snapshot_success(project_id)
+
+
+def _snapshot_results_ok(snapshot_results) -> bool:
+    if isinstance(snapshot_results, dict):
+        return bool(snapshot_results) and all(bool(v) for v in snapshot_results.values())
+    return bool(snapshot_results)
 
 
 def _resolve_repair_target(target: str) -> tuple[str, list[tuple[str, str]], dict[str, object]]:
@@ -1175,15 +1182,24 @@ def analyse(
             fg="yellow",
         )
         try:
-            sg.snapshot_all(background=False)
-            _record_snapshot_for_projects(modules_with_ids)
-            _set_project_states(
-                modules_with_ids,
-                core_state="partial",
-                deep_state="queued" if deep_enabled else "idle",
-                last_error="Indexing was interrupted before the core graph completed.",
-                repair_hint=repair_hint_for(path=abs_path),
-            )
+            snapshot_results = sg.snapshot_all(background=False)
+            if _snapshot_results_ok(snapshot_results):
+                _record_snapshot_for_projects(modules_with_ids)
+                _set_project_states(
+                    modules_with_ids,
+                    core_state="partial",
+                    deep_state="queued" if deep_enabled else "idle",
+                    last_error="Indexing was interrupted before the core graph completed.",
+                    repair_hint=repair_hint_for(path=abs_path),
+                )
+            else:
+                _set_project_states(
+                    modules_with_ids,
+                    core_state="repair_required",
+                    deep_state="queued" if deep_enabled else "idle",
+                    last_error="Interrupted indexing could not publish a valid read replica.",
+                    repair_hint=repair_hint_for(path=abs_path, full=True),
+                )
             click.secho(
                 "✓ Partial index saved. Run 'codespine stats' to see what was indexed.",
                 fg="yellow",
@@ -1478,6 +1494,23 @@ def analyse(
         f"{outcome_prefix} in {elapsed:.1f}s - {module_info}{symbols} symbols, {edges} edges, {len(communities)} clusters, {len(flows)} flows{embed_note}",
         fg="yellow" if core_partial else "green",
     )
+    skipped_total = sum(int(getattr(result, "skipped_files", 0) or 0) for result in all_results)
+    if skipped_total:
+        by_reason: dict[str, int] = defaultdict(int)
+        samples: list[str] = []
+        for result in all_results:
+            for reason, count in dict(getattr(result, "skipped_by_reason", {}) or {}).items():
+                by_reason[str(reason)] += int(count)
+            for sample in list(getattr(result, "skip_samples", []) or []):
+                if len(samples) < 5 and sample not in samples:
+                    samples.append(str(sample))
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(by_reason.items()))
+        click.secho(
+            f"Skipped files...            {skipped_total} ({detail})",
+            fg="yellow",
+        )
+        if samples:
+            click.echo("  Samples: " + "; ".join(samples))
 
     # Detect unresolved imports → hint about unindexed sibling projects.
     # This is useful, but it is still another global query, so fast mode leaves
@@ -1503,32 +1536,52 @@ def analyse(
             recycle()
     if fast and core_partial:
         _live_phase(snap_label, "copying partial core")
-        sg.snapshot_all(background=False)
-        _finish_phase(snap_label, "partial index visible")
-        _record_snapshot_for_projects(modules_with_ids)
-        _set_project_states(
-            modules_with_ids,
-            core_state="partial",
-            deep_state="queued" if deep_enabled else "idle",
-            last_error="Foreground budget exhausted before the core graph completed.",
-            repair_hint=repair_hint_for(path=abs_path),
-        )
+        snapshot_results = sg.snapshot_all(background=False)
+        if _snapshot_results_ok(snapshot_results):
+            _finish_phase(snap_label, "partial index visible")
+            _record_snapshot_for_projects(modules_with_ids)
+            _set_project_states(
+                modules_with_ids,
+                core_state="partial",
+                deep_state="queued" if deep_enabled else "idle",
+                last_error="Foreground budget exhausted before the core graph completed.",
+                repair_hint=repair_hint_for(path=abs_path),
+            )
+        else:
+            _finish_phase(snap_label, "failed")
+            _set_project_states(
+                modules_with_ids,
+                core_state="repair_required",
+                deep_state="queued" if deep_enabled else "idle",
+                last_error="Foreground core indexing completed, but publishing the read replica failed.",
+                repair_hint=repair_hint_for(path=abs_path, full=True),
+            )
         if _spawn_background_continuation(abs_path):
             _phase("Background indexing...", "core indexing continues; run 'codespine background'")
         else:
             _phase("Background indexing...", "not started; rerun 'codespine analyse' to continue")
     else:
         _live_phase(snap_label, "copying")
-        sg.snapshot_all(background=False)
-        _finish_phase(snap_label, "MCP will reload automatically")
-        _record_snapshot_for_projects(modules_with_ids)
-        _set_project_states(
-            modules_with_ids,
-            core_state="ready",
-            deep_state="failed" if deep_error else ("ready" if should_run_deep else ("running" if deep_enabled else "idle")),
-            last_error=str(deep_error) if deep_error else "",
-            repair_hint=repair_hint_for(path=abs_path) if deep_error else "",
-        )
+        snapshot_results = sg.snapshot_all(background=False)
+        if _snapshot_results_ok(snapshot_results):
+            _finish_phase(snap_label, "MCP will reload automatically")
+            _record_snapshot_for_projects(modules_with_ids)
+            _set_project_states(
+                modules_with_ids,
+                core_state="ready",
+                deep_state="failed" if deep_error else ("ready" if should_run_deep else ("running" if deep_enabled else "idle")),
+                last_error=str(deep_error) if deep_error else "",
+                repair_hint=repair_hint_for(path=abs_path) if deep_error else "",
+            )
+        else:
+            _finish_phase(snap_label, "failed")
+            _set_project_states(
+                modules_with_ids,
+                core_state="repair_required",
+                deep_state="failed" if deep_error else ("running" if deep_enabled and not should_run_deep else "idle"),
+                last_error="Indexing completed, but publishing the read replica failed.",
+                repair_hint=repair_hint_for(path=abs_path, full=True),
+            )
         if deep_error:
             _phase("Repair hint...", repair_hint_for(path=abs_path))
         elif deep_enabled and not should_run_deep:
@@ -2833,6 +2886,24 @@ def force_reset_cmd(force: bool) -> None:
         click.echo("Aborted.")
         return
     removed = ShardedGraphStore(read_only=False).force_delete_all_data()
+    extra_targets = [
+        SETTINGS.overlay_dir,
+        SETTINGS.index_meta_dir,
+        SETTINGS.embedding_cache_path,
+        _runtime_state_path(),
+        SETTINGS.task_registry_path,
+    ]
+    for target in extra_targets:
+        if not target or not os.path.exists(target):
+            continue
+        try:
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+            removed.append(target)
+        except OSError:
+            pass
     if removed:
         for p in removed:
             click.echo(f"  removed: {p}")

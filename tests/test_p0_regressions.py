@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import time
+import types
 from pathlib import Path
 
 from codespine.indexer.engine import JavaIndexer
@@ -246,3 +248,136 @@ def test_start_fails_cleanly_when_mcp_port_in_use(monkeypatch):
     result = CliRunner().invoke(cli.main, ['start'])
     assert result.exit_code == 0
     assert 'already in use' in result.output
+
+
+def test_force_reset_removes_meta_overlay_and_runtime_state(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    import codespine.cli as cli
+
+    overlay = tmp_path / 'overlay'
+    overlay.mkdir()
+    meta = tmp_path / 'meta'
+    meta.mkdir()
+    embedding = tmp_path / 'embed.json'
+    embedding.write_text('{}', encoding='utf-8')
+    runtime = tmp_path / 'runtime.json'
+    runtime.write_text('{}', encoding='utf-8')
+    tasks = tmp_path / 'tasks.json'
+    tasks.write_text('{}', encoding='utf-8')
+
+    monkeypatch.setattr(cli, 'SETTINGS', types.SimpleNamespace(
+        overlay_dir=str(overlay),
+        index_meta_dir=str(meta),
+        embedding_cache_path=str(embedding),
+        task_registry_path=str(tasks),
+    ))
+    monkeypatch.setattr(cli, '_runtime_state_path', lambda: str(runtime))
+
+    class _Store:
+        def force_delete_all_data(self):
+            return []
+
+    monkeypatch.setattr(cli, 'ShardedGraphStore', lambda read_only=False: _Store())
+
+    result = CliRunner().invoke(cli.main, ['force-reset', '--force'])
+    assert result.exit_code == 0
+    assert not overlay.exists()
+    assert not meta.exists()
+    assert not embedding.exists()
+    assert not runtime.exists()
+    assert not tasks.exists()
+
+
+def test_sharded_snapshot_to_read_replica_reports_failures():
+    class _Shard:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def snapshot_to_read_replica(self, background=False):
+            return self.ok
+
+    sg = object.__new__(ShardedGraphStore)
+    sg._pool = {0: _Shard(True), 1: _Shard(False)}
+
+    assert sg.snapshot_all(background=False) == {0: True, 1: False}
+    assert sg.snapshot_to_read_replica(background=False) is False
+
+
+def test_list_projects_hides_state_only_stale_entries(monkeypatch):
+    class _Store:
+        def query_records(self, query, params=None):
+            return []
+
+    async def _run():
+        import codespine.mcp.server as server
+
+        monkeypatch.setattr(
+            server,
+            '_project_inventory',
+            lambda _store: [{
+                'project_id': 'ghost',
+                'path': '/repo/ghost',
+                'state_only': True,
+                'snapshot_valid': False,
+                'write_db_valid': False,
+            }],
+        )
+        mcp = build_mcp_server(_Store(), lambda: '.')
+        result = await mcp.call_tool('list_projects', {})
+        payload = json.loads(result.content[0].text)
+        assert payload['available'] is False
+
+    asyncio.run(_run())
+
+
+def test_index_project_does_not_false_timeout_queued_files(monkeypatch, tmp_path):
+    from codespine.db.duckdb_store import DuckDBStore
+    import codespine.indexer.engine as engine
+
+    root = tmp_path / 'app'
+    root.mkdir()
+    for idx in range(3):
+        (root / f'A{idx}.java').write_text('class A {}\n', encoding='utf-8')
+
+    def _fake_parse(file_path: str, root_path: str, project_id: str) -> dict:
+        time.sleep(0.02)
+        rel_path = Path(file_path).name
+        parsed = types.SimpleNamespace(
+            package='example',
+            imports=[],
+            classes=[types.SimpleNamespace(
+                name=f'C{rel_path}',
+                package='example',
+                fqcn=f'example.C{rel_path}',
+                line=1,
+                col=1,
+                modifiers=[],
+                annotations=[],
+                interfaces=[],
+                extends=None,
+                field_types={},
+                methods=[],
+                fields=[],
+            )],
+        )
+        return {
+            'file_path': file_path,
+            'rel_path': rel_path,
+            'source': b'class A {}',
+            'parsed': parsed,
+            'f_id': f'{project_id}:{rel_path}',
+            'digest': rel_path,
+            'is_test': False,
+            'scope': project_id,
+        }
+
+    monkeypatch.setattr(engine, '_parse_file_worker', _fake_parse)
+    monkeypatch.setattr(engine, '_PARSE_TIMEOUT_SECS', 0.01)
+    monkeypatch.setattr(engine, '_PARSE_HEARTBEAT_PERIOD', 0.005)
+    monkeypatch.setattr(engine.os, 'cpu_count', lambda: 1)
+
+    store = DuckDBStore(read_only=False, db_path_override=str(tmp_path / 'db'), snapshot_path_override=str(tmp_path / 'db_read'))
+    result = JavaIndexer(store).index_project(str(root), full=True, embed=False)
+
+    assert result.classes_indexed == 3
+    assert result.skipped_files == 0

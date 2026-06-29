@@ -363,6 +363,7 @@ def _project_inventory(store) -> list[dict]:
             pid, path=project.get("path", "")
         )
         snap = snapshot_info(pid, store.router if hasattr(store, "router") else None)
+        state_only = not bool(project)
         out.append(
             {
                 "project_id": pid,
@@ -375,6 +376,8 @@ def _project_inventory(store) -> list[dict]:
                 "repair_hint": state.get("repair_hint"),
                 "snapshot_valid": snap.get("snapshot_valid"),
                 "write_db_valid": snap.get("write_db_valid"),
+                "state_only": state_only,
+                "inventory_source": "state" if state_only else "db",
             }
         )
     return out
