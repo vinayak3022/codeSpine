@@ -43,6 +43,14 @@ def _default_state(project_id: str) -> dict[str, Any]:
         "last_task_id": None,
         "last_good_snapshot_at": None,
         "repair_hint": "",
+        "dependency_project_ids": [],
+        "declared_dependencies": [],
+        "unresolved_dependency_coords": [],
+        "maven_coord": None,
+        "maven_group_id": None,
+        "maven_artifact_id": None,
+        "maven_version": None,
+        "maven_packaging": None,
         "updated_at": now,
     }
 
@@ -223,3 +231,80 @@ def repair_hint_for(
     if " " in target:
         target = f"\"{target}\""
     return f"codespine repair {'--full ' if full else ''}{target}".strip()
+
+
+def project_dependency_graph(store=None, project: str | None = None, *, reverse: bool = False) -> dict:
+    """Return the project dependency graph as {nodes: [...], edges: [...]}.
+
+    When *project* is given, only returns the subgraph reachable from that
+    project.  When *reverse* is True, returns the reverse dependency graph
+    (projects that depend on the given project).
+    """
+    states = list_project_states()
+    node_map: dict[str, dict] = {}
+    edges: list[dict] = []
+    for st in states:
+        pid = st.get("project_id")
+        if not pid:
+            continue
+        node_map[pid] = {
+            "id": pid,
+            "project_id": pid,
+            "name": pid,
+            "path": st.get("path", ""),
+            "indexed_at": st.get("last_good_snapshot_at"),
+        }
+        dep_ids: list[str] = st.get("dependency_project_ids") or []
+        for dep_id in dep_ids:
+            if dep_id == pid:
+                continue
+            edges.append({
+                "src": pid if not reverse else dep_id,
+                "dst": dep_id if not reverse else pid,
+                "direction": "reverse" if reverse else "forward",
+            })
+    nodes = sorted(node_map.values(), key=lambda n: n["id"])
+    if project:
+        adj: dict[str, list[str]] = {n["id"]: [] for n in nodes}
+        for e in edges:
+            adj.setdefault(e["src"], []).append(e["dst"])
+        reachable: set[str] = set()
+        queue = [project]
+        while queue:
+            pid = queue.pop(0)
+            if pid in reachable:
+                continue
+            reachable.add(pid)
+            for neighbor in adj.get(pid, []):
+                if neighbor not in reachable:
+                    queue.append(neighbor)
+        nodes = [n for n in nodes if n["id"] in reachable]
+        edges = [e for e in edges if e["src"] in reachable and e["dst"] in reachable]
+    return {"nodes": nodes, "edges": edges}
+
+
+def project_dependency_closure(project: str | None, *, include_self: bool = True) -> list[str]:
+    """Return the transitive dependency closure for *project*.
+
+    Returns a list of project IDs that *project* depends on (directly or
+    transitively).  When *include_self* is True (default), the list includes
+    *project* itself.  Returns an empty list when *project* is None.
+    """
+    if not project:
+        return []
+    visited: set[str] = set()
+    queue = [project]
+    while queue:
+        pid = queue.pop(0)
+        if pid in visited:
+            continue
+        visited.add(pid)
+        state = load_project_state(pid)
+        dep_ids: list[str] = state.get("dependency_project_ids") or []
+        for dep_id in dep_ids:
+            if dep_id not in visited:
+                queue.append(dep_id)
+    result = list(visited)
+    if not include_self:
+        result = [pid for pid in result if pid != project]
+    return result

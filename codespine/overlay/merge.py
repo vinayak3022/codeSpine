@@ -240,3 +240,68 @@ def merged_call_edges(store, overlay_store, project: str | None = None) -> list[
                 )
                 merged.append(rec)
     return merged
+
+
+def merged_reference_edges(store, overlay_store, project: str | None = None, rel: str = "REFERENCES_TYPE") -> list[dict[str, Any]]:
+    """Load symbol-level type-reference edges with project/kind metadata.
+
+    Queries the base store for ``REFERENCES_TYPE`` edges (or *rel*) and
+    merges with overlay dirty-file reference edges when an overlay store
+    is available.  Returns a list of dicts with keys::
+
+        src, dst, src_name, dst_name, src_fqname, dst_fqname,
+        src_file_path, dst_file_path, src_project_id, dst_project_id,
+        confidence, rel
+    """
+    from codespine.project_state import project_dependency_closure as _pd_closure
+
+    scope_projects: set[str] | None = None
+    if project:
+        scope_projects = set(_pd_closure(project, include_self=True))
+
+    params: dict = {}
+    extra: str = ""
+    if project and scope_projects and len(scope_projects) == 1:
+        extra = "AND fa.project_id = $proj AND fb.project_id = $proj"
+        params["proj"] = project
+
+    base = store.query_records(
+        f"""
+        MATCH (src:Symbol)-[r:{rel}]->(dst:Symbol), (fa:File), (fb:File)
+        WHERE src.file_id = fa.id AND dst.file_id = fb.id
+        {extra}
+        RETURN src.id as src, dst.id as dst,
+               src.name as src_name, dst.name as dst_name,
+               src.fqname as src_fqname, dst.fqname as dst_fqname,
+               fa.path as src_file_path, fb.path as dst_file_path,
+               fa.project_id as src_project_id, fb.project_id as dst_project_id,
+               coalesce(r.confidence, 0.5) as confidence
+        """,
+        params,
+    )
+
+    if scope_projects and not (len(scope_projects) == 1 and project):
+        base = [
+            r for r in base
+            if r.get("src_project_id") in scope_projects or r.get("dst_project_id") in scope_projects
+        ]
+
+    overlay_docs = _load_overlay_docs(overlay_store, project)
+    for doc in overlay_docs:
+        for file_path, entry in (doc.get("dirty_files") or {}).items():
+            for ref in entry.get("references", []):
+                base.append({
+                    "src": ref.get("src"),
+                    "dst": ref.get("dst"),
+                    "src_name": ref.get("src_name"),
+                    "dst_name": ref.get("dst_name"),
+                    "src_fqname": ref.get("src_fqname"),
+                    "dst_fqname": ref.get("dst_fqname"),
+                    "src_file_path": file_path,
+                    "dst_file_path": ref.get("dst_file_path"),
+                    "src_project_id": doc.get("project_id"),
+                    "dst_project_id": ref.get("dst_project_id", doc.get("project_id")),
+                    "confidence": float(ref.get("confidence", 0.9)),
+                })
+
+    return base

@@ -355,3 +355,157 @@ def link_cross_project_calls(sg, progress=None) -> int:
     _ping(f"{new_edges} cross-project edges created")
     LOGGER.info("Cross-project linking: created %d new call edges.", new_edges)
     return new_edges
+
+
+def link_dependency_imports(store, project_ids: list[str] | None = None, progress=None) -> int:
+    """Create ``REFERENCES_TYPE`` edges from file-level import declarations.
+
+    Reads cached import data from the meta-cache (stored during indexing) and
+    creates ``REFERENCES_TYPE`` edges between symbols whose fully-qualified
+    names appear in another project's import statements.
+
+    This is distinct from ``link_cross_module_calls`` / ``link_cross_project_calls``
+    which scan method signatures for type references.  This pass uses the
+    explicit import declarations that Java/C#/Kotlin files already contain.
+
+    Returns the number of new reference edges created.
+    """
+    import os
+    import json
+
+    from codespine.project_state import list_project_states
+    from codespine.indexer.engine import JavaIndexer
+
+    def _ping(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    if project_ids is None:
+        proj_recs = store.query_records("MATCH (p:Project) RETURN p.id as id")
+        project_ids = [r["id"] for r in proj_recs]
+
+    # Gather all indexed project IDs for cross-project resolution
+    all_project_ids: list[str] = []
+    try:
+        proj_recs = store.query_records("MATCH (p:Project) RETURN p.id as id")
+        all_project_ids = [r["id"] for r in proj_recs]
+    except Exception:
+        all_project_ids = list(project_ids)
+
+    # We need at least 2 unique projects across the whole index
+    unique_projects = set(all_project_ids)
+    if len(unique_projects) < 2:
+        LOGGER.info("link_dependency_imports: fewer than 2 projects (%d), skipping.", len(unique_projects))
+        return 0
+
+    _ping(f"import-resolution linking scanning {len(project_ids)} project(s) across {len(unique_projects)} total")
+
+    # 1. Build symbol index: unqualified-name → [(qualified-name, symbol-id, project-id)]
+    # Also build file_id → first symbol in that file (the source)
+    symbol_index: dict[str, list[tuple[str, str, str]]] = {}
+    file_to_symbols: dict[str, list[dict]] = {}
+    sym_recs = store.query_records(
+        """
+        MATCH (s:Symbol), (f:File)
+        WHERE s.file_id = f.id
+        RETURN s.id as id, s.name as name, s.fqname as fqname, f.project_id as pid,
+               f.id as file_id
+        """
+    )
+    for sr in sym_recs:
+        sname = str(sr.get("name") or "").strip()
+        if sname:
+            symbol_index.setdefault(sname.lower(), []).append(
+                (str(sr.get("fqname") or ""), str(sr.get("id") or ""), str(sr.get("pid") or ""))
+            )
+        fid = str(sr.get("file_id") or "")
+        if fid:
+            file_to_symbols.setdefault(fid, []).append(sr)
+
+    # 2. Scan each project's meta-cache for file-level imports.
+    new_edges = 0
+    seen: set[tuple[str, str]] = set()
+    batch: list[dict] = []
+
+    for pid in project_ids:
+        meta_path = JavaIndexer._meta_cache_path(pid)
+        if not os.path.isfile(meta_path):
+            LOGGER.debug("link_dependency_imports: no meta-cache for %s at %s", pid, meta_path)
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception as exc:
+            LOGGER.debug("link_dependency_imports: failed to read meta-cache %s: %s", meta_path, exc)
+            continue
+
+        if not isinstance(meta, dict):
+            continue
+
+        for file_id, file_data in meta.items():
+            imports: list[str] = []
+            if isinstance(file_data, dict):
+                imports = file_data.get("imports") or []
+            elif isinstance(file_data, list):
+                imports = file_data
+            if not imports:
+                continue
+
+            # Find the source symbol(s) for this file: first class symbol in the file
+            source_sym_id = None
+            for sym in file_to_symbols.get(file_id, []):
+                if sym.get("kind") in ("class", "interface", "enum"):
+                    source_sym_id = sym.get("id")
+                    break
+            if not source_sym_id:
+                # fallback: any symbol in the file
+                src_syms = file_to_symbols.get(file_id, [])
+                if src_syms:
+                    source_sym_id = src_syms[0].get("id")
+
+            if not source_sym_id:
+                LOGGER.debug("link_dependency_imports: no source symbol for file %s", file_id)
+                continue
+
+            for imp_fqn in imports:
+                imp_name = imp_fqn.split(".")[-1].lower() if "." in imp_fqn else imp_fqn.lower()
+                candidates = symbol_index.get(imp_name, [])
+                if not candidates:
+                    continue
+                for dst_fqname, dst_sym_id, dst_pid in candidates:
+                    if dst_pid == pid or not dst_pid:
+                        continue  # same project or unknown project
+                    pair = (source_sym_id, dst_sym_id)
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    batch.append({
+                        "src_id": source_sym_id,
+                        "dst_id": dst_sym_id,
+                        "rel": "REFERENCES_TYPE",
+                        "confidence": 0.9,
+                    })
+                    new_edges += 1
+
+    # 3. Write edges — batch by source-project shard
+    if batch:
+        # Group edges by source project ID (infer from symbol_index)
+        src_pid_map: dict[str, str] = {}
+        for sr in sym_recs:
+            src_pid_map[str(sr.get("id") or "")] = str(sr.get("pid") or "")
+        edges_by_project: dict[str, list[dict]] = {}
+        for edge in batch:
+            src_pid = src_pid_map.get(edge["src_id"], "")
+            if src_pid:
+                edges_by_project.setdefault(src_pid, []).append(edge)
+
+        for src_pid, edges in edges_by_project.items():
+            try:
+                shard_store = store.shard(src_pid)
+                shard_store.add_references_batch(edges)
+            except Exception as exc:
+                LOGGER.warning("link_dependency_imports: batch write failed for %s: %s", src_pid, exc)
+
+    _ping(f"{new_edges} import-reference edges created")
+    LOGGER.info("link_dependency_imports: created %d new reference edges.", new_edges)
+    return new_edges

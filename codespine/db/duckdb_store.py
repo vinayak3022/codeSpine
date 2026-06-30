@@ -247,6 +247,12 @@ CREATE TABLE IF NOT EXISTS co_changed_with (
     days        INTEGER,
     PRIMARY KEY (file_a, file_b)
 );
+
+CREATE TABLE IF NOT EXISTS project_dependencies (
+    project_id      VARCHAR,
+    dependency_id   VARCHAR,
+    PRIMARY KEY (project_id, dependency_id)
+);
 """
 
 
@@ -844,6 +850,38 @@ class DuckDBStore:
             ),
             op_name="upsert_coupling",
         )
+
+    # ------------------------------------------------------------------
+    # Project dependency operations
+    # ------------------------------------------------------------------
+
+    def upsert_project_dependencies(self, project_id: str, dependency_ids: list[str]) -> None:
+        self._with_lock_retry(
+            lambda: self._conn.execute(
+                "DELETE FROM project_dependencies WHERE project_id = ?",
+                [project_id],
+            ),
+            op_name="delete_project_dependencies",
+        )
+        if dependency_ids:
+            rows = [[project_id, dep_id] for dep_id in dependency_ids]
+            self._executemany(
+                "INSERT OR REPLACE INTO project_dependencies (project_id, dependency_id) VALUES (?, ?)",
+                rows,
+            )
+
+    def list_project_dependencies(self, project_id: str, reverse: bool = False) -> list[str]:
+        if reverse:
+            rows = self.query_records(
+                "SELECT project_id AS pid FROM project_dependencies WHERE dependency_id = ? ORDER BY pid",
+                {"pid": project_id},
+            )
+        else:
+            rows = self.query_records(
+                "SELECT dependency_id AS dep_id FROM project_dependencies WHERE project_id = ? ORDER BY dep_id",
+                {"pid": project_id},
+            )
+        return [list(r.values())[0] for r in rows]
 
     # ------------------------------------------------------------------
     # Composite write

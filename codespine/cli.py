@@ -438,6 +438,44 @@ def _set_project_states(modules_with_ids: list[tuple[str, str]], **fields: objec
         update_project_state(project_id, path=module_path, **fields)
 
 
+def _refresh_project_dependency_metadata(modules_with_ids: list[tuple[str, str]]) -> None:
+    """Parse pom.xml for each module and update project state with Maven metadata."""
+    from codespine.indexer.maven import load_maven_project_metadata
+
+    for module_path, project_id in modules_with_ids:
+        meta = load_maven_project_metadata(module_path)
+        if not meta:
+            continue
+        maven_coord = meta.get("coord", "")
+        maven_group_id = meta.get("group_id", "")
+        maven_artifact_id = meta.get("artifact_id", "")
+        maven_version = meta.get("version", "")
+        maven_packaging = meta.get("packaging", "")
+
+        # Map declared dependencies to project IDs
+        dependency_project_ids: list[str] = []
+        for dep in meta.get("dependencies", []):
+            dep_artifact = dep.get("artifact_id", "")
+            if not dep_artifact:
+                continue
+            # Look up the artifact_id among other indexed modules
+            for other_path, other_id in modules_with_ids:
+                other_meta = load_maven_project_metadata(other_path)
+                if other_meta and other_meta.get("artifact_id") == dep_artifact and other_id != project_id:
+                    dependency_project_ids.append(other_id)
+                    break
+
+        update_project_state(
+            project_id,
+            maven_coord=maven_coord,
+            maven_group_id=maven_group_id,
+            maven_artifact_id=maven_artifact_id,
+            maven_version=maven_version,
+            maven_packaging=maven_packaging,
+            dependency_project_ids=dependency_project_ids,
+        )
+
+
 def _record_snapshot_for_projects(modules_with_ids: list[tuple[str, str]]) -> None:
     for module_path, project_id in modules_with_ids:
         update_project_state(project_id, path=module_path)
@@ -2577,6 +2615,53 @@ def ui(host: str, port: int, open_browser: bool) -> None:
                 store = _open_store(read_only=True)
                 results = detect_communities(store, project=project or None)
                 self._json({"results": results})
+                return
+            if parsed.path == "/api/dependency-graph":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                project = (params.get("project") or [None])[0]
+                reverse_flag = (params.get("reverse") or ["false"])[0] == "true"
+                if not project:
+                    self._json({"error": "project parameter required"})
+                    return
+                from codespine.project_state import project_dependency_graph
+                store = _open_store(read_only=True)
+                graph = project_dependency_graph(store, project, reverse=reverse_flag)
+                self._json(graph)
+                return
+            if parsed.path == "/api/project-usages":
+                qs = urlparse(self.path).query
+                from urllib.parse import parse_qs
+                params = parse_qs(qs)
+                project = (params.get("project") or [None])[0]
+                if not project:
+                    self._json({"error": "project parameter required"})
+                    return
+                from codespine.overlay.merge import merged_reference_edges
+                store = _open_store(read_only=True)
+                overlay_store = getattr(store, "overlay_store", None)
+                ref_edges = merged_reference_edges(store, overlay_store, project=None, rel="REFERENCES_TYPE")
+                dependent_projects: set[str] = set()
+                import_groups: dict[str, list[dict]] = {}
+                for edge in ref_edges:
+                    if edge.get("dst_project_id") == project and edge.get("src_project_id") != project:
+                        src_pid = edge.get("src_project_id")
+                        dependent_projects.add(src_pid)
+                        import_groups.setdefault(src_pid, []).append({
+                            "src_symbol": edge.get("src"),
+                            "src_name": edge.get("src_name"),
+                            "src_fqname": edge.get("src_fqname"),
+                            "src_file_path": edge.get("src_file_path"),
+                            "confidence": edge.get("confidence"),
+                        })
+                self._json({
+                    "project": project,
+                    "dependent_project_count": len(dependent_projects),
+                    "import_reference_count": sum(len(v) for v in import_groups.values()),
+                    "dependent_projects": sorted(dependent_projects),
+                    "imports_by_project": import_groups,
+                })
                 return
             self._send(b"not found", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
 

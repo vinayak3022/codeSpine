@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
-from codespine.overlay.merge import merged_call_edges, merged_method_records, merged_symbol_records
+from codespine.overlay.merge import merged_call_edges, merged_method_records, merged_reference_edges, merged_symbol_records
+from codespine.project_state import project_dependency_closure
+
+
+def _scope_project_ids(project: str | None) -> set[str]:
+    return set(project_dependency_closure(project, include_self=True)) if project else set()
 
 
 def _symbol_exact_match(rec: dict, needle: str) -> bool:
@@ -255,6 +260,33 @@ def _resolve_method_metadata(store, method_ids: list[str], project: str | None =
     return {r["id"]: r for r in recs}
 
 
+def _resolve_importing_classes(
+    store, overlay_store, target_symbol_ids: list[str], scope_projects: set[str] | None = None,
+) -> list[dict]:
+    """Return cross-project import references for the given target symbol IDs."""
+    if not target_symbol_ids:
+        return []
+    try:
+        ref_edges = merged_reference_edges(store, overlay_store, project=None, rel="REFERENCES_TYPE")
+        return [
+            {
+                "symbol": edge.get("src"),
+                "name": edge.get("src_name"),
+                "fqname": edge.get("src_fqname"),
+                "file_path": edge.get("src_file_path"),
+                "project_id": edge.get("src_project_id"),
+                "edge_type": edge.get("rel"),
+                "confidence": float(edge.get("confidence") or 0.5),
+            }
+            for edge in ref_edges
+            if edge.get("dst") in target_symbol_ids
+            and edge.get("src_project_id") != edge.get("dst_project_id")
+            and (not scope_projects or edge.get("src_project_id") in scope_projects or edge.get("dst_project_id") in scope_projects)
+        ]
+    except Exception:
+        return []
+
+
 def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | None = None) -> dict:
     resolution = resolve_symbol_targets(store, symbol_query, project=project)
     if resolution["status"] != "exact":
@@ -262,6 +294,8 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
             "target": symbol_query,
             "resolution": resolution,
             "depth_groups": {"1": [], "2": [], "3+": []},
+            "importing_classes": [],
+            "dependent_projects": [],
         }
         if resolution["status"] == "ambiguous":
             payload["ambiguity"] = {"matches": resolution["matches"]}
@@ -269,8 +303,19 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
 
     overlay_store = getattr(store, "overlay_store", None)
     target_method_ids = resolution["resolved_method_ids"]
+    target_symbol_ids = [str(m.get("id") or "") for m in (resolution.get("matches") or []) if m.get("id")]
     if not target_method_ids:
-        return {"target": symbol_query, "resolution": resolution, "depth_groups": {"1": [], "2": [], "3+": []}}
+        importing_classes = _resolve_importing_classes(store, overlay_store, target_symbol_ids, _scope_project_ids(project))
+        dependent_projects = sorted({item.get("project_id") for item in importing_classes if item.get("project_id")})
+        return {
+            "target": symbol_query,
+            "resolution": resolution,
+            "depth_groups": {"1": [], "2": [], "3+": []},
+            "importing_classes": importing_classes,
+            "dependent_projects": dependent_projects,
+        }
+
+    scope_projects = _scope_project_ids(project)
 
     # Load call edges; when project is provided, keep traversal within that scope.
     if overlay_store is not None:
@@ -450,12 +495,18 @@ def analyze_impact(store, symbol_query: str, max_depth: int = 4, project: str | 
             impacted_depth1.append(item)
     depth_groups["1"] = impacted_depth1
 
+    # ── Cross-project import references ───────────────────────────────────
+    importing_classes = _resolve_importing_classes(store, overlay_store, target_symbol_ids, scope_projects)
+    dependent_projects = sorted({item.get("project_id") for item in importing_classes if item.get("project_id")})
+
     return {
         "target": symbol_query,
         "resolution": resolution,
         "resolved_to": resolved_targets,
         "self_callers": self_callers,
         "impacted_callers": depth_groups,
+        "importing_classes": importing_classes,
+        "dependent_projects": dependent_projects,
         "summary": {
             "direct": len(depth_groups["1"]),
             "indirect": len(depth_groups["2"]),

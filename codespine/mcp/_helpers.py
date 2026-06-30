@@ -29,6 +29,8 @@ __all__ = [
     "_index_guard",
     "_normalize_symbol_input",
     "_preferred_symbol_inputs",
+    "_parse_project_symbol",
+    "_cross_project_guidance",
     "_parse_indexed_at",
     "MCPTelemetry",
     "_staleness_meta",
@@ -177,6 +179,64 @@ def _preferred_symbol_inputs(raw: str) -> list[str]:
     if normalized and normalized != original:
         candidates.append(normalized)
     return candidates
+
+
+def _parse_project_symbol(symbol: str, project: str | None = None) -> tuple[str | None, str]:
+    """Parse ``project::SymbolName`` shorthand syntax.
+
+    If *symbol* contains ``::``, extract the project prefix and the actual
+    symbol name.  An explicit *project* keyword argument always takes
+    precedence over the inline prefix.
+
+    Returns ``(project, symbol_name)`` — the resolved project (possibly None)
+    and the cleaned symbol string.
+    """
+    s = symbol.strip()
+    if "::" in s:
+        parts = s.split("::", 1)
+        prefix = parts[0].strip()
+        rest = parts[1].strip()
+        if prefix and rest:
+            # Inline prefix only applies when no explicit project was given.
+            if project is None:
+                project = prefix
+            return project, rest
+    return project, s
+
+
+def _cross_project_guidance(store) -> str:
+    """Check for cross-project reference edges and return actionable guidance.
+
+    Returns an empty string when cross-project data already exists or when
+    fewer than 2 projects are present.
+    """
+    try:
+        proj_recs = store.query_records(
+            "MATCH (p:Project) RETURN count(p) as n"
+        )
+        project_count = _sum_count_rows(proj_recs)
+        if project_count < 2:
+            return ""
+        # Check for any REFERENCES_TYPE edges where src and dst are in
+        # different projects.
+        ref_rows = store.query_records(
+            """
+            MATCH (src:Symbol)-[r:REFERENCES_TYPE]->(dst:Symbol), (sf:File), (df:File)
+            WHERE src.file_id = sf.id AND dst.file_id = df.id AND sf.project_id <> df.project_id
+            RETURN count(r) as n
+            LIMIT 1
+            """
+        )
+        ref_count = _sum_count_rows(ref_rows)
+        if ref_count > 0:
+            return ""  # cross-project data exists, no guidance needed
+        return (
+            "Hint: 2+ projects are indexed but no cross-project import references were found. "
+            "Run 'codespine analyse --complete <workspace>' with --complete to enable "
+            "import-resolution linking across projects."
+        )
+    except Exception:
+        return ""
 
 
 def _parse_indexed_at(raw) -> int:

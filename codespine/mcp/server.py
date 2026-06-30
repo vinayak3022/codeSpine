@@ -54,6 +54,7 @@ from codespine.cache.result_cache import ResultCache
 from codespine.mcp._helpers import (
     MCPTelemetry,
     _StoreProxy,
+    _cross_project_guidance,
     _get_watch_active,
     _git_available,
     _index_guard,
@@ -61,6 +62,7 @@ from codespine.mcp._helpers import (
     _no_symbols_response,
     _normalize_symbol_input,
     _parse_indexed_at,
+    _parse_project_symbol,
     _preferred_symbol_inputs,
     _project_inventory,
     _reload_store_instance,
@@ -452,6 +454,62 @@ def build_mcp_server(store, repo_path_provider):
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    def get_dependency_graph(project: str | None = None, reverse: bool = False):
+        """Return the project dependency graph as nodes + edges.
+
+        Parameters:
+          project – If provided, restricts the graph to the subgraph reachable
+                    from this project (its dependency closure).
+          reverse – When True, returns the reverse dependency graph (projects
+                    that depend on the given project).
+
+        Returns {nodes: [{id, name, path}], edges: [{src, dst, direction}]}
+        """
+        from codespine.project_state import project_dependency_graph as _pd_graph
+        return _pd_graph(store, project=project, reverse=reverse)
+
+    @mcp.tool()
+    def find_project_usages(project: str):
+        """Find which other projects import/reference symbols from *project*.
+
+        Returns dependent_projects, import_reference_count, and
+        imports_by_project grouped by importing project.
+        """
+        if not project:
+            return {"available": False, "error": "project parameter required"}
+        try:
+            from codespine.overlay.merge import merged_reference_edges
+            from codespine.project_state import project_dependency_closure
+
+            overlay_store = getattr(store, "overlay_store", None)
+            ref_edges = merged_reference_edges(store, overlay_store, project=None, rel="REFERENCES_TYPE")
+            dependent_projects: set[str] = set()
+            import_groups: dict[str, list[dict]] = {}
+            for edge in ref_edges:
+                if edge.get("dst_project_id") == project and edge.get("src_project_id") != project:
+                    src_pid = str(edge.get("src_project_id") or "")
+                    if not src_pid:
+                        continue
+                    dependent_projects.add(src_pid)
+                    import_groups.setdefault(src_pid, []).append({
+                        "src_symbol": edge.get("src"),
+                        "src_name": edge.get("src_name"),
+                        "src_fqname": edge.get("src_fqname"),
+                        "src_file_path": edge.get("src_file_path"),
+                        "confidence": edge.get("confidence"),
+                    })
+            return {
+                "available": True,
+                "project": project,
+                "dependent_project_count": len(dependent_projects),
+                "import_reference_count": sum(len(v) for v in import_groups.values()),
+                "dependent_projects": sorted(dependent_projects),
+                "imports_by_project": import_groups,
+            }
+        except Exception as exc:
+            return {"available": False, "error": str(exc)[:200]}
+
+    @mcp.tool()
     def search_hybrid(
         query: str,
         k: int = 20,
@@ -491,9 +549,14 @@ def build_mcp_server(store, repo_path_provider):
         Includes DI edges (@Inject/@Autowired/@Provides/@Bean) when the index has been
         built with a DI-aware version of CodeSpine.
 
+        Supports ``project::SymbolName`` shorthand in the *symbol* parameter
+        (e.g. ``vision::BaseStateMachine``). An explicit ``project=`` keyword
+        argument takes precedence.
+
         project scopes the target symbol lookup; cross-project callers are always included.
         """
         try:
+            project, symbol = _parse_project_symbol(symbol, project)
             _ck = _cache_key(
                 "get_impact",
                 symbol=symbol,
@@ -885,6 +948,8 @@ def build_mcp_server(store, repo_path_provider):
 
         Parameters:
           name    – Simple class/method name, fully-qualified name, or prefix.
+                    Supports ``project::SymbolName`` shorthand (the inline project
+                    prefix is overridden by an explicit project= argument).
                     Matching is case-insensitive on the simple name; exact on the FQCN.
           kind    – Optional filter: "class", "method", or "field".
           project – Optional project_id to restrict the search.
@@ -893,21 +958,33 @@ def build_mcp_server(store, repo_path_provider):
         Returns results grouped by kind and project, each with:
           id, name, fqname, project_id, file_path, line, col.
         """
+        project, name = _parse_project_symbol(name, project)
+
+        # Compute dependency closure scope for project filtering
+        scope_projects: set[str] | None = None
+        if project:
+            from codespine.project_state import project_dependency_closure
+            scope_projects = set(project_dependency_closure(project, include_self=True))
+
         name_lower = name.lower()
-        project_clause = "AND f.project_id = $proj" if project else ""
+        # When scope_projects includes more than just `project`, fetch all and filter locally
+        filter_project = project
+        if scope_projects and len(scope_projects) > 1:
+            filter_project = None
+        project_clause = "AND f.project_id = $proj" if filter_project else ""
         # Note: only $namel and $lim are referenced in the queries below.
         # Do NOT add extra keys here — some Kuzu versions raise "Parameter not found"
         # when the params dict contains keys absent from the query string.
         params: dict = {"namel": name_lower, "lim": limit}
-        if project:
-            params["proj"] = project
+        if filter_project:
+            params["proj"] = filter_project
 
         from codespine.overlay.merge import merged_class_records, merged_method_records
 
         classes: list[dict] = []
         methods: list[dict] = []
         if kind != "method":
-            for rec in merged_class_records(store, overlay_store, project=project):
+            for rec in merged_class_records(store, overlay_store, project=filter_project):
                 rec_name = str(rec.get("name") or "").lower()
                 rec_fqcn = str(rec.get("fqcn") or "").lower()
                 if rec_name == name_lower or rec_fqcn == name_lower or name_lower in rec_fqcn or name_lower in rec_name:
@@ -925,7 +1002,7 @@ def build_mcp_server(store, repo_path_provider):
                         break
 
         if kind != "class":
-            for rec in merged_method_records(store, overlay_store, project=project):
+            for rec in merged_method_records(store, overlay_store, project=filter_project):
                 rec_name = str(rec.get("name") or "").lower()
                 signature = str(rec.get("signature") or "").lower()
                 if rec_name == name_lower or name_lower in signature:
@@ -945,10 +1022,10 @@ def build_mcp_server(store, repo_path_provider):
 
         fields: list[dict] = []
         if kind in (None, "field"):
-            project_clause_f = "AND f.project_id = $proj" if project else ""
+            project_clause_f = "AND f.project_id = $proj" if filter_project else ""
             field_params: dict = {"namel": name_lower, "lim": limit}
-            if project:
-                field_params["proj"] = project
+            if filter_project:
+                field_params["proj"] = filter_project
             field_recs = store.query_records(
                 f"""
                 MATCH (s:Symbol), (f:File)
@@ -974,6 +1051,12 @@ def build_mcp_server(store, repo_path_provider):
                         "col": rec.get("col"),
                     }
                 )
+
+        # Filter by dependency closure scope
+        if scope_projects:
+            classes = [c for c in classes if c.get("project_id") in scope_projects]
+            methods = [m for m in methods if m.get("project_id") in scope_projects]
+            fields = [f for f in fields if f.get("project_id") in scope_projects]
 
         total = len(classes) + len(methods) + len(fields)
         if total == 0:
@@ -2042,6 +2125,12 @@ def build_mcp_server(store, repo_path_provider):
                     data = _j.loads(result)
                     data["dispatched_to"] = dispatched_to
                     data["interpreted_as"] = interpreted_as
+                    # Append cross-project guidance when no cross-project edges exist
+                    # and the user didn't already get a "not found" response.
+                    if data.get("available") is not False:
+                        guidance = _cross_project_guidance(store)
+                        if guidance:
+                            data["cross_project_guidance"] = guidance
                     return _json(data)
                 except Exception:
                     return result
@@ -2056,9 +2145,14 @@ def build_mcp_server(store, repo_path_provider):
         Intent-named wrapper around get_impact that also includes DI consumers.
         Returns a flat summary with risk_level to help prioritise refactoring.
 
+        Supports ``project::SymbolName`` shorthand in the *symbol* parameter
+        (e.g. ``vision::BaseStateMachine``). An explicit ``project=`` keyword
+        argument takes precedence.
+
         risk_level: "low" (<5 callers), "medium" (5–20), "high" (>20).
         """
         try:
+            project, symbol = _parse_project_symbol(symbol, project)
             result = None
             for candidate in _preferred_symbol_inputs(symbol):
                 result = analyze_impact(store, candidate, max_depth=4, project=project)
@@ -2106,8 +2200,13 @@ def build_mcp_server(store, repo_path_provider):
           matched    — what the symbol is (type, fqname, file_path, line)
           neighbors  — direct callers and callees
           community  — architectural cluster membership
+
+        Supports ``project::SymbolName`` shorthand in the *symbol* parameter
+        (e.g. ``vision::BaseStateMachine``). An explicit ``project=`` keyword
+        argument takes precedence.
         """
         try:
+            project, symbol = _parse_project_symbol(symbol, project)
             resolution = None
             for candidate in _preferred_symbol_inputs(symbol):
                 resolution = resolve_symbol_targets(store, candidate, project=project)
@@ -2173,6 +2272,24 @@ def build_mcp_server(store, repo_path_provider):
                 callers = []
                 callees = []
 
+            # Cross-project importers via reference edges
+            imported_by: list[dict] = []
+            try:
+                from codespine.overlay.merge import merged_reference_edges
+                ref_edges = merged_reference_edges(store, overlay_store, rel="REFERENCES_TYPE")
+                for edge in ref_edges:
+                    if (edge.get("dst") == top.get("id")
+                            and edge.get("src_project_id") != edge.get("dst_project_id")):
+                        imported_by.append({
+                            "project_id": edge.get("src_project_id"),
+                            "symbol": edge.get("src"),
+                            "name": edge.get("src_name"),
+                            "fqname": edge.get("src_fqname"),
+                            "file_path": edge.get("src_file_path"),
+                        })
+            except Exception:
+                pass
+
             return _staleness_meta(store, {
                 "available": True,
                 "symbol": symbol,
@@ -2180,6 +2297,7 @@ def build_mcp_server(store, repo_path_provider):
                 "community": community_info[0] if community_info else None,
                 "callers": callers,
                 "callees": callees,
+                "imported_by": imported_by,
                 "resolution_status": resolution.get("status"),
             }, project, overlay_store=overlay_store)
         except Exception as exc:
@@ -2423,6 +2541,25 @@ def build_mcp_server(store, repo_path_provider):
                 except Exception:
                     pass
 
+            # Cross-project importers via reference edges
+            imported_by: list[dict] = []
+            try:
+                from codespine.overlay.merge import merged_reference_edges
+                symbol_ids_in_file = {s.get("id") for s in symbols if s.get("id")}
+                for edge in merged_reference_edges(store, overlay_store, rel="REFERENCES_TYPE"):
+                    if edge.get("dst_file_path") == abs_fp or edge.get("dst") in symbol_ids_in_file:
+                        if (edge.get("src_project_id") and edge.get("dst_project_id")
+                                and edge.get("src_project_id") != edge.get("dst_project_id")):
+                            imported_by.append({
+                                "project_id": edge.get("src_project_id"),
+                                "symbol": edge.get("src"),
+                                "name": edge.get("src_name"),
+                                "fqname": edge.get("src_fqname"),
+                                "file_path": edge.get("src_file_path"),
+                            })
+            except Exception:
+                pass
+
             return _staleness_meta(store, {
                 "available": True,
                 "file": abs_fp,
@@ -2432,6 +2569,7 @@ def build_mcp_server(store, repo_path_provider):
                 "community": community,
                 "coupling": coupling,
                 "overlay_dirty": overlay_dirty,
+                "imported_by": imported_by,
             }, project, overlay_store=overlay_store)
         except Exception as exc:
             return _safe_tool_response("file_context", exc)
@@ -2940,6 +3078,26 @@ def build_mcp_server(store, repo_path_provider):
                             "suggested_name": new_name,
                             "note": "Override — must match new name",
                         })
+
+            # Import reference sites (cross-project type references)
+            try:
+                from codespine.overlay.merge import merged_reference_edges
+                for edge in merged_reference_edges(store, overlay_store, rel="REFERENCES_TYPE"):
+                    if edge.get("dst") in target_ids:
+                        fp = edge.get("src_file_path", "")
+                        if fp:
+                            declaration_files.setdefault(fp, {
+                                "file_path": fp,
+                                "project_id": edge.get("src_project_id"),
+                                "changes": [],
+                            })["changes"].append({
+                                "kind": "import_reference",
+                                "current_name": symbol,
+                                "suggested_name": new_name,
+                                "note": f"Import reference in {edge.get('src_fqname', '<unknown>')}",
+                            })
+            except Exception:
+                pass
 
             files_to_modify = sorted(
                 declaration_files.values(), key=lambda x: x.get("file_path", "")

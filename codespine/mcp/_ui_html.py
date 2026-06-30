@@ -266,6 +266,20 @@ tr:hover td{background:var(--bg-tag)}
   .diff-grid{grid-template-columns:1fr}
   .topbar{padding:10px 14px}
 }
+
+/* ─── Modal overlay & cards ─── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;display:none}
+.modal-card{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:201;background:var(--bg-primary);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);max-width:700px;width:90vw;max-height:80vh;overflow-y:auto;display:none}
+.modal-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border-light)}
+.modal-title{font-weight:600;font-size:16px}
+.modal-close{cursor:pointer;font-size:22px;color:var(--text-muted);padding:0 4px}
+.modal-close:hover{color:var(--text)}
+.modal-body{padding:16px 20px}
+.modal-body details{margin-bottom:8px}
+.modal-body summary{cursor:pointer;font-weight:500;padding:4px 0}
+.table-sm{width:100%;border-collapse:collapse;font-size:13px}
+.table-sm th,.table-sm td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--border-light)}
+.table-sm th{font-weight:500;color:var(--text-muted)}
 </style>
 </head>
 <body>
@@ -402,6 +416,76 @@ async function refreshAll() {
   }
 }
 
+/* ─── Dependency Graph / Project Usage modals ─── */
+let _activeDepsProject = null;
+let _activeUsagesProject = null;
+
+async function showProjectDependencies(projectId) {
+  _activeDepsProject = projectId;
+  const data = await api('/api/dependency-graph?project='+encodeURIComponent(projectId));
+  const card = document.getElementById('deps-card');
+  const overlay = document.getElementById('modal-overlay');
+  if (!data || data.error) {
+    toast('No dependency data for '+esc(projectId), 'error');
+    return;
+  }
+  const nodes = data.nodes || [];
+  const edges = data.edges || [];
+  card.querySelector('.modal-title').textContent = 'Dependency Graph — ' + esc(projectId);
+  card.querySelector('.modal-body').innerHTML = `
+    <div class="mb-8"><strong>${nodes.length}</strong> projects, <strong>${edges.length}</strong> edges</div>
+    <table class="table-sm">
+      <thead><tr><th>Project</th><th>Direction</th><th>Dependency</th></tr></thead>
+      <tbody>${edges.map(e => `
+        <tr>
+          <td>${esc(e.src)}</td>
+          <td>${e.direction === 'forward' ? '→ depends on' : '← used by'}</td>
+          <td>${esc(e.dst)}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="3" class="text-muted">No dependency edges found.</td></tr>'}</tbody>
+    </table>
+  `;
+  overlay.style.display = 'block';
+  card.style.display = 'block';
+}
+
+async function showProjectUsages(projectId) {
+  _activeUsagesProject = projectId;
+  const data = await api('/api/project-usages?project='+encodeURIComponent(projectId));
+  const card = document.getElementById('usages-card');
+  const overlay = document.getElementById('modal-overlay');
+  if (!data || data.error) {
+    toast('No usage data for '+esc(projectId), 'error');
+    return;
+  }
+  card.querySelector('.modal-title').textContent = 'Project Usage — ' + esc(projectId);
+  const deps = data.dependent_projects || [];
+  const totalRefs = data.import_reference_count || 0;
+  const byProject = data.imports_by_project || {};
+  card.querySelector('.modal-body').innerHTML = `
+    <div class="mb-8">
+      <strong>${deps.length}</strong> dependent project${deps.length === 1 ? '' : 's'}, <strong>${totalRefs}</strong> import reference${totalRefs === 1 ? '' : 's'}
+    </div>
+    ${deps.length === 0 ? '<div class="text-muted">No other project imports from this one.</div>' : deps.map(pid => `
+      <details class="mb-4"${deps.length <= 3 ? ' open' : ''}>
+        <summary><strong>${esc(pid)}</strong> — ${(byProject[pid]||[]).length} references</summary>
+        <table class="table-sm">
+          <thead><tr><th>Symbol</th><th>File</th><th>Confidence</th></tr></thead>
+          <tbody>${(byProject[pid]||[]).map(ref => `
+            <tr>
+              <td>${esc(ref.src_name || ref.src_fqname) || '—'}</td>
+              <td class="text-xs">${esc(ref.src_file_path || '')}</td>
+              <td>${ref.confidence != null ? (+ref.confidence).toFixed(2) : '—'}</td>
+            </tr>
+          `).join('')}</tbody>
+        </table>
+      </details>
+    `).join('')}
+  `;
+  overlay.style.display = 'block';
+  card.style.display = 'block';
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    View Renderers
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -489,6 +573,8 @@ VIEWS.projects = function(el) {
             <td class="text-xs text-muted">${p.last_good_snapshot_at ? new Date(p.last_good_snapshot_at*1000).toLocaleString() : '-'}</td>
             <td>
               <div class="btn-group">
+                <button class="btn btn-sm btn-secondary" onclick="showProjectDependencies('${p.id}')">Deps</button>
+                <button class="btn btn-sm btn-secondary" onclick="showProjectUsages('${p.id}')">Usages</button>
                 <button class="btn btn-sm" onclick="apiPost('/api/repair',{project_id:'${p.id}',mode:'auto'}).then(r=>{toast('Repair started: '+r.task_id,'success');refreshAll()})">Repair</button>
                 <button class="btn btn-sm btn-danger" onclick="if(confirm('Reindex ${esc(p.id)}?'))apiPost('/api/repair',{project_id:'${p.id}',mode:'full'}).then(r=>{toast('Reindex started: '+r.task_id,'success');refreshAll()})">Reindex</button>
               </div>
@@ -855,7 +941,7 @@ VIEWS.settings = function(el) {
         <div><span class="text-muted">Version:</span> v${esc(STATE.version||'—')}</div>
         <div><span class="text-muted">Projects:</span> ${STATE.projects.length}</div>
         <div><span class="text-muted">Auto-refresh:</span> Every 5 seconds</div>
-        <div><span class="text-muted">API:</span> <code>/api/status /api/projects /api/health /api/tasks /api/search /api/impact /api/deadcode /api/ask /api/diff /api/communities</code></div>
+        <div><span class="text-muted">API:</span> <code>/api/status /api/projects /api/health /api/tasks /api/search /api/impact /api/deadcode /api/ask /api/diff /api/communities /api/dependency-graph /api/project-usages</code></div>
       </div>
     </div>
     <div class="card">
@@ -919,5 +1005,25 @@ navigate(initialView);
 refreshAll();
 setInterval(refreshAll, 5000);
 </script>
+
+<!-- Modal overlay & cards -->
+<div id="modal-overlay" class="modal-overlay" onclick="this.style.display='none';document.querySelectorAll('.modal-card').forEach(c=>c.style.display='none')" style="display:none"></div>
+
+<div id="deps-card" class="modal-card" style="display:none">
+  <div class="modal-header">
+    <span class="modal-title">Dependency Graph</span>
+    <span class="modal-close" onclick="document.getElementById('modal-overlay').style.display='none';this.parentElement.parentElement.style.display='none'">&times;</span>
+  </div>
+  <div class="modal-body"></div>
+</div>
+
+<div id="usages-card" class="modal-card" style="display:none">
+  <div class="modal-header">
+    <span class="modal-title">Project Usage</span>
+    <span class="modal-close" onclick="document.getElementById('modal-overlay').style.display='none';this.parentElement.parentElement.style.display='none'">&times;</span>
+  </div>
+  <div class="modal-body"></div>
+</div>
+
 </body>
 </html>"""
