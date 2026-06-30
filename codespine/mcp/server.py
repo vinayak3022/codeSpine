@@ -76,6 +76,27 @@ from codespine.mcp._helpers import (
 )
 
 
+def _camel_case_tokens(text: str) -> list[str]:
+    """Split a PascalCase/camelCase string into lowercase tokens.
+
+    e.g. ``_camel_case_tokens("ScreeningStateMachine")``
+         -> ``["screening", "state", "machine"]``
+    """
+    if not text:
+        return []
+    tokens: list[str] = []
+    current = [text[0]]
+    for ch in text[1:]:
+        if ch.isupper():
+            tokens.append("".join(current).lower())
+            current = [ch]
+        else:
+            current.append(ch)
+    if current:
+        tokens.append("".join(current).lower())
+    return tokens
+
+
 def build_mcp_server(store, repo_path_provider):
     store = _StoreProxy(store)
     _raw_mcp = FastMCP("codespine")
@@ -1059,6 +1080,76 @@ def build_mcp_server(store, repo_path_provider):
             fields = [f for f in fields if f.get("project_id") in scope_projects]
 
         total = len(classes) + len(methods) + len(fields)
+
+        # ── Phase 2 fallback: SQL-level prefix / token-boundary matching ──
+        # When in-memory matching returns 0 hits for a query that looks like
+        # a real symbol name (PascalCase), fall back to SQL CONTAINS and
+        # camelCase token-boundary matching.  This catches edge cases where
+        # the symbol exists in the DB but differs in encoding, whitespace, or
+        # case normalization from the query, or where the in-memory matching
+        # has a subtle filtering issue.
+        if total == 0 and name_lower and name_lower[0].isalpha() and name_lower[0].isupper():
+            _LOGGER.info("find_symbol: 0 results for '%s', trying SQL-level fallback", name)
+            tokens = _camel_case_tokens(name_lower)
+            tried_tokens = False
+            for token in sorted(tokens, key=len, reverse=True):
+                if len(token) < 3:
+                    continue
+                tried_tokens = True
+                fb_params: dict = {"tok": token, "lim": limit}
+                if filter_project:
+                    fb_params["proj"] = filter_project
+                if not classes and kind != "method":
+                    for r in store.query_records(
+                        f"MATCH (c:Class), (f:File) WHERE c.file_id = f.id "
+                        f"AND lower(c.name) CONTAINS $tok {project_clause} "
+                        f"RETURN c.id as id, c.name as name, c.fqcn as fqcn, "
+                        f"c.package as pkg, f.project_id as pid, f.path as fp LIMIT $lim",
+                        fb_params,
+                    ):
+                        classes.append({"id": r["id"], "name": r["name"], "fqname": r["fqcn"],
+                                        "package": r["pkg"], "project_id": r["pid"],
+                                        "file_path": r["fp"]})
+                if not methods and kind != "class":
+                    for r in store.query_records(
+                        f"MATCH (m:Method), (c:Class), (f:File) "
+                        f"WHERE m.class_id = c.id AND c.file_id = f.id "
+                        f"AND (lower(m.name) CONTAINS $tok OR lower(m.signature) CONTAINS $tok) "
+                        f"{project_clause} RETURN m.id as id, m.name as name, "
+                        f"m.signature as sig, m.return_type as rt, c.fqcn as cfqcn, "
+                        f"f.project_id as pid, f.path as fp LIMIT $lim",
+                        fb_params,
+                    ):
+                        methods.append({"id": r["id"], "name": r["name"], "fqname": r["sig"],
+                                        "class_fqcn": r["cfqcn"], "project_id": r["pid"],
+                                        "file_path": r["fp"], "return_type": r["rt"]})
+                if not fields and kind in (None, "field"):
+                    fb_field_params: dict = {"tok": token, "lim": limit}
+                    if filter_project:
+                        fb_field_params["proj"] = filter_project
+                    for r in store.query_records(
+                        f"MATCH (s:Symbol), (f:File) WHERE s.file_id = f.id AND s.kind = 'field' "
+                        f"AND lower(s.name) CONTAINS $tok {project_clause_f} "
+                        f"RETURN s.id as id, s.name as name, s.fqname as fqname, "
+                        f"f.project_id as pid, f.path as fp, s.line as ln, s.col as cl LIMIT $lim",
+                        fb_field_params,
+                    ):
+                        fields.append({"id": r["id"], "name": r["name"], "fqname": r["fqname"],
+                                       "project_id": r["pid"], "file_path": r["fp"],
+                                       "line": r["ln"], "col": r["cl"]})
+                if classes or methods or fields:
+                    break
+            if tried_tokens and (classes or methods or fields):
+                # Apply dependency-closure scoping to fallback results too.
+                if scope_projects:
+                    classes = [c for c in classes if c.get("project_id") in scope_projects]
+                    methods = [m for m in methods if m.get("project_id") in scope_projects]
+                    fields = [f for f in fields if f.get("project_id") in scope_projects]
+                total = len(classes) + len(methods) + len(fields)
+                if total > 0:
+                    _LOGGER.info("find_symbol fallback matched %d symbols for '%s' via token '%s'",
+                                 total, name, token)
+
         if total == 0:
             return {
                 "available": False,

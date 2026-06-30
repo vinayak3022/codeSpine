@@ -20,6 +20,17 @@ _LOW_CONFIDENCE_THRESHOLD = 0.05
 _SNIPPET_CONTEXT_LINES = 2  # lines above and below the symbol declaration
 _SEARCH_PROVENANCE_VERSION = 12
 
+# Stopwords stripped before token-level confidence matching.
+_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "have", "has", "had", "can", "could", "will",
+    "would", "shall", "should", "may", "might", "must", "of", "in",
+    "on", "at", "to", "for", "with", "by", "from", "as", "into",
+    "how", "what", "when", "where", "why", "who", "which", "this",
+    "that", "it", "its", "or", "and", "but", "not", "no", "if",
+    "about", "does", "just", "very", "than", "also", "so", "get", "got",
+})
+
 
 def _store_snapshot_mtime(store, project: str | None = None) -> float:
     try:
@@ -58,6 +69,37 @@ def _snapshot_mtime_for_path(path: str) -> float:
     except OSError:
         pass
     return 0.0
+
+
+def _sql_prefilter_candidates(
+    store, query_lower: str, pool_size: int, project: str | None = None,
+) -> list[dict]:
+    """Pre-filter the candidate symbol pool using SQL CONTAINS.
+
+    Runs a DuckDB-native CONTAINS query against symbol name/fqname to quickly
+    narrow the candidate pool before expensive in-Python BM25/fuzzy ranking.
+    Produces a dict of symbol records (without embeddings) for the top-*pool_size*
+    matches.
+
+    Falls back to returning the first *pool_size* records if the SQL path fails.
+    """
+    pref_clause = "AND f.project_id = $proj" if project else ""
+    pref_params: dict = {"q": query_lower, "lim": pool_size}
+    if project:
+        pref_params["proj"] = project
+    rows = store.query_records(
+        f"""
+        MATCH (s:Symbol), (f:File)
+        WHERE s.file_id = f.id {pref_clause}
+          AND (lower(s.name) CONTAINS $q OR lower(s.fqname) CONTAINS $q)
+        RETURN s.id as id, s.kind as kind, s.name as name, s.fqname as fqname,
+               s.line as line, s.file_id as file_id,
+               f.path as file_path, f.project_id as project_id, f.is_test as is_test
+        LIMIT $lim
+        """,
+        pref_params,
+    )
+    return rows if rows else []
 
 
 def _rank_trace_map(ranking: list[tuple[str, float]], limit: int) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
@@ -286,6 +328,13 @@ def hybrid_search(
     pool_size: int | None = None,
 ) -> list[dict] | dict:
     overlay_store = getattr(store, "overlay_store", None)
+    _pool = pool_size or SETTINGS.semantic_candidate_pool
+
+    # ── Phase 1a: Lightweight symbol load (no embeddings) ────────────────
+    # Embeddings are multi-KB each (384 floats).  Loading them for every
+    # search is wasteful because `rank_semantic_sql` handles vector distance
+    # natively in DuckDB.  Only load embeddings on-demand when the SQL
+    # vector path is unavailable (fallback to Python cosine-similarity).
     if overlay_store is not None:
         recs = merged_symbol_records(store, overlay_store, project=project)
     else:
@@ -301,7 +350,6 @@ def hybrid_search(
                    s.kind as kind,
                    s.name as name,
                    s.fqname as fqname,
-                   s.embedding as embedding,
                    s.line as line,
                    s.file_id as file_id,
                    f.path as file_path,
@@ -338,22 +386,64 @@ def hybrid_search(
         fuzzy_traces: list[dict[str, object]] = []
         semantic_traces: list[dict[str, object]] = []
     else:
-        # Rich multi-field text for BM25 — includes kind, name, fqname,
-        # file-path basename, and project_id.
-        lexical_docs = [(r["id"], _build_lexical_text(r)) for r in recs]
-        # Fuzzy search still uses name primarily (edit-distance on short text).
-        fuzzy_docs = [(r["id"], r.get("name", "")) for r in recs]
-        vector_docs = [(r["id"], r.get("embedding")) for r in recs]
+        # ── Phase 1b: Candidate pool pre-filter ─────────────────────────
+        # For large symbol indexes, pre-filter the candidate pool using SQL
+        # CONTAINS / LIKE before running expensive in-Python BM25/fuzzy.
+        # If the query looks like a symbol name (no spaces, PascalCase), the
+        # pre-filter is a safe precision gain.  For free-form questions
+        # ("how does payment work?") we fall back to the full pool.
+        _prefiltered = recs
+        if len(recs) > _pool and not exact_matches:
+            _query_words = query_lower.split()
+            if len(_query_words) <= 3:
+                # Short query → likely a symbol name → safe to pre-filter.
+                try:
+                    _prefiltered = _sql_prefilter_candidates(
+                        store, query_lower, _pool, project=project,
+                    )
+                except Exception:
+                    pass
+
+        recs_by_id = {r["id"]: r for r in recs}
+        lexical_docs = [(_r["id"], _build_lexical_text(_r)) for _r in _prefiltered]
+        fuzzy_docs = [(_r["id"], _r.get("name", "")) for _r in _prefiltered]
 
         bm25_rank = rank_bm25(query, lexical_docs)
         fuzzy_rank = rank_fuzzy(query, fuzzy_docs)
-        # Try SQL-native vector search pushdown for lower latency (P1.4).
-        _pool = pool_size or SETTINGS.semantic_candidate_pool
+
+        # ── Phase 1c: Semantic ranking via SQL (no Python embedding load) ──
         _sql_rank = rank_semantic_sql(store, query, pool_size=_pool)
         if _sql_rank is not None:
             semantic_rank = _sql_rank
         else:
-            semantic_rank = rank_semantic(query, vector_docs)
+            # On-demand embedding load — only happens when the SQL vector
+            # path is unsupported (e.g. Kuzu backend, older DuckDB).
+            emb_by_id: dict[str, list[float] | None] = {}
+            try:
+                emb_rows = store.query_records(
+                    "MATCH (s:Symbol) WHERE s.embedding IS NOT NULL RETURN s.id as id, s.embedding as emb",
+                    {},
+                )
+                if emb_rows:
+                    # Handle both alias conventions: "emb" (DuckDB) vs "embedding" (mock stores).
+                    for r in emb_rows:
+                        eid = r.get("id")
+                        emb = r.get("emb") or r.get("embedding")
+                        if eid and emb is not None:
+                            emb_by_id[eid] = emb
+            except Exception:
+                pass
+            # Fallback: check if embeddings were pre-loaded in recs (legacy path).
+            if not emb_by_id:
+                for r in recs:
+                    emb = r.get("embedding")
+                    if emb is not None:
+                        emb_by_id[r["id"]] = emb
+            if emb_by_id:
+                vector_docs = [(r["id"], emb_by_id.get(r["id"])) for r in recs_by_id.values()]
+                semantic_rank = rank_semantic(query, vector_docs)
+            else:
+                LOGGER.info("Embeddings unavailable — skipping semantic ranking (BM25+fuzzy only)")
 
         bm25_trace_by_id, bm25_traces = _rank_trace_map(bm25_rank, trace_limit)
         fuzzy_trace_by_id, fuzzy_traces = _rank_trace_map(fuzzy_rank, trace_limit)
@@ -478,13 +568,21 @@ def hybrid_search(
                 if snippet:
                     item["snippet"] = snippet
 
-    # FR-10: Calibrate confidence labels based on name matching + RRF score.
-    # Exact name match → "high"; high RRF score (>0.3) → "medium"; else → "low".
-    # This prevents exact-match results being incorrectly labelled "low_confidence"
-    # when the embedding model is not installed, and also gives meaningful confidence
-    # to semantic-only matches (free-form queries like "state machine implementations").
-    has_exact_match = False
-    _has_high_score = False
+    # FR-10: Calibrate confidence labels based on NAME MATCHING (not score).
+    # RRF scores (`1 / (rank + 60)`) max out at ~0.02–0.05, far below the 0.3
+    # threshold that embedding cosine-similarity would produce.  Using absolute
+    # score thresholds always gives "low".  Using rank position alone gives
+    # false "medium" for single-doc edge cases.
+    #
+    # This heuristic uses CONTENT-BASED signals (name overlap, token match):
+    #
+    #   exact name/id/fqcn match           → "high"
+    #   substring match on name/fqname     → "medium"
+    #   query token in name/fqname         → "medium"
+    #   no overlap at all                  → "low"
+    #
+    has_medium_or_high = False
+    query_tokens = set(query_lower.split()) - set(_STOPWORDS)
     for item in top_k:
         if not isinstance(item, dict) or "score" not in item:
             continue
@@ -492,29 +590,27 @@ def hybrid_search(
         item_fqname = (item.get("fqname") or "").lower()
         if (item.get("id") or "").lower() == query_lower or item_name == query_lower or item_fqname == query_lower:
             item["confidence"] = "high"
-            has_exact_match = True
+            has_medium_or_high = True
         elif query_lower in item_name or query_lower in item_fqname:
             item["confidence"] = "medium"
-            _has_high_score = True
-        elif isinstance(item.get("score"), (int, float)) and item["score"] > 0.3:
-            # Semantic/fuzzy matches with meaningful scores → "medium" (not "low").
+            has_medium_or_high = True
+        elif any(t in item_name or t in item_fqname for t in query_tokens):
             item["confidence"] = "medium"
-            _has_high_score = True
+            has_medium_or_high = True
         else:
             item["confidence"] = "low"
 
     low_confidence_note: str | None = None
 
-    # Only add low-confidence warning when there are no exact/high-scored matches
-    # AND all RRF scores are below the noise threshold.
-    if not has_exact_match and not _has_high_score and top_k and isinstance(top_k[0], dict) and top_k[0].get("score", 1.0) < _LOW_CONFIDENCE_THRESHOLD:
+    # Only warn when ALL results are "low" — signals a genuine miss.
+    if not has_medium_or_high and top_k:
         has_model = _load_model() is not None
         for item in top_k:
             if isinstance(item, dict) and "score" in item:
                 item["low_confidence"] = True
         if has_model:
             low_confidence_note = (
-                "Low confidence results — all scores below threshold. "
+                "Low confidence results — no exact/substring/token overlap. "
                 "If searching for an exact class or method name, use find_symbol instead."
             )
         else:

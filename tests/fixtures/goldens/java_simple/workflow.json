@@ -5,7 +5,7 @@
       "kind": "method",
       "name": "processPayment",
       "fqname": "com.example.Service#processPayment()",
-      "confidence": "low",
+      "confidence": "medium",
       "file_path": "src/main/java/com/example/Service.java"
     }
   },

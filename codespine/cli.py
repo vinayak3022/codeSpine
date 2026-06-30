@@ -25,7 +25,11 @@ from click.core import ParameterSource
 from codespine.analysis.community import detect_communities, symbol_community
 from codespine.analysis.context import build_symbol_context
 from codespine.analysis.coupling import compute_coupling, get_coupling
-from codespine.analysis.crossmodule import link_cross_module_calls, link_cross_project_calls
+from codespine.analysis.crossmodule import (
+    link_cross_module_calls,
+    link_cross_project_calls,
+    link_dependency_imports,
+)
 from codespine.analysis.deadcode import detect_dead_code
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact
@@ -1362,6 +1366,19 @@ def analyse(
         """Finalise an in-place phase line and move to the next line."""
         click.echo(f"\r✓ {label:<28} {result:<48}")
 
+    # ── Post-index duplicate cleanup ───────────────────────────────
+    # Duplicates can arise when a module is indexed under a different project ID
+    # in this run than a prior run (e.g. bare "vision-models" vs "vision::vision-models").
+    # The pre-index cleanup (line 1257) covers prior-run duplicates; this pass
+    # catches any that were created during this run (e.g. cross-shard stale entries).
+    # Run BEFORE cross-module linking so orphaned projects don't consume analysis cycles.
+    post_dup_count = _cleanup_duplicate_projects(sg)
+    if post_dup_count:
+        click.secho(
+            f"Post-index cleanup: removed {post_dup_count} duplicate project entr{'y' if post_dup_count == 1 else 'ies'}.",
+            fg="yellow",
+        )
+
     # For cross-module operations (cross-module linking, deep analysis, stats)
     # we use the shard store for the root project (all modules share one shard).
     root_project_id = last_result.project_id if last_result else root_basename
@@ -1395,6 +1412,24 @@ def analyse(
         except Exception as exc:
             LOGGER.warning("Cross-project linking failed: %s", exc)
             _finish_phase(xproj_label, f"error: {exc}")
+
+        # ── Cross-project import-resolution linking ───────────────────────
+        # Reads file-level cached imports (stored during indexing) and creates
+        # REFERENCES_TYPE edges across projects.  Requires Maven metadata to
+        # correctly resolve project dependencies.
+        xdep_label = "Cross-project import linking..."
+        _live_phase(xdep_label, "running")
+        try:
+            _refresh_project_dependency_metadata(modules_with_ids)
+            xdep_edges = link_dependency_imports(
+                sg,
+                project_ids=[pid for _, pid in modules_with_ids],
+                progress=lambda s: _live_phase(xdep_label, s),
+            )
+            _finish_phase(xdep_label, f"{xdep_edges} import-reference edges")
+        except Exception as exc:
+            LOGGER.warning("Cross-project import linking failed: %s", exc)
+            _finish_phase(xdep_label, f"error: {exc}")
     else:
         _phase("Cross-project linking...", "skipped (fast mode)")
 
