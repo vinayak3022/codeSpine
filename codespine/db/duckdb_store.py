@@ -253,6 +253,11 @@ CREATE TABLE IF NOT EXISTS project_dependencies (
     dependency_id   VARCHAR,
     PRIMARY KEY (project_id, dependency_id)
 );
+
+-- Performance indexes for symbol name lookups
+CREATE INDEX IF NOT EXISTS idx_symbol_name     ON symbols(name);
+CREATE INDEX IF NOT EXISTS idx_symbol_fqname    ON symbols(fqname);
+CREATE INDEX IF NOT EXISTS idx_symbol_project   ON symbols(project_id, name);
 """
 
 

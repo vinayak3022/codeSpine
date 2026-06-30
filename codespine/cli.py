@@ -294,9 +294,9 @@ def _open_store(read_only: bool = True) -> ShardedGraphStore:
             ) from repair_exc
 
 
-def _discover_modules(abs_path: str) -> tuple[list[str], list[tuple[str, str]], bool]:
+def _discover_modules(abs_path: str, workspace: bool = False) -> tuple[list[str], list[tuple[str, str]], bool]:
     project_roots = JavaIndexer.detect_projects_in_workspace(abs_path)
-    is_workspace = not (len(project_roots) == 1 and project_roots[0] == abs_path)
+    is_workspace = workspace or not (len(project_roots) == 1 and project_roots[0] == abs_path)
 
     # Build existing path → project_id map to prevent duplicate entries for
     # the same physical path (common in multi-module Maven/Gradle projects
@@ -343,13 +343,13 @@ def _discover_modules(abs_path: str) -> tuple[list[str], list[tuple[str, str]], 
 def _cleanup_duplicate_projects(store: ShardedGraphStore) -> int:
     """Remove duplicate project entries that share the same physical path.
 
-    Scans all project states, groups by canonical (absolute) path, and removes
-    duplicates, keeping only the most complete project entry (most files
-    indexed).  Returns the number of duplicates removed.
+    Scans all project states AND DB project metadata, groups by canonical
+    (absolute) path, and removes duplicates, keeping only the most complete
+    project entry (most files indexed).  Returns the number of duplicates removed.
     """
     from codespine.project_state import delete_project_state
 
-    # Index projects by canonical path.
+    # Index projects by canonical path from state files.
     by_path: dict[str, list[dict[str, Any]]] = {}
     for state in list_project_states():
         p = state.get("path")
@@ -357,6 +357,29 @@ def _cleanup_duplicate_projects(store: ShardedGraphStore) -> int:
             continue
         canon = os.path.abspath(p)
         by_path.setdefault(canon, []).append(state)
+
+    # Also index projects from DB that may not have state files.
+    try:
+        db_projects = store.list_project_metadata()
+        existing_pids: set[str] = set()
+        for entries_list in by_path.values():
+            for s in entries_list:
+                pid = s.get("project_id") or s.get("id")
+                if pid:
+                    existing_pids.add(pid)
+        for proj in db_projects:
+            pid = proj.get("id", "")
+            p = proj.get("path", "")
+            if not pid or not p:
+                continue
+            canon = os.path.abspath(p)
+            if pid not in existing_pids:
+                by_path.setdefault(canon, []).append({
+                    "project_id": pid,
+                    "path": p,
+                })
+    except Exception:
+        pass
 
     removed = 0
     for canon, entries in by_path.items():
@@ -412,17 +435,36 @@ def _cleanup_duplicate_projects(store: ShardedGraphStore) -> int:
             dup_id = dup["project_id"]
             if dup_id == survivor:
                 continue
-            LOGGER.info("Removing duplicate project entry '%s' (keeping '%s')", dup_id, survivor)
-            cleared_ok = False
-            try:
-                store.clear_project(dup_id)
-                cleared_ok = True
-            except Exception as exc:
-                LOGGER.warning("Failed to clear duplicate project %s: %s", dup_id, exc)
-            if not cleared_ok:
-                continue
+            LOGGER.info(
+                "Removing duplicate project entry '%s' (keeping '%s') for path %s",
+                dup_id, survivor, canon,
+            )
+            # Delete state file FIRST so duplicate is gone even if DB delete fails.
             try:
                 delete_project_state(dup_id)
+            except Exception:
+                pass
+            # Then clear from DB with retry.
+            cleared_ok = False
+            for attempt in range(3):
+                try:
+                    store.clear_project(dup_id)
+                    cleared_ok = True
+                    break
+                except Exception as exc:
+                    if attempt < 2:
+                        import time
+                        time.sleep(0.5 * (attempt + 1))
+                    else:
+                        LOGGER.warning(
+                            "Failed to clear duplicate project %s after 3 attempts: %s",
+                            dup_id, exc,
+                        )
+            if not cleared_ok:
+                continue
+            # Persist the deletion immediately.
+            try:
+                store.snapshot_to_read_replica()
             except Exception:
                 pass
             # Also clear any overlay data for this orphaned project.
@@ -1149,6 +1191,7 @@ def main() -> None:
     show_default=True,
     help="Generate vector embeddings. On by default. Use --no-embed to skip for faster analysis.",
 )
+@click.option("--workspace", "-w", is_flag=True, default=False, help="Index all projects in a workspace directory (auto-discovers Maven/Gradle projects).")
 @click.option("--allow-running", is_flag=True, hidden=True, help="Skip MCP running check (used by MCP analyse_project tool).")
 @click.pass_context
 def analyse(
@@ -1160,6 +1203,7 @@ def analyse(
     budget_seconds: float,
     incremental_deep: bool,
     embed: bool,
+    workspace: bool,
     allow_running: bool,
 ) -> None:
     """Index a local Java project (auto-detects workspace / Maven / Gradle layout).
@@ -1264,7 +1308,7 @@ def analyse(
 
     # --- Workspace → project → module detection ---
     # Level 1: workspace (e.g. ~/IdeaProjects/) may contain independent projects.
-    project_roots, modules_with_ids, is_workspace = _discover_modules(abs_path)
+    project_roots, modules_with_ids, is_workspace = _discover_modules(abs_path, workspace=workspace)
     if is_workspace:
         click.secho(
             f"Detected workspace with {len(project_roots)} projects in {abs_path}: "

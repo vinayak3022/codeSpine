@@ -386,27 +386,14 @@ def hybrid_search(
         fuzzy_traces: list[dict[str, object]] = []
         semantic_traces: list[dict[str, object]] = []
     else:
-        # ── Phase 1b: Candidate pool pre-filter ─────────────────────────
-        # For large symbol indexes, pre-filter the candidate pool using SQL
-        # CONTAINS / LIKE before running expensive in-Python BM25/fuzzy.
-        # If the query looks like a symbol name (no spaces, PascalCase), the
-        # pre-filter is a safe precision gain.  For free-form questions
-        # ("how does payment work?") we fall back to the full pool.
-        _prefiltered = recs
-        if len(recs) > _pool and not exact_matches:
-            _query_words = query_lower.split()
-            if len(_query_words) <= 3:
-                # Short query → likely a symbol name → safe to pre-filter.
-                try:
-                    _prefiltered = _sql_prefilter_candidates(
-                        store, query_lower, _pool, project=project,
-                    )
-                except Exception:
-                    pass
-
+        # ── Phase 1b: BM25 + fuzzy lexical ranking ─────────────────────
+        # Run BM25 and fuzzy on the full candidate pool (no embedding data).
+        # The SQL pre-filter (v1.3.1) was removed since it added net latency
+        # via an extra DB round-trip.  DuckDB indexes on symbols(name/fqname)
+        # are created at schema init for fast lookups.
         recs_by_id = {r["id"]: r for r in recs}
-        lexical_docs = [(_r["id"], _build_lexical_text(_r)) for _r in _prefiltered]
-        fuzzy_docs = [(_r["id"], _r.get("name", "")) for _r in _prefiltered]
+        lexical_docs = [(_r["id"], _build_lexical_text(_r)) for _r in recs]
+        fuzzy_docs = [(_r["id"], _r.get("name", "")) for _r in recs]
 
         bm25_rank = rank_bm25(query, lexical_docs)
         fuzzy_rank = rank_fuzzy(query, fuzzy_docs)
@@ -425,7 +412,6 @@ def hybrid_search(
                     {},
                 )
                 if emb_rows:
-                    # Handle both alias conventions: "emb" (DuckDB) vs "embedding" (mock stores).
                     for r in emb_rows:
                         eid = r.get("id")
                         emb = r.get("emb") or r.get("embedding")
