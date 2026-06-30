@@ -68,7 +68,7 @@ class ResultCache:
     def make_key(
         tool_name: str,
         args: dict[str, Any],
-        snapshot_mtime: float,
+        snapshot_mtime_ns: int,
     ) -> tuple:
         """Build a cache key from tool name, arguments, and index timestamp.
 
@@ -79,16 +79,16 @@ class ResultCache:
         args:
             Tool arguments dict (``None`` values included so missing optional
             args don't collide with explicitly-set ones).
-        snapshot_mtime:
-            Last-modified time of the read-replica sentinel file.  The key
-            preserves nanosecond precision so rapid snapshots do not collide.
+        snapshot_mtime_ns:
+            Last-modified time of the read-replica sentinel file in integer
+            nanoseconds.  The key preserves rapid snapshot updates exactly.
         """
         try:
             args_bytes = json.dumps(args, sort_keys=True, default=str).encode()
         except Exception:
             args_bytes = str(args).encode()
         args_hash = hashlib.sha1(args_bytes).hexdigest()[:16]
-        return (tool_name, args_hash, int(round(snapshot_mtime * 1_000_000_000)))
+        return (tool_name, args_hash, int(snapshot_mtime_ns))
 
     # ------------------------------------------------------------------
     # Cache operations

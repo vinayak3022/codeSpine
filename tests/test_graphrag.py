@@ -127,7 +127,7 @@ def test_graph_rag_answer_caches_by_snapshot_and_reports_latency(monkeypatch):
     calls = {"count": 0}
 
     _GRAPH_RAG_CACHE.invalidate()
-    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime_ns", lambda *args, **kwargs: 7_000_000_000)
     monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
 
     first = graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
@@ -178,7 +178,7 @@ def test_graph_rag_answer_cache_separates_by_detail(monkeypatch):
     calls = {"count": 0}
 
     _GRAPH_RAG_CACHE.invalidate()
-    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime_ns", lambda *args, **kwargs: 7_000_000_000)
     monkeypatch.setattr("codespine.graphrag.resolve_symbol_focus", lambda *args, **kwargs: {"query": "what breaks if I change Foo?", "focus": context["focus"], "focus_symbol": context["focus"]["fqname"], "search_candidates": context["search_candidates"], "search_ms": 0})
     monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
 
@@ -223,7 +223,7 @@ def test_graph_rag_answer_cache_invalidates_on_overlay_change(monkeypatch, tmp_p
         overlay_store = _OverlayStore()
 
     _GRAPH_RAG_CACHE.invalidate()
-    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime_ns", lambda *args, **kwargs: 7_000_000_000)
     monkeypatch.setattr("codespine.graphrag.resolve_symbol_focus", lambda *args, **kwargs: {"query": "what breaks if I change Foo?", "focus": context["focus"], "focus_symbol": context["focus"]["fqname"], "search_candidates": context["search_candidates"], "search_ms": 0})
     monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
 
@@ -257,7 +257,7 @@ def test_graph_rag_answer_cache_invalidates_on_rapid_snapshot_updates(monkeypatc
     snapshot_mtimes = iter([11.1, 11.2])
 
     _GRAPH_RAG_CACHE.invalidate()
-    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: next(snapshot_mtimes))
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime_ns", lambda *args, **kwargs: next(snapshot_mtimes))
     monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
 
     graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")
@@ -289,7 +289,7 @@ def test_graph_rag_answer_cache_invalidates_on_snapshot_change(monkeypatch):
     snapshot_mtimes = iter([11.0, 12.0])
 
     _GRAPH_RAG_CACHE.invalidate()
-    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime", lambda *args, **kwargs: next(snapshot_mtimes))
+    monkeypatch.setattr("codespine.graphrag._store_snapshot_mtime_ns", lambda *args, **kwargs: next(snapshot_mtimes))
     monkeypatch.setattr("codespine.graphrag.build_symbol_context", lambda *args, **kwargs: calls.__setitem__("count", calls["count"] + 1) or context)
 
     graph_rag_answer(_NoopStore(), "what breaks if I change Foo?", project="app")

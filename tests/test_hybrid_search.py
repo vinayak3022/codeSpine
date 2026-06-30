@@ -226,7 +226,7 @@ def test_build_symbol_context_uses_shared_focus_resolution(monkeypatch):
     assert calls == [("Foo", "app")]
     assert result["focus"]["name"] == "Foo"
     assert result["impact"]["target"] == "com.example.Foo"
-    assert result["timings_ms"]["search"] > 0
+    assert result["timings_ms"]["search"] == 1
 
 
 def test_resolve_symbol_focus_reports_nonzero_search_time_for_prefetched_candidates(monkeypatch):
@@ -238,7 +238,7 @@ def test_resolve_symbol_focus_reports_nonzero_search_time_for_prefetched_candida
         search_candidates=[{"id": "s1", "name": "Foo", "fqname": "com.example.Foo"}],
     )
 
-    assert result["search_ms"] > 0
+    assert result["search_ms"] == 1
     assert result["focus_symbol"] == "com.example.Foo"
 
 

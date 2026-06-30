@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import codespine.analysis.impact as impact_module
 from codespine.analysis.flow import trace_execution_flows
 from codespine.analysis.impact import analyze_impact, resolve_symbol_targets
 from codespine.mcp.server import build_mcp_server
@@ -151,6 +152,131 @@ def test_impact_resolution_stays_project_scoped_and_ambiguous_queries_do_not_mer
     assert ambiguous["resolution"]["status"] == "ambiguous"
     assert ambiguous["depth_groups"] == {"1": [], "2": [], "3+": []}
     assert resolve_symbol_targets(_AmbiguousStore(), "target", project="app")["status"] == "ambiguous"
+
+
+def test_exact_symbol_resolution_cache_reuses_results_until_snapshot_changes(monkeypatch):
+    impact_module._EXACT_SYMBOL_RESOLUTION_CACHE.clear()
+
+    class _Store:
+        overlay_store = object()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            self.calls += 1
+            if "MATCH (s:Symbol), (f:File)" in query and "RETURN s.id as id" in query:
+                return [
+                    {
+                        "id": "s_target",
+                        "kind": "class",
+                        "name": "TargetService",
+                        "fqname": "com.example.TargetService",
+                        "file_id": "f_app",
+                        "project_id": "app",
+                        "file_path": "/repo/app/TargetService.java",
+                    }
+                ]
+            if "MATCH (m:Method), (c:Class), (f:File)" in query and "lower(c.fqcn) = lower($class_fqcn)" in query:
+                return []
+            return []
+
+    mtime_state = {"store": 10.0, "overlay": 20.0}
+    monkeypatch.setattr(impact_module, "_store_snapshot_mtime", lambda store, project=None: mtime_state["store"])
+    monkeypatch.setattr(impact_module, "_overlay_snapshot_mtime", lambda store, project=None: mtime_state["overlay"])
+
+    store = _Store()
+    first = resolve_symbol_targets(store, "TargetService", project="app")
+    first_calls = store.calls
+    second = resolve_symbol_targets(store, "TargetService", project="app")
+
+    assert first["status"] == "exact"
+    assert second == first
+    assert store.calls == first_calls
+
+
+def test_exact_symbol_resolution_cache_invalidates_on_overlay_or_index_mtime_change(monkeypatch):
+    impact_module._EXACT_SYMBOL_RESOLUTION_CACHE.clear()
+
+    class _Store:
+        overlay_store = object()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            self.calls += 1
+            if "MATCH (s:Symbol), (f:File)" in query and "RETURN s.id as id" in query:
+                return [
+                    {
+                        "id": "s_target",
+                        "kind": "class",
+                        "name": "TargetService",
+                        "fqname": "com.example.TargetService",
+                        "file_id": "f_app",
+                        "project_id": "app",
+                        "file_path": "/repo/app/TargetService.java",
+                    }
+                ]
+            return []
+
+    mtime_state = {"store": 10.0, "overlay": 20.0}
+    monkeypatch.setattr(impact_module, "_store_snapshot_mtime", lambda store, project=None: mtime_state["store"])
+    monkeypatch.setattr(impact_module, "_overlay_snapshot_mtime", lambda store, project=None: mtime_state["overlay"])
+
+    store = _Store()
+    resolve_symbol_targets(store, "TargetService", project="app")
+    first_calls = store.calls
+
+    mtime_state["overlay"] = 21.0
+    resolve_symbol_targets(store, "TargetService", project="app")
+    overlay_calls = store.calls
+    assert overlay_calls > first_calls
+
+    mtime_state["store"] = 11.0
+    resolve_symbol_targets(store, "TargetService", project="app")
+    assert store.calls > overlay_calls
+
+
+def test_exact_symbol_resolution_cache_supports_unhashable_stores(monkeypatch):
+    impact_module._EXACT_SYMBOL_RESOLUTION_CACHE.clear()
+
+    class _Store:
+        overlay_store = object()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __eq__(self, other: object) -> bool:
+            return self is other
+
+        def query_records(self, query: str, params: dict | None = None) -> list[dict]:
+            self.calls += 1
+            if "MATCH (s:Symbol), (f:File)" in query and "RETURN s.id as id" in query:
+                return [
+                    {
+                        "id": "s_target",
+                        "kind": "class",
+                        "name": "TargetService",
+                        "fqname": "com.example.TargetService",
+                        "file_id": "f_app",
+                        "project_id": "app",
+                        "file_path": "/repo/app/TargetService.java",
+                    }
+                ]
+            return []
+
+    monkeypatch.setattr(impact_module, "_store_snapshot_mtime", lambda store, project=None: 10.0)
+    monkeypatch.setattr(impact_module, "_overlay_snapshot_mtime", lambda store, project=None: 20.0)
+
+    store = _Store()
+    first = resolve_symbol_targets(store, "TargetService", project="app")
+    first_calls = store.calls
+    second = resolve_symbol_targets(store, "TargetService", project="app")
+
+    assert first["status"] == "exact"
+    assert second == first
+    assert store.calls == first_calls
 
 
 def test_what_breaks_and_explain_use_backend_safe_resolution(monkeypatch):

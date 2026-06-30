@@ -137,21 +137,40 @@ def _cache_key(text: str, dim: int) -> str:
 
 
 def embed_text(text: str, dim: int | None = None) -> list[float]:
+    return embed_texts([text], dim=dim)[0]
+
+
+def embed_texts(texts: list[str], dim: int | None = None) -> list[list[float]]:
     dim = dim or SETTINGS.vector_dim
-    key = _cache_key(text or "", dim)
+    if not texts:
+        return []
 
-    cached = _CACHE.get(key)
-    if cached is not None:
-        return cached
+    normalized_texts = [text or "" for text in texts]
+    unique_texts = list(dict.fromkeys(normalized_texts))
+    vectors_by_text: dict[str, list[float]] = {}
+    missing_texts: list[str] = []
 
-    model = _load_model()
-    if model is None:
-        vec = _hash_vector(text, dim)
-    else:
-        vec = [float(x) for x in model.encode([text or ""], normalize_embeddings=True)[0]]
+    for text in unique_texts:
+        cached = _CACHE.get(_cache_key(text, dim))
+        if cached is None:
+            missing_texts.append(text)
+        else:
+            vectors_by_text[text] = cached
 
-    _CACHE.set(key, vec)
-    return vec
+    if missing_texts:
+        model = _load_model()
+        if model is None:
+            missing_vectors = [_hash_vector(text, dim) for text in missing_texts]
+        else:
+            missing_vectors = [
+                [float(x) for x in vec]
+                for vec in model.encode(missing_texts, normalize_embeddings=True)
+            ]
+        for text, vec in zip(missing_texts, missing_vectors):
+            _CACHE.set(_cache_key(text, dim), vec)
+            vectors_by_text[text] = vec
+
+    return [vectors_by_text[text] for text in normalized_texts]
 
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:

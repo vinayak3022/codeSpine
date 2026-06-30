@@ -37,7 +37,9 @@ __all__ = [
     "_project_inventory",
     "_sum_count_rows",
     "_store_snapshot_mtime",
+    "_store_snapshot_mtime_ns",
     "_overlay_snapshot_mtime",
+    "_overlay_snapshot_mtime_ns",
     "_reload_store_instance",
     "_StoreProxy",
     "_WATCH_ACTIVE",
@@ -474,6 +476,15 @@ def _snapshot_mtime_for_path(path: str) -> float:
     return 0.0
 
 
+def _snapshot_mtime_ns_for_path(path: str) -> int:
+    try:
+        if path and os.path.exists(path):
+            return os.stat(path).st_mtime_ns
+    except OSError:
+        pass
+    return 0
+
+
 def _store_snapshot_mtime(store, project: str | None = None) -> float:
     try:
         router = getattr(store, "router", None)
@@ -489,6 +500,23 @@ def _store_snapshot_mtime(store, project: str | None = None) -> float:
     except Exception as exc:
         _LOGGER.debug("store_snapshot_mtime fallback 0: %s", exc)
         return 0.0
+
+
+def _store_snapshot_mtime_ns(store, project: str | None = None) -> int:
+    try:
+        router = getattr(store, "router", None)
+        if router is not None and hasattr(router, "all_shards") and hasattr(router, "snapshot_path"):
+            shard_ids = list(router.all_shards())
+            mtimes = [
+                _snapshot_mtime_ns_for_path(router.snapshot_path(idx) + ".updated")
+                for idx in shard_ids
+            ]
+            return max(mtimes, default=0)
+        snapshot_path = getattr(store, "_snapshot_path", "")
+        return _snapshot_mtime_ns_for_path(snapshot_path + ".updated")
+    except Exception as exc:
+        _LOGGER.debug("store_snapshot_mtime_ns fallback 0: %s", exc)
+        return 0
 
 
 def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
@@ -509,6 +537,26 @@ def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
     except Exception as exc:
         _LOGGER.debug("overlay_snapshot_mtime fallback 0: %s", exc)
         return 0.0
+
+
+def _overlay_snapshot_mtime_ns(store, project: str | None = None) -> int:
+    try:
+        overlay_store = getattr(store, "overlay_store", None)
+        if overlay_store is None:
+            return 0
+        if project:
+            return _snapshot_mtime_ns_for_path(overlay_store.project_path(project))
+        mtimes = []
+        for doc in overlay_store.list_projects():
+            project_id = doc.get("project_id")
+            if project_id:
+                mtimes.append(
+                    _snapshot_mtime_ns_for_path(overlay_store.project_path(project_id))
+                )
+        return max(mtimes, default=0)
+    except Exception as exc:
+        _LOGGER.debug("overlay_snapshot_mtime_ns fallback 0: %s", exc)
+        return 0
 
 
 # ── Store reload / proxy ────────────────────────────────────────────────────────

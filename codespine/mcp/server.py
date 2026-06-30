@@ -71,8 +71,10 @@ from codespine.mcp._helpers import (
     _set_watch_active,
     _staleness_meta,
     _store_snapshot_mtime,
+    _store_snapshot_mtime_ns,
     _sum_count_rows,
     _overlay_snapshot_mtime,
+    _overlay_snapshot_mtime_ns,
 )
 
 
@@ -151,10 +153,53 @@ def build_mcp_server(store, repo_path_provider):
     # overlay sentinel changes.
     _result_cache = ResultCache(maxsize=256, ttl_s=300.0)
 
+    # Per-server inventory cache for project listings / summaries. The cache is
+    # keyed by the latest snapshot mtime plus the latest project-state mtime so
+    # any index publish or state update forces a refresh on the next call.
+    _inventory_cache: dict[str, object] = {"signature": None, "projects": None}
+    _inventory_cache_lock = threading.Lock()
+
+    def _project_state_mtime() -> int:
+        state_dir = os.path.join(SETTINGS.index_meta_dir, "project_state")
+        try:
+            if not os.path.isdir(state_dir):
+                return 0
+            mtimes: list[int] = []
+            with os.scandir(state_dir) as entries:
+                for entry in entries:
+                    if entry.is_file() and entry.name.endswith(".json"):
+                        try:
+                            mtimes.append(entry.stat().st_mtime_ns)
+                        except OSError:
+                            continue
+            return max(mtimes, default=0)
+        except Exception:
+            return 0
+
+    def _inventory_signature() -> tuple[int, int]:
+        return (
+            int(_store_snapshot_mtime(store) * 1_000_000_000),
+            _project_state_mtime(),
+        )
+
+    def _cached_project_inventory() -> list[dict]:
+        signature = _inventory_signature()
+        with _inventory_cache_lock:
+            cached_signature = _inventory_cache["signature"]
+            cached_projects = _inventory_cache["projects"]
+            if cached_signature == signature and isinstance(cached_projects, list):
+                return [dict(project) for project in cached_projects]
+
+        projects = _project_inventory(store)
+        with _inventory_cache_lock:
+            _inventory_cache["signature"] = signature
+            _inventory_cache["projects"] = [dict(project) for project in projects]
+        return projects
+
     def _cache_key(tool_name: str, **kwargs):
         """Build a cache key using current snapshot mtime."""
-        mtime = _store_snapshot_mtime(store, kwargs.get("project"))
-        return ResultCache.make_key(tool_name, kwargs, mtime)
+        mtime_ns = _store_snapshot_mtime_ns(store, kwargs.get("project"))
+        return ResultCache.make_key(tool_name, kwargs, mtime_ns)
 
     # FR-03: Auto-start watch if indexed projects exist and watch is not running.
     import threading as _threading
@@ -254,7 +299,7 @@ def build_mcp_server(store, repo_path_provider):
         Call this before other tools so you know what's ready without trial-and-error.
         Features marked false may need 'codespine analyse --deep' or optional dependencies.
         """
-        projects = _project_inventory(store)
+        projects = _cached_project_inventory()
         sym_q = store.query_records("MATCH (s:Symbol) RETURN count(s) as count")
         comm_q = store.query_records("MATCH (c:Community) RETURN count(c) as count")
         flow_q = store.query_records("MATCH (f:Flow) RETURN count(f) as count")
@@ -428,7 +473,7 @@ def build_mcp_server(store, repo_path_provider):
     def list_projects():
         """List all indexed projects with their symbol and file counts."""
         projects = [
-            p for p in _project_inventory(store)
+            p for p in _cached_project_inventory()
             if not (p.get("state_only") and not p.get("snapshot_valid") and not p.get("write_db_valid"))
         ]
         if not projects:
@@ -583,7 +628,7 @@ def build_mcp_server(store, repo_path_provider):
                 symbol=symbol,
                 max_depth=max_depth,
                 project=project,
-                overlay_mtime=_overlay_snapshot_mtime(store, project),
+                overlay_mtime=_overlay_snapshot_mtime_ns(store, project),
             )
             _cached = _result_cache.get(_ck)
             if _cached is not None:
@@ -622,7 +667,13 @@ def build_mcp_server(store, repo_path_provider):
         exemption rules — useful for validating that the feature is working
         even when the dead list is empty.
         """
-        _ck = _cache_key("detect_dead_code", limit=limit, project=project, strict=strict)
+        _ck = _cache_key(
+            "detect_dead_code",
+            limit=limit,
+            project=project,
+            strict=strict,
+            overlay_mtime=_overlay_snapshot_mtime_ns(store, project),
+        )
         _cached = _result_cache.get(_ck)
         if _cached is not None:
             return _cached
@@ -885,7 +936,7 @@ def build_mcp_server(store, repo_path_provider):
         Use this to understand the size and coverage of each indexed project before
         deciding which project= scope to pass to analysis tools.
         """
-        projects = _project_inventory(store)
+        projects = _cached_project_inventory()
         if not projects:
             return {"available": False, "note": "No projects indexed yet. Run 'codespine analyse <path>'."}
 

@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 
+from codespine import project_state
 from codespine.mcp.server import build_mcp_server, _index_guard, _reload_store_instance, _store_snapshot_mtime
 
 
@@ -62,6 +63,22 @@ class _SyncThread:
     def start(self):
         if self._target is not None:
             self._target()
+
+
+class _InventoryStore:
+    def __init__(self, *, snapshot_path: str | None = None):
+        self.calls: dict[str, int] = {"list_project_metadata": 0}
+        if snapshot_path is not None:
+            self._snapshot_path = snapshot_path
+
+    def list_project_metadata(self) -> list[dict]:
+        self.calls["list_project_metadata"] += 1
+        return [{"id": "app", "path": "/repo/app", "indexed_at": 1_000}]
+
+    def query_records(self, query: str, params: dict | None = None):
+        if "MATCH (p:Project) RETURN p.path as path, p.id as id ORDER BY p.indexed_at DESC LIMIT 1" in query:
+            return []
+        return []
 
 
 def test_store_snapshot_mtime_tracks_sharded_snapshots(tmp_path: Path):
@@ -216,6 +233,103 @@ def test_get_impact_cache_invalidates_on_overlay_changes(monkeypatch, tmp_path: 
     assert calls["count"] == 2
 
 
+def test_detect_dead_code_cache_invalidates_on_overlay_changes(monkeypatch, tmp_path: Path):
+    overlay_path = tmp_path / "overlay" / "project.json"
+    overlay_path.parent.mkdir(parents=True)
+    overlay_path.write_text("{}", encoding="utf-8")
+    os.utime(overlay_path, (21.1, 21.1))
+
+    calls = {"count": 0}
+
+    class _OverlayStore:
+        def project_path(self, project_id: str) -> str:
+            return str(overlay_path)
+
+        def load_project(self, project_id: str):
+            return {"project_id": project_id, "project_path": str(tmp_path), "dirty_files": {}, "deleted_files": []}
+
+    class _Store:
+        overlay_store = _OverlayStore()
+
+        def query_records(self, query: str, params: dict | None = None):
+            if "MATCH (p:Project) WHERE p.id = $pid RETURN p.indexed_at as ts" in query:
+                return [{"ts": 1_000}]
+            return []
+
+    def fake_detect_dead_code(store, limit: int = 200, project: str | None = None, strict: bool = False):
+        calls["count"] += 1
+        return [
+            {
+                "method_id": "m1",
+                "name": "dead",
+                "signature": "dead()",
+                "class_fqcn": "example.App",
+                "file_path": "/repo/App.java",
+                "confidence": "high",
+                "reason": "no_incoming_calls_after_exemptions",
+            },
+            {"_stats": {"candidates_with_no_callers": 1, "exempted": 0, "dead_returned": 1, "mode": "normal", "note": "", "exemptions_breakdown": {}, "exempted_sample": []}},
+        ]
+
+    monkeypatch.setattr("codespine.mcp._tools_analysis.detect_dead_code_analysis", fake_detect_dead_code)
+    monkeypatch.setattr("threading.Thread", _SyncThread)
+
+    async def _run():
+        mcp = build_mcp_server(_Store(), lambda: str(tmp_path))
+        first = await mcp.call_tool("detect_dead_code", {"project": "app"})
+        second = await mcp.call_tool("detect_dead_code", {"project": "app"})
+        os.utime(overlay_path, (21.2, 21.2))
+        third = await mcp.call_tool("detect_dead_code", {"project": "app"})
+        assert json.loads(first.content[0].text)["available"] is True
+        assert json.loads(second.content[0].text)["available"] is True
+        assert json.loads(third.content[0].text)["available"] is True
+
+    asyncio.run(_run())
+
+    assert calls["count"] == 2
+
+
+def test_detect_dead_code_cache_invalidates_on_rapid_snapshot_updates(monkeypatch, tmp_path: Path):
+    calls = {"count": 0}
+    snapshot_mtimes = iter([31_000_000_001, 31_000_000_002])
+
+    class _Store:
+        overlay_store = None
+
+        def query_records(self, query: str, params: dict | None = None):
+            if "MATCH (p:Project) WHERE p.id = $pid RETURN p.indexed_at as ts" in query:
+                return [{"ts": 1_000}]
+            return []
+
+    def fake_detect_dead_code(store, limit: int = 200, project: str | None = None, strict: bool = False):
+        calls["count"] += 1
+        return [
+            {
+                "method_id": "m1",
+                "name": "dead",
+                "signature": "dead()",
+                "class_fqcn": "example.App",
+                "file_path": "/repo/App.java",
+                "confidence": "high",
+                "reason": "no_incoming_calls_after_exemptions",
+            },
+            {"_stats": {"candidates_with_no_callers": 1, "exempted": 0, "dead_returned": 1, "mode": "normal", "note": "", "exemptions_breakdown": {}, "exempted_sample": []}},
+        ]
+
+    monkeypatch.setattr("codespine.mcp._tools_analysis.detect_dead_code_analysis", fake_detect_dead_code)
+    monkeypatch.setattr("codespine.mcp.server._store_snapshot_mtime_ns", lambda *args, **kwargs: next(snapshot_mtimes))
+    monkeypatch.setattr("threading.Thread", _SyncThread)
+
+    async def _run():
+        mcp = build_mcp_server(_Store(), lambda: str(tmp_path))
+        await mcp.call_tool("detect_dead_code", {"project": "app"})
+        await mcp.call_tool("detect_dead_code", {"project": "app"})
+
+    asyncio.run(_run())
+
+    assert calls["count"] == 2
+
+
 def test_index_guard_sums_sharded_count_rows():
     class _Store:
         def query_records(self, query: str, params: dict | None = None):
@@ -226,3 +340,50 @@ def test_index_guard_sums_sharded_count_rows():
             return []
 
     assert _index_guard(_Store()) is None
+
+
+def test_list_projects_inventory_cache_invalidates_on_state_change(monkeypatch):
+    monkeypatch.setattr("threading.Thread", _SyncThread)
+
+    store = _InventoryStore()
+    mcp = build_mcp_server(store, lambda: "/repo")
+
+    async def _run():
+        first = await mcp.call_tool("list_projects", {})
+        second = await mcp.call_tool("list_projects", {})
+        project_state.update_project_state("app", path="/repo/app", core_state="ready")
+        third = await mcp.call_tool("list_projects", {})
+        assert json.loads(first.content[0].text)["available"] is True
+        assert json.loads(second.content[0].text)["available"] is True
+        assert json.loads(third.content[0].text)["available"] is True
+
+    asyncio.run(_run())
+
+    assert store.calls["list_project_metadata"] == 2
+
+
+def test_list_projects_inventory_cache_invalidates_on_snapshot_change(monkeypatch):
+    monkeypatch.setattr("threading.Thread", _SyncThread)
+    monkeypatch.setattr("codespine.mcp.server._reload_store_instance", lambda store: store)
+
+    snapshot_mtime = {"value": 10.0}
+    monkeypatch.setattr(
+        "codespine.mcp.server._store_snapshot_mtime",
+        lambda store, project=None: snapshot_mtime["value"],
+    )
+
+    store = _InventoryStore()
+    mcp = build_mcp_server(store, lambda: "/repo")
+
+    async def _run():
+        first = await mcp.call_tool("list_projects", {})
+        second = await mcp.call_tool("list_projects", {})
+        snapshot_mtime["value"] = 11.0
+        third = await mcp.call_tool("list_projects", {})
+        assert json.loads(first.content[0].text)["available"] is True
+        assert json.loads(second.content[0].text)["available"] is True
+        assert json.loads(third.content[0].text)["available"] is True
+
+    asyncio.run(_run())
+
+    assert store.calls["list_project_metadata"] == 2

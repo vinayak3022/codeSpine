@@ -34,3 +34,23 @@ def test_incremental_no_change_reindexes_zero_files():
     assert first.files_found >= 2
     assert second.files_found == first.files_found
     assert second.files_indexed == 0
+
+
+def test_index_batches_embeddings_per_file_chunk(monkeypatch):
+    fixture = Path(__file__).parent / "fixtures" / "java_simple"
+    store = GraphStore(read_only=False)
+    indexer = JavaIndexer(store)
+
+    batches: list[list[str]] = []
+
+    def fake_embed_texts(texts, dim=None):
+        batches.append(list(texts))
+        return [[float(i)] * 768 for i, _ in enumerate(texts)]
+
+    monkeypatch.setattr("codespine.indexer.engine.embed_texts", fake_embed_texts)
+
+    result = indexer.index_project(str(fixture), full=True)
+
+    assert result.files_indexed >= 2
+    assert len(batches) == 1
+    assert len(batches[0]) == result.classes_indexed + result.methods_indexed

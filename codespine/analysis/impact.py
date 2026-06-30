@@ -1,13 +1,72 @@
 from __future__ import annotations
 
+import copy
 from collections import defaultdict, deque
+import threading
+import weakref
 
 from codespine.overlay.merge import merged_call_edges, merged_method_records, merged_reference_edges, merged_symbol_records
+from codespine.mcp._helpers import _overlay_snapshot_mtime, _store_snapshot_mtime
 from codespine.project_state import project_dependency_closure
 
 
 def _scope_project_ids(project: str | None) -> set[str]:
     return set(project_dependency_closure(project, include_self=True)) if project else set()
+
+
+_EXACT_SYMBOL_RESOLUTION_CACHE: dict[int, tuple[weakref.ReferenceType[object], dict[tuple[str, str, float, float], dict]]] = {}
+_EXACT_SYMBOL_RESOLUTION_CACHE_LOCK = threading.RLock()
+_EXACT_SYMBOL_RESOLUTION_CACHE_MAXSIZE = 256
+
+
+def _exact_symbol_resolution_cache_key(symbol_query: str, project: str | None, store_mtime: float, overlay_mtime: float) -> tuple[str, str, float, float]:
+    needle = (symbol_query or "").strip().lower()
+    return (
+        project or "",
+        needle,
+        store_mtime,
+        overlay_mtime,
+    )
+
+
+def _exact_symbol_resolution_store_cache(store) -> dict[tuple[str, str, float, float], dict]:
+    store_id = id(store)
+    with _EXACT_SYMBOL_RESOLUTION_CACHE_LOCK:
+        entry = _EXACT_SYMBOL_RESOLUTION_CACHE.get(store_id)
+        if entry is not None:
+            store_ref, per_store = entry
+            if store_ref() is store:
+                return per_store
+            _EXACT_SYMBOL_RESOLUTION_CACHE.pop(store_id, None)
+
+        def _cleanup(_ref: weakref.ReferenceType[object], *, _store_id: int = store_id) -> None:
+            with _EXACT_SYMBOL_RESOLUTION_CACHE_LOCK:
+                current = _EXACT_SYMBOL_RESOLUTION_CACHE.get(_store_id)
+                if current is not None and current[0] is _ref:
+                    _EXACT_SYMBOL_RESOLUTION_CACHE.pop(_store_id, None)
+
+        per_store = {}
+        _EXACT_SYMBOL_RESOLUTION_CACHE[store_id] = (weakref.ref(store, _cleanup), per_store)
+        return per_store
+
+
+def _cache_exact_symbol_resolution(store, key: tuple[str, str, float, float], value: dict) -> dict:
+    snapshot = copy.deepcopy(value)
+    with _EXACT_SYMBOL_RESOLUTION_CACHE_LOCK:
+        per_store = _exact_symbol_resolution_store_cache(store)
+        per_store[key] = snapshot
+        if len(per_store) > _EXACT_SYMBOL_RESOLUTION_CACHE_MAXSIZE:
+            per_store.pop(next(iter(per_store)))
+    return copy.deepcopy(snapshot)
+
+
+def _get_cached_exact_symbol_resolution(store, key: tuple[str, str, float, float]) -> dict | None:
+    with _EXACT_SYMBOL_RESOLUTION_CACHE_LOCK:
+        per_store = _exact_symbol_resolution_store_cache(store)
+        if per_store is None:
+            return None
+        cached = per_store.get(key)
+        return copy.deepcopy(cached) if cached is not None else None
 
 
 def _symbol_exact_match(rec: dict, needle: str) -> bool:
@@ -176,9 +235,16 @@ def _resolve_methods_for_symbol(store, symbol_rec: dict, project: str | None = N
 
 
 def resolve_symbol_targets(store, symbol_query: str, project: str | None = None) -> dict:
+    store_mtime = _store_snapshot_mtime(store, project)
+    overlay_mtime = _overlay_snapshot_mtime(store, project)
+    cache_key = _exact_symbol_resolution_cache_key(symbol_query, project, store_mtime, overlay_mtime)
+    cached = _get_cached_exact_symbol_resolution(store, cache_key)
+    if cached is not None:
+        return cached
+
     exact_matches = _resolve_exact_symbol_records(store, symbol_query, project=project)
     if not exact_matches:
-        return {"status": "not_found", "matches": [], "resolved_method_ids": []}
+        return _cache_exact_symbol_resolution(store, cache_key, {"status": "not_found", "matches": [], "resolved_method_ids": []})
     if len(exact_matches) > 1:
         # Ambiguity resolution: if one match is clearly better (e.g. a non-test
         # class when all others are test or different kinds), resolve to that.
@@ -186,12 +252,12 @@ def resolve_symbol_targets(store, symbol_query: str, project: str | None = None)
         best = _pick_best_symbol(exact_matches)
         if best is not None:
             method_ids = _resolve_methods_for_symbol(store, best, project=project)
-            return {"status": "exact", "matches": [best], "resolved_method_ids": method_ids}
-        return {"status": "ambiguous", "matches": exact_matches, "resolved_method_ids": []}
+            return _cache_exact_symbol_resolution(store, cache_key, {"status": "exact", "matches": [best], "resolved_method_ids": method_ids})
+        return _cache_exact_symbol_resolution(store, cache_key, {"status": "ambiguous", "matches": exact_matches, "resolved_method_ids": []})
 
     symbol_rec = exact_matches[0]
     method_ids = _resolve_methods_for_symbol(store, symbol_rec, project=project)
-    return {"status": "exact", "matches": exact_matches, "resolved_method_ids": method_ids}
+    return _cache_exact_symbol_resolution(store, cache_key, {"status": "exact", "matches": exact_matches, "resolved_method_ids": method_ids})
 
 
 def _pick_best_symbol(matches: list[dict]) -> dict | None:

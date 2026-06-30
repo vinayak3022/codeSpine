@@ -60,6 +60,29 @@ def test_detect_projects_in_workspace_promotes_module_path_to_reactor_root(tmp_p
     assert projects == [str(root.resolve())]
 
 
+def test_discover_modules_handles_workspace_with_multiple_projects(monkeypatch, tmp_path: Path) -> None:
+    import codespine.cli as cli
+
+    workspace = tmp_path / "workspace"
+    app_a = workspace / "app-a"
+    app_b = workspace / "app-b"
+    app_a.mkdir(parents=True)
+    app_b.mkdir(parents=True)
+    (app_a / "pom.xml").write_text("<project/>", encoding="utf-8")
+    (app_b / "build.gradle").write_text("plugins { id 'java' }", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "list_project_states", lambda: [])
+
+    project_roots, modules_with_ids, is_workspace = cli._discover_modules(str(workspace))
+
+    assert is_workspace is True
+    assert project_roots == [str(app_a.resolve()), str(app_b.resolve())]
+    assert modules_with_ids == [
+        (str(app_a.resolve()), "app-a"),
+        (str(app_b.resolve()), "app-b"),
+    ]
+
+
 def test_supervisor_uses_http_transport_for_background_daemon() -> None:
     import codespine.cli as cli
 
@@ -120,6 +143,59 @@ def test_cleanup_duplicate_projects_uses_clear_project_not_cypher_delete(monkeyp
     assert ("snapshot", None) in cleared
 
 
+def test_cleanup_duplicate_projects_prefers_richer_canonical_entry(monkeypatch):
+    import codespine.cli as cli
+
+    class _Overlay:
+        def clear_project(self, project_id):
+            cleared.append(("overlay", project_id))
+
+    class _Store:
+        overlay_store = _Overlay()
+
+        def query_records(self, query, params=None):
+            pid = (params or {}).get("pid")
+            counts = {
+                "app": {"files": 1, "methods": 1, "symbols": 1},
+                "legacy": {"files": 9, "methods": 7, "symbols": 6},
+            }
+            bucket = counts[pid]
+            if "count(f)" in query:
+                return [{"c": bucket["files"]}]
+            if "count(m)" in query:
+                return [{"c": bucket["methods"]}]
+            if "count(s)" in query:
+                return [{"c": bucket["symbols"]}]
+            raise AssertionError(f"unexpected query: {query}")
+
+        def clear_project(self, project_id):
+            cleared.append(("store", project_id))
+
+        def snapshot_to_read_replica(self):
+            cleared.append(("snapshot", None))
+
+    cleared = []
+    monkeypatch.setattr(
+        cli,
+        "list_project_states",
+        lambda: [
+            {"project_id": "app", "path": "/repo/app"},
+            {"project_id": "legacy", "path": "/repo/app"},
+        ],
+    )
+    monkeypatch.setattr("codespine.project_state.delete_project_state", lambda pid: cleared.append(("state", pid)))
+    monkeypatch.setattr(cli, "snapshot_info", lambda pid, router=None: {"snapshot_valid": pid == "legacy", "write_db_valid": pid == "legacy"})
+
+    removed = cli._cleanup_duplicate_projects(_Store())
+
+    assert removed == 1
+    assert ("store", "app") in cleared
+    assert ("state", "app") in cleared
+    assert ("overlay", "app") in cleared
+    assert ("snapshot", None) in cleared
+    assert ("store", "legacy") not in cleared
+
+
 def test_index_project_allows_valid_java_files_with_no_classes(monkeypatch, tmp_path):
     from codespine.db.duckdb_store import DuckDBStore
     from codespine.indexer.engine import JavaIndexer
@@ -176,6 +252,32 @@ def test_status_reports_sharded_storage(monkeypatch):
     assert payload['read_replica'] == '/tmp/shards'
     assert payload['read_replica_paths'] == ['/tmp/shards/0/db_read']
     assert payload['read_replica_size_bytes'] == 45
+
+
+def test_get_capabilities_reports_first_run_zero_counts(monkeypatch):
+    import codespine.mcp.server as server
+
+    class _Store:
+        def query_records(self, query, params=None):
+            return []
+
+        def list_project_metadata(self):
+            return []
+
+    monkeypatch.setattr(server, '_project_inventory', lambda _store: [])
+    monkeypatch.setattr(server, '_git_available', lambda _path: False)
+    monkeypatch.setattr('codespine.search.vector._load_model', lambda: None)
+
+    async def _run():
+        mcp = build_mcp_server(_Store(), lambda: "/tmp")
+        result = await mcp.call_tool('get_capabilities', {})
+        return json.loads(result.content[0].text)
+
+    payload = asyncio.run(_run())
+    assert payload['symbol_count'] == 0
+    assert payload['index_health']['summary']['project_count'] == 0
+    assert payload['features']['search_hybrid'] is False
+    assert payload['features']['semantic_embeddings'] is False
 
 
 

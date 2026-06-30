@@ -24,7 +24,7 @@ from codespine.mcp._helpers import (
     _normalize_symbol_input,
     _safe_tool_response,
     _staleness_meta,
-    _overlay_snapshot_mtime,
+    _overlay_snapshot_mtime_ns,
 )
 
 
@@ -52,7 +52,7 @@ def register_tools(mcp, store, repo_path_provider, telemetry, overlay_store, res
                 symbol=symbol,
                 max_depth=max_depth,
                 project=project,
-                overlay_mtime=_overlay_snapshot_mtime(store, project),
+                overlay_mtime=_overlay_snapshot_mtime_ns(store, project),
             )
             cached = result_cache.get(ck)
             if cached is not None:
@@ -92,7 +92,13 @@ def register_tools(mcp, store, repo_path_provider, telemetry, overlay_store, res
         exemption rules - useful for validating that the feature is working
         even when the dead list is empty.
         """
-        ck = cache_key("detect_dead_code", limit=limit, project=project, strict=strict)
+        ck = cache_key(
+            "detect_dead_code",
+            limit=limit,
+            project=project,
+            strict=strict,
+            overlay_mtime=_overlay_snapshot_mtime_ns(store, project),
+        )
         cached = result_cache.get(ck)
         if cached is not None:
             return cached

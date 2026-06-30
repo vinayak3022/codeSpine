@@ -52,6 +52,15 @@ def _snapshot_mtime_for_path(path: str) -> float:
     return 0.0
 
 
+def _snapshot_mtime_ns_for_path(path: str) -> int:
+    try:
+        if path and os.path.exists(path):
+            return os.stat(path).st_mtime_ns
+    except OSError:
+        pass
+    return 0
+
+
 def _store_snapshot_mtime(store, project: str | None = None) -> float:
     try:
         router = getattr(store, "router", None)
@@ -63,6 +72,19 @@ def _store_snapshot_mtime(store, project: str | None = None) -> float:
         return _snapshot_mtime_for_path(snapshot_path + ".updated")
     except Exception:
         return 0.0
+
+
+def _store_snapshot_mtime_ns(store, project: str | None = None) -> int:
+    try:
+        router = getattr(store, "router", None)
+        if router is not None and hasattr(router, "all_shards") and hasattr(router, "snapshot_path"):
+            shard_ids = list(router.all_shards())
+            mtimes = [_snapshot_mtime_ns_for_path(router.snapshot_path(idx) + ".updated") for idx in shard_ids]
+            return max(mtimes, default=0)
+        snapshot_path = getattr(store, "_snapshot_path", "")
+        return _snapshot_mtime_ns_for_path(snapshot_path + ".updated")
+    except Exception:
+        return 0
 
 
 def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
@@ -82,14 +104,31 @@ def _overlay_snapshot_mtime(store, project: str | None = None) -> float:
         return 0.0
 
 
+def _overlay_snapshot_mtime_ns(store, project: str | None = None) -> int:
+    overlay_store = getattr(store, "overlay_store", None)
+    if overlay_store is None:
+        return 0
+    try:
+        if project:
+            return _snapshot_mtime_ns_for_path(overlay_store.project_path(project))
+        mtimes = []
+        for doc in overlay_store.list_projects():
+            project_id = doc.get("project_id")
+            if project_id:
+                mtimes.append(_snapshot_mtime_ns_for_path(overlay_store.project_path(project_id)))
+        return max(mtimes, default=0)
+    except Exception:
+        return 0
+
+
 def _graph_rag_cache_key(
     question: str,
     project: str | None,
     max_depth: int,
     k: int,
     detail: str,
-    snapshot_mtime: float,
-    overlay_mtime: float,
+    snapshot_mtime_ns: int,
+    overlay_mtime_ns: int,
     deep: bool = False,
 ) -> tuple:
     return ResultCache.make_key(
@@ -102,10 +141,10 @@ def _graph_rag_cache_key(
             "project": project,
             "max_depth": max_depth,
             "k": k,
-            "snapshot_mtime": snapshot_mtime,
-            "overlay_mtime": overlay_mtime,
+            "snapshot_mtime_ns": snapshot_mtime_ns,
+            "overlay_mtime_ns": overlay_mtime_ns,
         },
-        0.0,
+        0,
     )
 
 
@@ -897,8 +936,10 @@ def graph_rag_answer(
         raise ValueError("detail must be 'full' or 'compact'")
     snapshot_mtime = _store_snapshot_mtime(store, project)
     overlay_mtime = _overlay_snapshot_mtime(store, project)
+    snapshot_mtime_ns = _store_snapshot_mtime_ns(store, project)
+    overlay_mtime_ns = _overlay_snapshot_mtime_ns(store, project)
     evidence_limit = max(0, int(k))
-    cache_key = _graph_rag_cache_key(question, project, max_depth, evidence_limit, detail, snapshot_mtime, overlay_mtime, deep=deep)
+    cache_key = _graph_rag_cache_key(question, project, max_depth, evidence_limit, detail, snapshot_mtime_ns, overlay_mtime_ns, deep=deep)
     cached = _GRAPH_RAG_CACHE.get(cache_key)
     if cached is not None:
         result = json.loads(cached)

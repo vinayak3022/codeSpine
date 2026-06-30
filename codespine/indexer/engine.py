@@ -13,7 +13,7 @@ from codespine.config import SETTINGS
 from codespine.indexer.call_resolver import resolve_calls
 from codespine.indexer.java_parser import parse_java_source
 from codespine.indexer.symbol_builder import class_id, digest_bytes, file_id, method_id, symbol_id
-from codespine.search.vector import embed_text
+from codespine.search.vector import embed_texts
 
 LOGGER = logging.getLogger(__name__)
 
@@ -532,6 +532,7 @@ class JavaIndexer:
                 class_rows: list[dict] = []
                 method_rows: list[dict] = []
                 symbol_rows: list[dict] = []
+                symbol_embedding_texts: list[str] = []
 
                 for pr in parse_chunk:
                     # Skipped files (oversized, timeout) carry parsed=None.
@@ -608,6 +609,11 @@ class JavaIndexer:
                         cls_symbol_id = symbol_id("class", cls.fqcn, scope)
                         cls_anns = " ".join(a.split(".")[-1] for a in cls.annotations) if cls.annotations else ""
                         cls_ifaces = ", ".join(cls.interfaces) if cls.interfaces else ""
+                        cls_embedding_text = (
+                            f"type: class, name: {cls.fqcn}, annotations: {cls_anns}"
+                            f"{', interfaces: ' + cls_ifaces if cls_ifaces else ''}"
+                            f", package: {cls.package}, project: {scope}"
+                        )
                         symbol_rows.append(
                             {
                                 "id": cls_symbol_id,
@@ -617,13 +623,11 @@ class JavaIndexer:
                                 "file_id": f_id,
                                 "line": cls.line,
                                 "col": cls.col,
-                                "embedding": embed_text(
-                                    f"type: class, name: {cls.fqcn}, annotations: {cls_anns}"
-                                    f"{', interfaces: ' + cls_ifaces if cls_ifaces else ''}"
-                                    f", package: {cls.package}, project: {scope}"
-                                ) if embed else None,
+                                "embedding": None,
                             }
                         )
+                        if embed:
+                            symbol_embedding_texts.append(cls_embedding_text)
                         classes_indexed += 1
                         _db_classes_holder[0] = classes_indexed
 
@@ -671,6 +675,11 @@ class JavaIndexer:
 
                         for fld in cls.fields:
                             fqfield = f"{cls.fqcn}#{fld.name}"
+                            field_embedding_text = (
+                                f"type: field, name: {fld.name}, "
+                                f"qualified name: {fqfield}, "
+                                f"type: {fld.type_name}, project: {scope}"
+                            )
                             symbol_rows.append(
                                 {
                                     "id": symbol_id("field", fqfield, scope),
@@ -680,13 +689,11 @@ class JavaIndexer:
                                     "file_id": f_id,
                                     "line": fld.line,
                                     "col": fld.col,
-                                    "embedding": embed_text(
-                                        f"type: field, name: {fld.name}, "
-                                        f"qualified name: {fqfield}, "
-                                        f"type: {fld.type_name}, project: {scope}"
-                                    ) if embed else None,
+                                    "embedding": None,
                                 }
                             )
+                            if embed:
+                                symbol_embedding_texts.append(field_embedding_text)
 
                         for method in cls.methods:
                             m_id = method_id(cls.fqcn, method.signature, scope)
@@ -704,6 +711,12 @@ class JavaIndexer:
                             )
 
                             fqname = f"{cls.fqcn}#{method.signature}"
+                            method_embedding_text = (
+                                f"type: method, name: {fqname} "
+                                f"returns {method.return_type}"
+                                f", project: {scope}"
+                                f"{', body: ' + method.body_text if getattr(method, 'body_text', '') else ''}"
+                            )
                             symbol_rows.append(
                                 {
                                     "id": symbol_id("method", fqname, scope),
@@ -713,14 +726,11 @@ class JavaIndexer:
                                     "file_id": f_id,
                                     "line": method.line,
                                     "col": method.col,
-                                    "embedding": embed_text(
-                                        f"type: method, name: {fqname} "
-                                        f"returns {method.return_type}"
-                                        f", project: {scope}"
-                                        f"{', body: ' + method.body_text if getattr(method, 'body_text', '') else ''}"
-                                    ) if embed else None,
+                                    "embedding": None,
                                 }
                             )
+                            if embed:
+                                symbol_embedding_texts.append(method_embedding_text)
                             methods_indexed += 1
                             _db_methods_holder[0] = methods_indexed
 
@@ -743,6 +753,11 @@ class JavaIndexer:
                             class_methods[c_id][method.signature] = m_id
                     files_indexed += 1
                     _db_done_holder[0] = files_indexed
+
+                if embed and symbol_rows:
+                    embeddings = embed_texts(symbol_embedding_texts)
+                    for row, embedding in zip(symbol_rows, embeddings):
+                        row["embedding"] = embedding
 
                 # For incremental re-indexes clear files in bulk first, then use
                 # CREATE (not MERGE) for all writes — after clear the nodes are
