@@ -23,7 +23,7 @@ jobs:
       publish_reason: ${{ steps.meta.outputs.publish_reason }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
         uses: actions/setup-python@v5
